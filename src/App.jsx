@@ -26,7 +26,7 @@ const fmt$2 = (v) => v.toLocaleString("en-US", { style: "currency", currency: "U
 const fmtPct = (v) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
 
 async function fetchPositions() {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/positions?select=*&order=id.asc`, {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/positions?select=*`, {
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
   if (!res.ok) throw new Error("No se pudo leer Supabase (revisa RLS / anon key)");
