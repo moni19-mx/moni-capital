@@ -220,6 +220,17 @@ export default function Dashboard() {
 
   const concColor = top1Pct > 0.35 ? RED : top1Pct > 0.2 ? AMBER : GREEN;
 
+  const opportunities = useMemo(() => {
+    return withValue
+      .filter((p) => p.type !== "cash" && p.thesis?.conviction >= 4 && p.market?.low != null && p.market?.high != null && p.market.high > p.market.low)
+      .map((p) => ({
+        ...p,
+        rangePct: ((p.market.price - p.market.low) / (p.market.high - p.market.low)) * 100,
+      }))
+      .sort((a, b) => a.rangePct - b.rangePct)
+      .slice(0, 5);
+  }, [withValue]);
+
   return (
     <div style={{ background: NAVY_BG, minHeight: "100vh", color: TXT, fontFamily: "'IBM Plex Sans','Inter',sans-serif" }}>
       <style>{`
@@ -300,6 +311,10 @@ export default function Dashboard() {
 
         {tab === "resumen" && (
           <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 20 }}>
+            <Panel title="🎯 Ranking de Oportunidad — tus posiciones núcleo (4-5★) más cerca de su mínimo" span={2}>
+              <OpportunityRanking rows={opportunities} />
+            </Panel>
+
             <Panel title="Allocation por Tipo de Activo">
               {allocType.length === 0 ? <Empty /> : (
                 <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
@@ -482,6 +497,45 @@ function SemRow({ label, value, color }) {
 
 function Empty() {
   return <div style={{ color: MUTE, fontSize: 13 }}>Sin datos suficientes todavía.</div>;
+}
+
+function OpportunityRanking({ rows }) {
+  if (rows.length === 0) {
+    return (
+      <div style={{ color: MUTE, fontSize: 13 }}>
+        Ninguna de tus posiciones con convicción 4★ o 5★ está cerca de su mínimo de rango ahora mismo — o todavía no le has puesto convicción a ninguna en la pestaña "Tesis".
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      {rows.map((p, i) => {
+        const color = p.rangePct < 15 ? GREEN : p.rangePct < 25 ? "#7FCF9E" : AMBER;
+        return (
+          <div key={p.id} style={{
+            display: "flex", alignItems: "center", gap: 16, background: NAVY_BG, border: `1px solid ${LINE}`,
+            borderRadius: 10, padding: "14px 18px", flexWrap: "wrap",
+          }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: MUTE, width: 24 }}>{i + 1}</div>
+            <div style={{ minWidth: 140 }}>
+              <div style={{ fontWeight: 700 }}>{p.ticker} <span style={{ color: MUTE, fontSize: 12, fontWeight: 400 }}>{p.name}</span></div>
+              <ConvictionStars value={p.thesis?.conviction} />
+            </div>
+            <div style={{ flex: 1, minWidth: 180 }}>
+              <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact />
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>{fmt$2(p.market.price)}</div>
+              <div className="num" style={{ fontSize: 11, color }}>{p.rangePct.toFixed(0)}% del rango</div>
+            </div>
+          </div>
+        );
+      })}
+      <div style={{ fontSize: 11, color: MUTE, marginTop: 4 }}>
+        Informativo, no es recomendación de compra — solo cruza tu propia convicción declarada con el rango de precio actual.
+      </div>
+    </div>
+  );
 }
 
 function CashTab({ movements, balance, onChanged }) {
