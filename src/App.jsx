@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis,
-  Tooltip, CartesianGrid,
+  Tooltip, CartesianGrid, LineChart, Line,
 } from "recharts";
 import {
   TrendingUp, TrendingDown, Wallet, Layers, Coins, ShieldAlert, ChevronRight,
@@ -91,6 +91,7 @@ export default function Dashboard() {
   const [positions, setPositions] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [thesis, setThesis] = useState([]);
+  const [snapshots, setSnapshots] = useState([]);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
@@ -103,14 +104,16 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th] = await Promise.all([
+      const [pos, wl, th, snaps] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
+        sb("snapshots").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
       setThesis(th);
+      setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
 
       const items = [];
       const seen = new Set();
@@ -173,6 +176,18 @@ export default function Dashboard() {
   const stocksValue = withValue.filter((p) => p.type === "stock").reduce((a, p) => a + p.value, 0);
   const cryptoValue = withValue.filter((p) => p.type === "crypto").reduce((a, p) => a + p.value, 0);
   const cashValue = withValue.filter((p) => p.type === "cash").reduce((a, p) => a + p.value, 0);
+
+  const snapshotPosted = useRef(false);
+  useEffect(() => {
+    if (!snapshotPosted.current && patrimonio > 0) {
+      snapshotPosted.current = true;
+      fetch("/api/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patrimonio, invested, stocksValue, cryptoValue, cashValue }),
+      }).catch(() => {});
+    }
+  }, [patrimonio, invested, stocksValue, cryptoValue, cashValue]);
 
   const top5 = [...withValue].sort((a, b) => b.value - a.value).slice(0, 5);
   const top1Pct = patrimonio ? (top5[0]?.value || 0) / patrimonio : 0;
@@ -262,7 +277,7 @@ export default function Dashboard() {
         </div>
 
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -320,6 +335,12 @@ export default function Dashboard() {
               )}
             </Panel>
           </div>
+        )}
+
+        {tab === "performance" && (
+          <Panel title="Performance — evolución de tu patrimonio">
+            <PerformanceTab snapshots={snapshots} />
+          </Panel>
         )}
 
         {tab === "posiciones" && (
@@ -443,6 +464,54 @@ function SemRow({ label, value, color }) {
 
 function Empty() {
   return <div style={{ color: MUTE, fontSize: 13 }}>Sin datos suficientes todavía.</div>;
+}
+
+function PerformanceTab({ snapshots }) {
+  if (!snapshots || snapshots.length === 0) {
+    return <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay historial — vuelve mañana. Cada día que abras el sitio se guarda una "foto" de tu patrimonio.</div>;
+  }
+
+  const first = snapshots[0];
+  const last = snapshots[snapshots.length - 1];
+  const change = last.patrimonio - first.patrimonio;
+  const changePct = first.patrimonio ? change / first.patrimonio : 0;
+
+  const chartData = snapshots.map((s) => ({
+    date: s.date,
+    Patrimonio: Number(s.patrimonio),
+    Invertido: Number(s.invested),
+  }));
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 24 }}>
+        <Metric label={`Primer registro (${first.date})`} value={fmt$2(Number(first.patrimonio))} />
+        <Metric label={`Hoy (${last.date})`} value={fmt$2(Number(last.patrimonio))} />
+        <Metric label="Cambio del período" value={fmt$2(change)} color={change >= 0 ? GREEN : RED} icon={change >= 0 ? TrendingUp : TrendingDown} />
+        <Metric label="Rendimiento del período" value={fmtPct(changePct)} color={change >= 0 ? GREEN : RED} />
+      </div>
+
+      {snapshots.length < 3 ? (
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 12 }}>
+          Con solo {snapshots.length} {snapshots.length === 1 ? "registro" : "registros"} la gráfica todavía no dice mucho — entre más días abras el sitio, más útil se vuelve esta vista.
+        </div>
+      ) : null}
+
+      <ResponsiveContainer width="100%" height={320}>
+        <LineChart data={chartData} margin={{ left: 10, right: 20, top: 10 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={LINE} />
+          <XAxis dataKey="date" stroke={MUTE} fontSize={11} />
+          <YAxis stroke={MUTE} fontSize={11} tickFormatter={fmt$} width={70} />
+          <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
+          <Line type="monotone" dataKey="Patrimonio" stroke={GOLD} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="Invertido" stroke={MUTE} strokeWidth={1.5} strokeDasharray="4 4" dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+      <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>
+        Se guarda un registro por día (la primera vez que abres el sitio ese día). Línea dorada = patrimonio total, línea punteada = capital invertido.
+      </div>
+    </div>
+  );
 }
 
 // Barra que ubica el precio actual dentro de su rango de referencia
