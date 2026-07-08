@@ -85,6 +85,15 @@ async function manageThesis(payload) {
   return data;
 }
 
+async function manageCash(payload) {
+  const res = await fetch("/api/manage-cash", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
 const STARS = ["", "★", "★★", "★★★", "★★★★", "★★★★★"];
 
 export default function Dashboard() {
@@ -92,6 +101,7 @@ export default function Dashboard() {
   const [watchlist, setWatchlist] = useState([]);
   const [thesis, setThesis] = useState([]);
   const [snapshots, setSnapshots] = useState([]);
+  const [cashMovements, setCashMovements] = useState([]);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
@@ -104,16 +114,18 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps] = await Promise.all([
+      const [pos, wl, th, snaps, cm] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
         sb("snapshots").catch(() => []),
+        sb("cash_movements").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
       setThesis(th);
       setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
+      setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
 
       const items = [];
       const seen = new Set();
@@ -168,14 +180,14 @@ export default function Dashboard() {
   const withValue = enriched.filter((p) => p.value != null);
   const missing = enriched.filter((p) => p.value == null);
 
-  const patrimonio = withValue.reduce((a, p) => a + p.value, 0);
-  const invested = withValue.reduce((a, p) => a + Number(p.cost_basis), 0);
-  const totalGain = patrimonio - invested;
-  const totalPct = invested ? totalGain / invested : 0;
-
   const stocksValue = withValue.filter((p) => p.type === "stock").reduce((a, p) => a + p.value, 0);
   const cryptoValue = withValue.filter((p) => p.type === "crypto").reduce((a, p) => a + p.value, 0);
-  const cashValue = withValue.filter((p) => p.type === "cash").reduce((a, p) => a + p.value, 0);
+  const cashValue = cashMovements.reduce((a, m) => a + (m.type === "deposito" ? Number(m.amount) : -Number(m.amount)), 0);
+
+  const patrimonio = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+  const invested = withValue.reduce((a, p) => a + Number(p.cost_basis), 0) + cashValue;
+  const totalGain = patrimonio - invested;
+  const totalPct = invested ? totalGain / invested : 0;
 
   const snapshotPosted = useRef(false);
   useEffect(() => {
@@ -277,7 +289,7 @@ export default function Dashboard() {
         </div>
 
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -386,6 +398,12 @@ export default function Dashboard() {
           </Panel>
         )}
 
+        {tab === "efectivo" && (
+          <Panel title="Efectivo — depósitos y retiros">
+            <CashTab movements={cashMovements} balance={cashValue} onChanged={loadAll} />
+          </Panel>
+        )}
+
         {tab === "gestionar" && (
           <Panel title="Gestionar posiciones">
             <button onClick={() => setShowAdd((s) => !s)} style={{
@@ -464,6 +482,131 @@ function SemRow({ label, value, color }) {
 
 function Empty() {
   return <div style={{ color: MUTE, fontSize: 13 }}>Sin datos suficientes todavía.</div>;
+}
+
+function CashTab({ movements, balance, onChanged }) {
+  const [showForm, setShowForm] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+
+  async function handleDelete(m) {
+    const pin = window.prompt("Ingresa tu PIN para borrar este movimiento:");
+    if (!pin) return;
+    setBusyId(m.id);
+    try {
+      await manageCash({ pin, action: "delete", id: m.id });
+      onChanged();
+    } catch (e) { alert("No se pudo borrar: " + e.message); }
+    finally { setBusyId(null); }
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 20 }}>
+        <Metric label="Balance de efectivo actual" value={fmt$2(balance)} icon={Wallet} />
+        <button onClick={() => setShowForm((s) => !s)} style={{
+          background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
+          fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+        }}>
+          <Plus size={16} /> {showForm ? "Cancelar" : "Registrar movimiento"}
+        </button>
+      </div>
+
+      {showForm && <CashMovementForm onDone={() => { setShowForm(false); onChanged(); }} />}
+
+      {movements.length === 0 ? (
+        <div style={{ color: MUTE, fontSize: 13 }}>Sin movimientos registrados todavía.</div>
+      ) : (
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+              <th style={{ padding: "8px 6px" }}>Fecha</th>
+              <th style={{ padding: "8px 6px" }}>Tipo</th>
+              <th style={{ padding: "8px 6px", textAlign: "right" }}>Monto</th>
+              <th style={{ padding: "8px 6px" }}>Nota / Para qué</th>
+              <th style={{ padding: "8px 6px" }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {movements.map((m) => (
+              <tr key={m.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "10px 6px", color: MUTE }}>{m.date}</td>
+                <td style={{ padding: "10px 6px" }}>
+                  <span style={{
+                    color: m.type === "deposito" ? GREEN : RED, border: `1px solid ${m.type === "deposito" ? GREEN : RED}`,
+                    borderRadius: 4, padding: "2px 8px", fontSize: 11, fontWeight: 700,
+                  }}>{m.type === "deposito" ? "DEPÓSITO" : "RETIRO"}</span>
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: m.type === "deposito" ? GREEN : RED }}>
+                  {m.type === "deposito" ? "+" : "-"}{fmt$2(Number(m.amount))}
+                </td>
+                <td style={{ padding: "10px 6px", color: m.note ? TXT : MUTE, fontStyle: m.note ? "normal" : "italic" }}>
+                  {m.note || "Sin nota"}
+                </td>
+                <td style={{ padding: "10px 6px", textAlign: "right" }}>
+                  <button onClick={() => handleDelete(m)} disabled={busyId === m.id} style={{
+                    background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
+                    cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
+                  }}><Trash2 size={12} /> {busyId === m.id ? "…" : "Borrar"}</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function CashMovementForm({ onDone }) {
+  const [type, setType] = useState("deposito");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [note, setNote] = useState("");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const inputStyle = { background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!amount || Number(amount) <= 0) { setErr("Pon un monto válido."); return; }
+    setBusy(true);
+    try {
+      await manageCash({
+        pin, action: "add",
+        movement: { type, amount: Number(amount), date, note: note || null },
+      });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
+      <div>
+        <label style={{ fontSize: 11, color: MUTE }}>Tipo *</label>
+        <select style={inputStyle} value={type} onChange={(e) => setType(e.target.value)}>
+          <option value="deposito">Depósito (entra dinero)</option>
+          <option value="retiro">Retiro (sale dinero)</option>
+        </select>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Monto ($) *</label><input style={inputStyle} type="number" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Fecha *</label><input style={inputStyle} type="date" value={date} onChange={(e) => setDate(e.target.value)} /></div>
+      <div style={{ gridColumn: "span 2" }}>
+        <label style={{ fontSize: 11, color: MUTE }}>{type === "retiro" ? "¿Para qué usaste este dinero?" : "¿De dónde vino? (opcional)"}</label>
+        <input style={inputStyle} value={note} onChange={(e) => setNote(e.target.value)} placeholder={type === "retiro" ? "Ej. gasto personal, comisión, transferencia..." : "Ej. depósito de nómina, ahorro mensual..."} />
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+      <div style={{ display: "flex", alignItems: "flex-end" }}>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%" }}>
+          {busy ? "Guardando…" : "Guardar movimiento"}
+        </button>
+      </div>
+      {err && <div style={{ gridColumn: "1 / -1", color: RED, fontSize: 12 }}>{err}</div>}
+    </form>
+  );
 }
 
 function PerformanceTab({ snapshots }) {
@@ -862,7 +1005,7 @@ function AddForm({ onDone }) {
       <div>
         <label style={{ fontSize: 11, color: MUTE }}>Tipo *</label>
         <select style={inputStyle} value={form.type} onChange={(e) => set("type", e.target.value)}>
-          <option value="stock">Acción</option><option value="crypto">Cripto</option><option value="cash">Efectivo</option>
+          <option value="stock">Acción</option><option value="crypto">Cripto</option>
         </select>
       </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Sector</label><input style={inputStyle} value={form.sector} onChange={(e) => set("sector", e.target.value)} /></div>
