@@ -1,11 +1,11 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis,
   Tooltip, CartesianGrid,
 } from "recharts";
 import {
   TrendingUp, TrendingDown, Wallet, Layers, Coins, ShieldAlert, ChevronRight,
-  Plus, Trash2, RefreshCw, AlertTriangle,
+  Plus, Trash2, RefreshCw, AlertTriangle, Search, Eye,
 } from "lucide-react";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -24,37 +24,75 @@ const MUTE = "#8A93B0";
 const fmt$ = (v) => v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 const fmt$2 = (v) => v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const fmtPct = (v) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
+const fmtPct1 = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+const fmtBig = (v) => {
+  if (v == null) return "—";
+  if (v >= 1e12) return `$${(v / 1e12).toFixed(2)}T`;
+  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  return fmt$2(v);
+};
 
-async function fetchPositions() {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/positions?select=*`, {
+async function sb(table) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=*`, {
     headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
   });
-  if (!res.ok) throw new Error("No se pudo leer Supabase (revisa RLS / anon key)");
+  if (!res.ok) throw new Error(`No se pudo leer ${table} de Supabase`);
   return res.json();
 }
 
-async function fetchPrices(stockTickers, cryptoTickers) {
-  const qs = new URLSearchParams({ stocks: stockTickers.join(","), cryptos: cryptoTickers.join(",") });
-  const res = await fetch(`/api/prices?${qs.toString()}`);
-  if (!res.ok) throw new Error("No se pudieron obtener precios en vivo");
+async function fetchMarketData(items) {
+  if (!items.length) return { data: {}, errors: [], updatedAt: null };
+  const res = await fetch("/api/market-data", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items }),
+  });
+  if (!res.ok) throw new Error("No se pudieron obtener datos de mercado");
+  return res.json();
+}
+
+async function searchAssets(q) {
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) throw new Error("Busqueda fallo");
   return res.json();
 }
 
 async function managePosition(payload) {
   const res = await fetch("/api/manage-positions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
   return data;
 }
 
+async function manageWatchlist(payload) {
+  const res = await fetch("/api/manage-watchlist", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
+async function manageThesis(payload) {
+  const res = await fetch("/api/manage-thesis", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
+const STARS = ["", "★", "★★", "★★★", "★★★★", "★★★★★"];
+
 export default function Dashboard() {
   const [positions, setPositions] = useState([]);
-  const [prices, setPrices] = useState({});
-  const [priceErrors, setPriceErrors] = useState([]);
+  const [watchlist, setWatchlist] = useState([]);
+  const [thesis, setThesis] = useState([]);
+  const [marketData, setMarketData] = useState({});
+  const [marketErrors, setMarketErrors] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
@@ -65,13 +103,27 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const pos = await fetchPositions();
+      const [pos, wl, th] = await Promise.all([
+        sb("positions"),
+        sb("watchlist").catch(() => []),
+        sb("thesis").catch(() => []),
+      ]);
       setPositions(pos);
-      const stockTickers = pos.filter((p) => p.type === "stock").map((p) => p.ticker);
-      const cryptoTickers = pos.filter((p) => p.type === "crypto").map((p) => p.ticker);
-      const { prices: live, errors, updatedAt: ts } = await fetchPrices(stockTickers, cryptoTickers);
-      setPrices(live);
-      setPriceErrors(errors || []);
+      setWatchlist(wl);
+      setThesis(th);
+
+      const items = [];
+      const seen = new Set();
+      [...pos.filter((p) => p.type !== "cash"), ...wl].forEach((p) => {
+        const key = `${p.ticker}-${p.type}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        items.push({ ticker: p.ticker, type: p.type, coingeckoId: p.coingecko_id || undefined });
+      });
+
+      const { data, errors, updatedAt: ts } = await fetchMarketData(items);
+      setMarketData(data);
+      setMarketErrors(errors || []);
       setUpdatedAt(ts);
     } catch (e) {
       setLoadError(String(e.message || e));
@@ -86,21 +138,29 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
+  const thesisByTicker = useMemo(() => {
+    const m = {};
+    thesis.forEach((t) => { m[t.ticker] = t; });
+    return m;
+  }, [thesis]);
+
   const enriched = useMemo(() => positions.map((p) => {
     const cost = Number(p.cost_basis);
-    let value = null;
-    let price = null;
+    let value = null, md = null;
     if (p.type === "cash") {
       value = cost;
-      price = 1;
     } else {
-      price = prices[p.ticker];
-      if (price != null) value = Number(p.shares) * price;
+      md = marketData[p.ticker];
+      if (md) value = Number(p.shares) * md.price;
     }
     const gain = value != null ? value - cost : null;
     const pct = value != null && cost ? gain / cost : null;
-    return { ...p, price, value, gain, pct };
-  }), [positions, prices]);
+    return { ...p, value, gain, pct, market: md || null, thesis: thesisByTicker[p.ticker] || null };
+  }), [positions, marketData, thesisByTicker]);
+
+  const watchlistEnriched = useMemo(() => watchlist.map((w) => ({
+    ...w, market: marketData[w.ticker] || null,
+  })), [watchlist, marketData]);
 
   const withValue = enriched.filter((p) => p.value != null);
   const missing = enriched.filter((p) => p.value == null);
@@ -154,7 +214,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <div style={{ maxWidth: 1160, margin: "0 auto", padding: "40px 24px 80px" }}>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "40px 24px 80px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 24, flexWrap: "wrap", gap: 16 }}>
           <div>
             <div style={{ fontSize: 12, letterSpacing: 3, color: GOLD, fontWeight: 600, marginBottom: 6 }}>FAMILY OFFICE DIGITAL</div>
@@ -172,18 +232,14 @@ export default function Dashboard() {
         </div>
 
         {loadError && (
-          <div style={{ background: "#2A1518", border: `1px solid ${RED}`, borderRadius: 10, padding: "14px 18px", marginBottom: 20, display: "flex", gap: 10, alignItems: "flex-start" }}>
-            <AlertTriangle size={18} color={RED} style={{ flexShrink: 0, marginTop: 2 }} />
-            <div style={{ fontSize: 13, color: TXT }}>
-              No se pudo cargar el portafolio: {loadError}. Revisa que las variables de entorno VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY estén bien puestas en Vercel.
-            </div>
-          </div>
+          <Banner color={RED} icon={AlertTriangle}>
+            No se pudo cargar el portafolio: {loadError}.
+          </Banner>
         )}
-
         {missing.length > 0 && !loadError && (
-          <div style={{ background: "#2A2413", border: `1px solid ${AMBER}`, borderRadius: 10, padding: "12px 18px", marginBottom: 20, fontSize: 13, color: TXT }}>
-            Sin precio en vivo por ahora: {missing.map((m) => m.ticker).join(", ")}. No se inventa su valor — no cuentan en los totales hasta que haya dato real.
-          </div>
+          <Banner color={AMBER}>
+            Sin precio en vivo por ahora: {missing.map((m) => m.ticker).join(", ")}. No se inventa su valor.
+          </Banner>
         )}
 
         <div style={{ background: `linear-gradient(135deg, ${PANEL} 0%, #151C33 100%)`, border: `1px solid ${LINE}`, borderRadius: 14, padding: "32px 36px", marginBottom: 20 }}>
@@ -202,14 +258,14 @@ export default function Dashboard() {
           <KpiCard icon={Wallet} label="Efectivo" value={fmt$2(cashValue)} />
           <KpiCard icon={Layers} label="Valor en acciones" value={fmt$2(stocksValue)} />
           <KpiCard icon={Coins} label="Valor en cripto" value={fmt$2(cryptoValue)} />
-          <KpiCard icon={ShieldAlert} label="Posiciones" value={`${positions.length}`} />
+          <KpiCard icon={Eye} label="En watchlist" value={`${watchlist.length}`} />
         </div>
 
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["posiciones", "Top Posiciones"], ["allocation", "Allocation"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
-              fontSize: 13, padding: "10px 18px", cursor: "pointer",
+              fontSize: 13, padding: "10px 16px", cursor: "pointer",
               borderBottom: tab === key ? `2px solid ${GOLD}` : "2px solid transparent", marginBottom: -1,
             }}>{label}</button>
           ))}
@@ -246,9 +302,6 @@ export default function Dashboard() {
                   <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
                   <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
                   <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
-                  <div style={{ fontSize: 11, color: MUTE, marginTop: 14, lineHeight: 1.5 }}>
-                    Referencia informativa: &gt;20% en una sola posición = alta concentración. Sin recomendación automática.
-                  </div>
                 </>
               )}
             </Panel>
@@ -270,8 +323,14 @@ export default function Dashboard() {
         )}
 
         {tab === "posiciones" && (
-          <Panel title="Top Posiciones">
-            <PositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} />
+          <Panel title="Top Posiciones — con contexto de rango">
+            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} />
+          </Panel>
+        )}
+
+        {tab === "tesis" && (
+          <Panel title="Investment Thesis — por qué tienes cada posición">
+            <ThesisTab rows={enriched.filter((p) => p.type !== "cash")} onSaved={loadAll} />
           </Panel>
         )}
 
@@ -298,6 +357,14 @@ export default function Dashboard() {
           </Panel>
         )}
 
+        {tab === "buscar" && <SearchTab onWatchlistAdded={loadAll} />}
+
+        {tab === "watchlist" && (
+          <Panel title="Watchlist">
+            <WatchlistTable rows={watchlistEnriched} onDeleted={loadAll} />
+          </Panel>
+        )}
+
         {tab === "gestionar" && (
           <Panel title="Gestionar posiciones">
             <button onClick={() => setShowAdd((s) => !s)} style={{
@@ -313,9 +380,18 @@ export default function Dashboard() {
 
         <div style={{ marginTop: 40, display: "flex", alignItems: "center", gap: 8, color: MUTE, fontSize: 12 }}>
           <ChevronRight size={14} />
-          Precios de acciones vía Finnhub, cripto vía CoinGecko. Se refrescan solos cada 60s. No sustituye tu estado de cuenta oficial.
+          Precios de acciones vía Finnhub, cripto vía CoinGecko. Rango de referencia: 52 semanas (acciones) / histórico ATH-ATL (cripto). Informativo, no es asesoría de inversión.
         </div>
       </div>
+    </div>
+  );
+}
+
+function Banner({ color, icon: Icon = AlertTriangle, children }) {
+  return (
+    <div style={{ background: "#1A1710", border: `1px solid ${color}`, borderRadius: 10, padding: "12px 18px", marginBottom: 20, display: "flex", gap: 10, alignItems: "flex-start", fontSize: 13 }}>
+      <Icon size={16} color={color} style={{ flexShrink: 0, marginTop: 2 }} />
+      <div>{children}</div>
     </div>
   );
 }
@@ -369,40 +445,74 @@ function Empty() {
   return <div style={{ color: MUTE, fontSize: 13 }}>Sin datos suficientes todavía.</div>;
 }
 
-function PositionsTable({ rows, patrimonio }) {
+// Barra que ubica el precio actual dentro de su rango de referencia
+function RangeBar({ price, low, high, label, compact }) {
+  if (low == null || high == null || high <= low || price == null) {
+    return <div style={{ fontSize: 11, color: MUTE }}>Sin rango disponible</div>;
+  }
+  const pct = Math.min(100, Math.max(0, ((price - low) / (high - low)) * 100));
+  const color = pct < 25 ? GREEN : pct > 75 ? RED : AMBER;
+  const tag = pct < 25 ? "cerca del mínimo" : pct > 75 ? "cerca del máximo" : "rango medio";
   return (
-    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-      <thead>
-        <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
-          <th style={{ padding: "8px 6px" }}>#</th>
-          <th style={{ padding: "8px 6px" }}>Activo</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>Valor</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>Ganancia</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>% Patrimonio</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((p, i) => (
-          <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
-            <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
-            <td style={{ padding: "10px 6px" }}><b>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></td>
-            <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}</td>
-            <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
-              {p.gain != null ? fmt$2(p.gain) : "—"}
-            </td>
-            <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: GOLD }}>
-              {patrimonio ? ((p.value / patrimonio) * 100).toFixed(2) : "0.00"}%
-            </td>
+    <div style={{ minWidth: compact ? 120 : 180 }}>
+      {!compact && (
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: MUTE, marginBottom: 3 }}>
+          <span>Rango {label}</span><span style={{ color, fontWeight: 700 }}>{tag}</span>
+        </div>
+      )}
+      <div style={{ position: "relative", height: 6, background: LINE, borderRadius: 3 }}>
+        <div style={{ position: "absolute", left: `${pct}%`, top: -2, width: 10, height: 10, borderRadius: "50%", background: color, transform: "translateX(-50%)" }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: MUTE, marginTop: 3 }}>
+        <span>{fmt$2(low)}</span><span>{fmt$2(high)}</span>
+      </div>
+    </div>
+  );
+}
+
+function RichPositionsTable({ rows, patrimonio }) {
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 760 }}>
+        <thead>
+          <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+            <th style={{ padding: "8px 6px" }}>#</th>
+            <th style={{ padding: "8px 6px" }}>Activo</th>
+            <th style={{ padding: "8px 6px" }}>Convicción</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Valor</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Ganancia</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Cap. Mercado</th>
+            <th style={{ padding: "8px 6px" }}>Rango</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {rows.map((p, i) => (
+            <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+              <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
+              <td style={{ padding: "10px 6px" }}><b>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></td>
+              <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
+              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}</td>
+              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
+                {p.gain != null ? fmt$2(p.gain) : "—"}
+              </td>
+              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (p.market?.changePct || 0) >= 0 ? GREEN : RED }}>
+                {p.market?.changePct != null ? fmtPct1(p.market.changePct) : "—"}
+              </td>
+              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmtBig(p.market?.marketCap)}</td>
+              <td style={{ padding: "10px 6px" }}>
+                {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
 function ManageTable({ rows, onDeleted }) {
   const [busyId, setBusyId] = useState(null);
-
   async function handleDelete(row) {
     const pin = window.prompt(`Ingresa tu PIN para eliminar ${row.ticker}:`);
     if (!pin) return;
@@ -410,23 +520,16 @@ function ManageTable({ rows, onDeleted }) {
     try {
       await managePosition({ pin, action: "delete", id: row.id });
       onDeleted();
-    } catch (e) {
-      alert("No se pudo eliminar: " + e.message);
-    } finally {
-      setBusyId(null);
-    }
+    } catch (e) { alert("No se pudo eliminar: " + e.message); }
+    finally { setBusyId(null); }
   }
-
   return (
     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginTop: 10 }}>
       <thead>
         <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
-          <th style={{ padding: "8px 6px" }}>Ticker</th>
-          <th style={{ padding: "8px 6px" }}>Nombre</th>
-          <th style={{ padding: "8px 6px" }}>Tipo</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>Acciones/Unid.</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>Costo</th>
-          <th style={{ padding: "8px 6px" }}></th>
+          <th style={{ padding: "8px 6px" }}>Ticker</th><th style={{ padding: "8px 6px" }}>Nombre</th>
+          <th style={{ padding: "8px 6px" }}>Tipo</th><th style={{ padding: "8px 6px", textAlign: "right" }}>Acciones/Unid.</th>
+          <th style={{ padding: "8px 6px", textAlign: "right" }}>Costo</th><th style={{ padding: "8px 6px" }}></th>
         </tr>
       </thead>
       <tbody>
@@ -439,11 +542,9 @@ function ManageTable({ rows, onDeleted }) {
             <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(Number(p.cost_basis))}</td>
             <td style={{ padding: "10px 6px", textAlign: "right" }}>
               <button onClick={() => handleDelete(p)} disabled={busyId === p.id} style={{
-                background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6,
-                padding: "4px 8px", cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
-              }}>
-                <Trash2 size={12} /> {busyId === p.id ? "…" : "Eliminar"}
-              </button>
+                background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
+                cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
+              }}><Trash2 size={12} /> {busyId === p.id ? "…" : "Eliminar"}</button>
             </td>
           </tr>
         ))}
@@ -452,20 +553,223 @@ function ManageTable({ rows, onDeleted }) {
   );
 }
 
+function WatchlistTable({ rows, onDeleted }) {
+  const [busyId, setBusyId] = useState(null);
+  async function handleDelete(row) {
+    const pin = window.prompt(`Ingresa tu PIN para quitar ${row.ticker} de la watchlist:`);
+    if (!pin) return;
+    setBusyId(row.id);
+    try {
+      await manageWatchlist({ pin, action: "delete", id: row.id });
+      onDeleted();
+    } catch (e) { alert("No se pudo eliminar: " + e.message); }
+    finally { setBusyId(null); }
+  }
+  if (rows.length === 0) return <div style={{ color: MUTE, fontSize: 13 }}>Tu watchlist está vacía. Agrega activos desde la pestaña "Buscar".</div>;
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 780 }}>
+        <thead>
+          <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+            <th style={{ padding: "8px 6px" }}>Activo</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Precio</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
+            <th style={{ padding: "8px 6px" }}>Rango</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Tu precio objetivo</th>
+            <th style={{ padding: "8px 6px" }}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((w) => {
+            const hitTarget = w.target_price != null && w.market?.price != null && w.market.price <= Number(w.target_price);
+            return (
+              <tr key={w.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "10px 6px" }}><b>{w.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{w.name}</span></td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{w.market ? fmt$2(w.market.price) : "sin dato"}</td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (w.market?.changePct || 0) >= 0 ? GREEN : RED }}>
+                  {w.market?.changePct != null ? fmtPct1(w.market.changePct) : "—"}
+                </td>
+                <td style={{ padding: "10px 6px" }}>{w.market ? <RangeBar price={w.market.price} low={w.market.low} high={w.market.high} label={w.market.rangeLabel} compact /> : "—"}</td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: hitTarget ? GREEN : TXT }}>
+                  {w.target_price != null ? fmt$2(Number(w.target_price)) : "—"}{hitTarget && " ✓"}
+                </td>
+                <td style={{ padding: "10px 6px", textAlign: "right" }}>
+                  <button onClick={() => handleDelete(w)} disabled={busyId === w.id} style={{
+                    background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
+                    cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
+                  }}><Trash2 size={12} /> {busyId === w.id ? "…" : "Quitar"}</button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SearchTab({ onWatchlistAdded }) {
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [showWlForm, setShowWlForm] = useState(false);
+  const debounceRef = useRef(null);
+
+  function onChange(v) {
+    setQ(v);
+    setSelected(null);
+    setDetail(null);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (v.trim().length < 1) { setResults([]); return; }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const { results } = await searchAssets(v.trim());
+        setResults(results || []);
+      } catch (e) { setResults([]); }
+      finally { setSearching(false); }
+    }, 400);
+  }
+
+  async function selectResult(r) {
+    setSelected(r);
+    setShowWlForm(false);
+    setDetailLoading(true);
+    try {
+      const { data } = await fetchMarketData([{ ticker: r.ticker, type: r.type, coingeckoId: r.coingeckoId }]);
+      setDetail(data[r.ticker] || null);
+    } catch (e) { setDetail(null); }
+    finally { setDetailLoading(false); }
+  }
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "10px 12px", fontSize: 14, width: "100%" };
+
+  return (
+    <Panel title="Buscar cualquier activo (real, no solo lo tuyo)">
+      <div style={{ position: "relative", marginBottom: 16 }}>
+        <Search size={16} color={MUTE} style={{ position: "absolute", left: 12, top: 12 }} />
+        <input style={{ ...inputStyle, paddingLeft: 36 }} value={q} onChange={(e) => onChange(e.target.value)} placeholder="Ej. Tesla, TSLA, Solana, Uber…" />
+      </div>
+
+      {searching && <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Buscando…</div>}
+
+      {results.length > 0 && !selected && (
+        <div style={{ display: "grid", gap: 6, marginBottom: 20 }}>
+          {results.map((r, i) => (
+            <button key={i} onClick={() => selectResult(r)} style={{
+              background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
+              textAlign: "left", cursor: "pointer", color: TXT, display: "flex", justifyContent: "space-between", alignItems: "center",
+            }}>
+              <span><b>{r.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{r.name}</span></span>
+              <span style={{ fontSize: 10, color: GOLD, border: `1px solid ${GOLD}`, borderRadius: 4, padding: "2px 6px" }}>
+                {r.type === "stock" ? "ACCIÓN" : "CRIPTO"}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {selected && (
+        <div style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 700 }}>{selected.ticker}</div>
+              <div style={{ color: MUTE, fontSize: 13 }}>{selected.name}</div>
+            </div>
+            <button onClick={() => { setSelected(null); setDetail(null); }} style={{ background: "none", border: "none", color: MUTE, cursor: "pointer", fontSize: 12 }}>✕ cerrar</button>
+          </div>
+
+          {detailLoading && <div style={{ color: MUTE, fontSize: 13 }}>Cargando datos reales…</div>}
+
+          {!detailLoading && detail && (
+            <>
+              <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 18 }}>
+                <Metric label="Precio actual" value={fmt$2(detail.price)} />
+                <Metric label="Cambio del día" value={detail.changePct != null ? fmtPct1(detail.changePct) : "—"} color={(detail.changePct || 0) >= 0 ? GREEN : RED} />
+                <Metric label="Cap. de mercado" value={fmtBig(detail.marketCap)} />
+                {detail.peRatio != null && <Metric label="P/E" value={detail.peRatio.toFixed(1)} />}
+              </div>
+              <RangeBar price={detail.price} low={detail.low} high={detail.high} label={detail.rangeLabel} />
+
+              <div style={{ marginTop: 20 }}>
+                {!showWlForm ? (
+                  <button onClick={() => setShowWlForm(true)} style={{
+                    background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
+                    fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+                  }}><Plus size={16} /> Agregar a Watchlist</button>
+                ) : (
+                  <WatchlistAddForm result={selected} onDone={() => { setShowWlForm(false); onWatchlistAdded(); }} />
+                )}
+              </div>
+              <div style={{ fontSize: 11, color: MUTE, marginTop: 14 }}>
+                Si ya la compraste, agrégala en la pestaña "Gestionar" con tus acciones y costo real — la watchlist es solo para vigilar, no cuenta en tu patrimonio.
+              </div>
+            </>
+          )}
+          {!detailLoading && !detail && <div style={{ color: AMBER, fontSize: 13 }}>No se pudo obtener el dato en vivo de este activo ahora mismo.</div>}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function WatchlistAddForm({ result, onDone }) {
+  const [targetPrice, setTargetPrice] = useState("");
+  const [notes, setNotes] = useState("");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const inputStyle = { background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    setBusy(true);
+    try {
+      await manageWatchlist({
+        pin, action: "add",
+        item: {
+          ticker: result.ticker, name: result.name, type: result.type,
+          coingecko_id: result.coingeckoId || null,
+          target_price: targetPrice ? Number(targetPrice) : null,
+          notes: notes || null,
+        },
+      });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 10, marginTop: 10 }}>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Precio objetivo (opcional)</label><input style={inputStyle} type="number" step="any" value={targetPrice} onChange={(e) => setTargetPrice(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Notas (opcional)</label><input style={inputStyle} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+      <div style={{ display: "flex", alignItems: "flex-end" }}>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%" }}>
+          {busy ? "Guardando…" : "Guardar en Watchlist"}
+        </button>
+      </div>
+      {err && <div style={{ gridColumn: "1/-1", color: RED, fontSize: 12 }}>{err}</div>}
+    </form>
+  );
+}
+
 function AddForm({ onDone }) {
   const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", shares: "", cost_basis: "" });
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-
   function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
-
   async function submit(e) {
     e.preventDefault();
     setErr(null);
     if (!form.ticker || !form.name || !form.shares || !form.cost_basis) {
-      setErr("Faltan campos obligatorios (ticker, nombre, acciones/unidades, costo).");
-      return;
+      setErr("Faltan campos obligatorios."); return;
     }
     setBusy(true);
     try {
@@ -478,15 +782,10 @@ function AddForm({ onDone }) {
         },
       });
       onDone();
-    } catch (e) {
-      setErr(e.message);
-    } finally {
-      setBusy(false);
-    }
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
   }
-
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
-
   return (
     <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
       <div><label style={{ fontSize: 11, color: MUTE }}>Ticker *</label><input style={inputStyle} value={form.ticker} onChange={(e) => set("ticker", e.target.value)} placeholder="AAPL" /></div>
@@ -494,9 +793,7 @@ function AddForm({ onDone }) {
       <div>
         <label style={{ fontSize: 11, color: MUTE }}>Tipo *</label>
         <select style={inputStyle} value={form.type} onChange={(e) => set("type", e.target.value)}>
-          <option value="stock">Acción</option>
-          <option value="crypto">Cripto</option>
-          <option value="cash">Efectivo</option>
+          <option value="stock">Acción</option><option value="crypto">Cripto</option><option value="cash">Efectivo</option>
         </select>
       </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Sector</label><input style={inputStyle} value={form.sector} onChange={(e) => set("sector", e.target.value)} /></div>
@@ -505,12 +802,143 @@ function AddForm({ onDone }) {
       <div><label style={{ fontSize: 11, color: MUTE }}>Costo total ($) *</label><input style={inputStyle} type="number" step="any" value={form.cost_basis} onChange={(e) => set("cost_basis", e.target.value)} /></div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
       <div style={{ display: "flex", alignItems: "flex-end" }}>
-        <button type="submit" disabled={busy} style={{
-          background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px",
-          fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%",
-        }}>{busy ? "Guardando…" : "Guardar"}</button>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%" }}>
+          {busy ? "Guardando…" : "Guardar"}
+        </button>
       </div>
       {err && <div style={{ gridColumn: "1 / -1", color: RED, fontSize: 12 }}>{err}</div>}
+    </form>
+  );
+}
+
+function ConvictionStars({ value }) {
+  if (!value) return <span style={{ color: MUTE, fontSize: 12 }}>Sin definir</span>;
+  const stars = "★".repeat(value) + "☆".repeat(5 - value);
+  const color = value >= 4 ? GOLD : value >= 3 ? TXT : MUTE;
+  return <span style={{ color, letterSpacing: 1 }}>{stars}</span>;
+}
+
+function ThesisTab({ rows, onSaved }) {
+  const [editing, setEditing] = useState(null);
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      {rows.length === 0 && <Empty />}
+      {rows.map((p) => {
+        const isEditing = editing === p.ticker;
+        const rangePct = p.market && p.market.low != null && p.market.high != null && p.market.high > p.market.low
+          ? ((p.market.price - p.market.low) / (p.market.high - p.market.low)) * 100
+          : null;
+        const contextNote = p.thesis?.conviction >= 4 && rangePct != null && rangePct < 25
+          ? `Es una posición de tu mayor convicción (${p.thesis.conviction}★) y hoy está cerca del mínimo de su ${p.market.rangeLabel}.`
+          : null;
+
+        return (
+          <div key={p.id} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: 18 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>{p.ticker} <span style={{ color: MUTE, fontSize: 13, fontWeight: 400 }}>{p.name}</span></div>
+                <div style={{ marginTop: 4 }}><ConvictionStars value={p.thesis?.conviction} /></div>
+              </div>
+              <button onClick={() => setEditing(isEditing ? null : p.ticker)} style={{
+                background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6,
+                padding: "6px 12px", fontSize: 12, cursor: "pointer",
+              }}>{isEditing ? "Cancelar" : (p.thesis ? "Editar" : "Definir tesis")}</button>
+            </div>
+
+            {contextNote && (
+              <div style={{ marginTop: 10, fontSize: 12, color: GREEN, background: "#0F2A1D", border: `1px solid ${GREEN}`, borderRadius: 6, padding: "8px 10px" }}>
+                {contextNote}
+              </div>
+            )}
+
+            {!isEditing ? (
+              <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13 }}>
+                <ThesisField label="¿Por qué la compré?" value={p.thesis?.why_bought} />
+                <ThesisField label="¿Qué tiene de especial?" value={p.thesis?.what_special} />
+                <ThesisField label="¿Qué la haría vender?" value={p.thesis?.sell_trigger} />
+                <ThesisField label="Horizonte" value={p.thesis?.horizon} />
+                <ThesisField label="Riesgos" value={p.thesis?.risks} />
+              </div>
+            ) : (
+              <ThesisEditForm ticker={p.ticker} current={p.thesis} onDone={() => { setEditing(null); onSaved(); }} />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ThesisField({ label, value }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10, color: MUTE, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 3 }}>{label}</div>
+      <div style={{ color: value ? TXT : MUTE, fontStyle: value ? "normal" : "italic" }}>{value || "Pendiente — sin definir"}</div>
+    </div>
+  );
+}
+
+function ThesisEditForm({ ticker, current, onDone }) {
+  const [conviction, setConviction] = useState(current?.conviction || "");
+  const [whyBought, setWhyBought] = useState(current?.why_bought || "");
+  const [whatSpecial, setWhatSpecial] = useState(current?.what_special || "");
+  const [sellTrigger, setSellTrigger] = useState(current?.sell_trigger || "");
+  const [horizon, setHorizon] = useState(current?.horizon || "");
+  const [risks, setRisks] = useState(current?.risks || "");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const inputStyle = { background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%", resize: "vertical" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    setBusy(true);
+    try {
+      await manageThesis({
+        pin, ticker,
+        fields: {
+          conviction: conviction ? Number(conviction) : null,
+          why_bought: whyBought || null,
+          what_special: whatSpecial || null,
+          sell_trigger: sellTrigger || null,
+          horizon: horizon || null,
+          risks: risks || null,
+        },
+      });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ marginTop: 14, display: "grid", gap: 10 }}>
+      <div>
+        <label style={{ fontSize: 11, color: MUTE }}>Convicción</label>
+        <select style={inputStyle} value={conviction} onChange={(e) => setConviction(e.target.value)}>
+          <option value="">Sin definir</option>
+          <option value="1">★ (1) Sin interés</option>
+          <option value="2">★★ (2) Especulativa</option>
+          <option value="3">★★★ (3) Buena empresa, mantener</option>
+          <option value="4">★★★★ (4) Excelente, comprar en correcciones</option>
+          <option value="5">★★★★★ (5) Posición núcleo</option>
+        </select>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>¿Por qué la compré?</label><textarea style={inputStyle} rows={2} value={whyBought} onChange={(e) => setWhyBought(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>¿Qué tiene de especial?</label><textarea style={inputStyle} rows={2} value={whatSpecial} onChange={(e) => setWhatSpecial(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>¿Qué tendría que pasar para venderla?</label><textarea style={inputStyle} rows={2} value={sellTrigger} onChange={(e) => setSellTrigger(e.target.value)} /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Horizonte</label><input style={inputStyle} value={horizon} onChange={(e) => setHorizon(e.target.value)} placeholder="Ej. 10+ años" /></div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Riesgos principales</label><textarea style={inputStyle} rows={2} value={risks} onChange={(e) => setRisks(e.target.value)} /></div>
+      <button type="submit" disabled={busy} style={{
+        background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px",
+        fontWeight: 700, fontSize: 13, cursor: "pointer",
+      }}>{busy ? "Guardando…" : "Guardar tesis"}</button>
+      {err && <div style={{ color: RED, fontSize: 12 }}>{err}</div>}
     </form>
   );
 }
