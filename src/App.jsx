@@ -282,7 +282,7 @@ export default function Dashboard() {
 
         <div style={{ background: `linear-gradient(135deg, ${PANEL} 0%, #151C33 100%)`, border: `1px solid ${LINE}`, borderRadius: 14, padding: "32px 36px", marginBottom: 20 }}>
           <div style={{ fontSize: 12, color: MUTE, letterSpacing: 1.5, marginBottom: 8 }}>PATRIMONIO TOTAL (con dato en vivo)</div>
-          <div className="display num" style={{ fontSize: 56, fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
+          <div className="display num" style={{ fontSize: "clamp(32px, 8vw, 56px)", fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
             {fmt$2(patrimonio)}
           </div>
           <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap" }}>
@@ -570,7 +570,8 @@ function CashTab({ movements, balance, onChanged }) {
       {movements.length === 0 ? (
         <div style={{ color: MUTE, fontSize: 13 }}>Sin movimientos registrados todavía.</div>
       ) : (
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+        <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 640 }}>
           <thead>
             <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
               <th style={{ padding: "8px 6px" }}>Fecha</th>
@@ -606,6 +607,7 @@ function CashTab({ movements, balance, onChanged }) {
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -790,7 +792,8 @@ function ManageTable({ rows, onDeleted }) {
     finally { setBusyId(null); }
   }
   return (
-    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginTop: 10 }}>
+    <div style={{ overflowX: "auto" }}>
+    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginTop: 10, minWidth: 600 }}>
       <thead>
         <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
           <th style={{ padding: "8px 6px" }}>Ticker</th><th style={{ padding: "8px 6px" }}>Nombre</th>
@@ -816,6 +819,7 @@ function ManageTable({ rows, onDeleted }) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 
