@@ -4,6 +4,7 @@
 // se guarda un "total" aparte -- asi nunca se desincroniza.
 
 import { createClient } from "@supabase/supabase-js";
+import { checkRateLimit, recordFailedAttempt } from "../lib/security.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -17,7 +18,13 @@ export default async function handler(req, res) {
 
   const { pin, action, movement, id } = req.body || {};
 
+  const { blocked } = await checkRateLimit(supabase);
+  if (blocked) {
+    return res.status(429).json({ error: "rate_limited", detail: "Demasiados intentos fallidos. Espera unos minutos e intenta de nuevo." });
+  }
+
   if (!pin || pin !== process.env.MONI_PIN) {
+    await recordFailedAttempt(supabase);
     return res.status(401).json({ error: "invalid_pin" });
   }
 
