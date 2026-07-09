@@ -94,6 +94,37 @@ async function manageCash(payload) {
   return data;
 }
 
+async function manageGoal(payload) {
+  const res = await fetch("/api/manage-goal", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
+async function fetchMarketPulse() {
+  const res = await fetch("/api/market-pulse");
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// Opportunity Score (0-100), explicable: convicción + cercanía al mínimo + momentum reciente.
+// Cada pieza es un número real ya calculado en otra parte -- esto solo los combina.
+function scoreBreakdown({ price, low, high, changePct, conviction }) {
+  const convictionPts = conviction ? Math.round((conviction / 5) * 40) : 0;
+  let rangePts = 0;
+  if (low != null && high != null && high > low && price != null) {
+    const rangePct = ((price - low) / (high - low)) * 100;
+    rangePts = Math.round((100 - rangePct) * 0.4);
+  }
+  const momentumPts = changePct != null
+    ? Math.max(0, Math.min(20, Math.round(10 - changePct * 2)))
+    : 10;
+  const total = Math.max(0, Math.min(100, convictionPts + rangePts + momentumPts));
+  return { convictionPts, rangePts, momentumPts, total };
+}
+
 const STARS = ["", "★", "★★", "★★★", "★★★★", "★★★★★"];
 
 export default function Dashboard() {
@@ -103,6 +134,8 @@ export default function Dashboard() {
   const [snapshots, setSnapshots] = useState([]);
   const [cashMovements, setCashMovements] = useState([]);
   const [transactions, setTransactions] = useState([]);
+  const [goal, setGoal] = useState(null);
+  const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
@@ -115,13 +148,14 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goals] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
         sb("snapshots").catch(() => []),
         sb("cash_movements").catch(() => []),
         sb("transactions").catch(() => []),
+        sb("goals").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
@@ -129,6 +163,9 @@ export default function Dashboard() {
       setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
       setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      setGoal(goals && goals.length ? goals[0] : null);
+
+      fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
 
       const items = [];
       const seen = new Set();
@@ -214,25 +251,91 @@ export default function Dashboard() {
     { name: "Efectivo", value: cashValue, color: MUTE },
   ].filter((a) => a.value > 0);
 
-  const temaMap = {};
-  withValue.filter((p) => p.type !== "cash").forEach((p) => {
-    const key = p.tema || "Sin clasificar";
-    temaMap[key] = (temaMap[key] || 0) + p.value;
-  });
-  const temaData = Object.entries(temaMap).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }));
-
   const concColor = top1Pct > 0.35 ? RED : top1Pct > 0.2 ? AMBER : GREEN;
 
-  const opportunities = useMemo(() => {
-    return withValue
-      .filter((p) => p.type !== "cash" && p.thesis?.conviction >= 4 && p.market?.low != null && p.market?.high != null && p.market.high > p.market.low)
-      .map((p) => ({
-        ...p,
-        rangePct: ((p.market.price - p.market.low) / (p.market.high - p.market.low)) * 100,
-      }))
-      .sort((a, b) => a.rangePct - b.rangePct)
+  // Oportunidades con Opportunity Score, dentro y fuera de cartera
+  const scoredOpportunities = useMemo(() => {
+    const fromPortfolio = withValue
+      .filter((p) => p.type !== "cash" && p.market)
+      .map((p) => {
+        const b = scoreBreakdown({
+          price: p.market.price, low: p.market.low, high: p.market.high,
+          changePct: p.market.changePct, conviction: p.thesis?.conviction || 0,
+        });
+        return { ticker: p.ticker, name: p.name, source: "cartera", conviction: p.thesis?.conviction || 0, market: p.market, breakdown: b, score: b.total };
+      });
+    const fromWatchlist = watchlist
+      .filter((w) => marketData[w.ticker])
+      .map((w) => {
+        const md = marketData[w.ticker];
+        const b = scoreBreakdown({ price: md.price, low: md.low, high: md.high, changePct: md.changePct, conviction: 0 });
+        const hitTarget = w.target_price != null && md.price <= Number(w.target_price);
+        const total = Math.min(100, b.total + (hitTarget ? 20 : 0));
+        return { ticker: w.ticker, name: w.name, source: "watchlist", conviction: 0, market: md, breakdown: { ...b, total }, score: total, hitTarget };
+      });
+    return [...fromPortfolio, ...fromWatchlist]
+      .filter((o) => o.score >= 50)
+      .sort((a, b) => b.score - a.score)
       .slice(0, 5);
-  }, [withValue]);
+  }, [withValue, watchlist, marketData]);
+
+  // Estado de Hoy: motor de reglas, riesgo > oportunidad > default. Moni AI solo narra esto, nunca lo decide.
+  const estadoDeHoy = useMemo(() => {
+    if (patrimonio === 0) return { emoji: "🟢", label: "Sin datos suficientes", detail: "" };
+    if (top1Pct > 0.35) {
+      const top = top5[0];
+      return {
+        emoji: "🔴", label: `Revisar concentración en ${top?.ticker || ""}`,
+        detail: `Tu posición #1 pesa ${(top1Pct * 100).toFixed(1)}% de tu patrimonio.`,
+      };
+    }
+    if (scoredOpportunities.length && scoredOpportunities[0].score >= 80) {
+      const o = scoredOpportunities[0];
+      return {
+        emoji: "🟡", label: `Revisar ${o.ticker}${o.source === "watchlist" ? " en watchlist" : ""}`,
+        detail: o.source === "cartera"
+          ? `Posición ${o.conviction}★ con Opportunity Score ${o.score}.`
+          : `En watchlist, Opportunity Score ${o.score}.`,
+      };
+    }
+    return { emoji: "🟢", label: "Mantener estrategia", detail: "Ninguna señal relevante hoy." };
+  }, [patrimonio, top1Pct, top5, scoredOpportunities]);
+
+  // Estado de la Estrategia: reglas sobre datos ya calculados, sin opinión de IA
+  const estadoEstrategia = useMemo(() => {
+    if (patrimonio === 0) return [];
+    const badges = [];
+    if (top1Pct > 0.35) badges.push({ text: "Concentración elevada", color: RED });
+    else if (top1Pct > 0.2) badges.push({ text: "Concentración moderada", color: AMBER });
+    else badges.push({ text: "Diversificación correcta", color: GREEN });
+
+    if (cashValue / patrimonio < 0.05) badges.push({ text: "Liquidez baja", color: AMBER });
+
+    const iaTemas = ["IA / Cloud", "IA / Software", "Semiconductores IA", "Infraestructura IA"];
+    const iaValue = withValue.filter((p) => iaTemas.includes(p.tema)).reduce((a, p) => a + p.value, 0);
+    const iaPct = iaValue / patrimonio;
+    if (iaPct > 0.55) badges.push({ text: `Sobrepeso IA (${(iaPct * 100).toFixed(0)}%)`, color: AMBER });
+
+    if (badges.length === 1 && badges[0].text === "Diversificación correcta") {
+      badges.push({ text: "Estrategia alineada", color: GREEN });
+    }
+    return badges;
+  }, [patrimonio, top1Pct, cashValue, withValue]);
+
+  // Qué cambió desde tu última visita: resta simple contra el snapshot anterior, ya existente en la tabla snapshots
+  const cambiosRecientes = useMemo(() => {
+    if (snapshots.length < 2) return null;
+    const baseline = snapshots[snapshots.length - 2];
+    const deltaPatrimonio = patrimonio - Number(baseline.patrimonio);
+    const deltaPct = Number(baseline.patrimonio) ? deltaPatrimonio / Number(baseline.patrimonio) : 0;
+    const movers = [...withValue]
+      .filter((p) => p.type !== "cash" && p.market?.changePct != null)
+      .sort((a, b) => Math.abs(b.market.changePct) - Math.abs(a.market.changePct))
+      .slice(0, 2);
+    return { baselineDate: baseline.date, deltaPatrimonio, deltaPct, movers };
+  }, [snapshots, patrimonio, withValue]);
+
+  const goalPct = goal?.target_amount ? Math.min(100, (patrimonio / Number(goal.target_amount)) * 100) : null;
 
   return (
     <div style={{ background: NAVY_BG, minHeight: "100vh", color: TXT, fontFamily: "'IBM Plex Sans','Inter',sans-serif" }}>
@@ -293,6 +396,7 @@ export default function Dashboard() {
             <Metric label="Ganancia / Pérdida" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
             <Metric label="Rendimiento" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
           </div>
+          <GoalBar goal={goal} patrimonio={patrimonio} goalPct={goalPct} onSaved={loadAll} />
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 28 }}>
@@ -313,55 +417,84 @@ export default function Dashboard() {
         </div>
 
         {tab === "resumen" && (
-          <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 20 }}>
-            <Panel title="🎯 Ranking de Oportunidad — tus posiciones núcleo (4-5★) más cerca de su mínimo" span={2}>
-              <OpportunityRanking rows={opportunities} />
+          <div style={{ display: "grid", gap: 14 }}>
+            <TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} />
+
+            <MoniAIBanner estado={estadoDeHoy} estrategia={estadoEstrategia} onNavigate={setTab} />
+
+            <MarketPulseRow pulse={marketPulse} />
+
+            <Panel title="Oportunidades — dentro y fuera de tu cartera">
+              <ScoredOpportunities rows={scoredOpportunities} />
+              <CtaLink label="Ver Top Posiciones" onClick={() => setTab("posiciones")} />
             </Panel>
 
-            <Panel title="Allocation por Tipo de Activo">
-              {allocType.length === 0 ? <Empty /> : (
-                <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-                  <ResponsiveContainer width={160} height={160}>
-                    <PieChart>
-                      <Pie data={allocType} dataKey="value" innerRadius={45} outerRadius={70} paddingAngle={2}>
-                        {allocType.map((e, i) => <Cell key={i} fill={e.color} stroke="none" />)}
-                      </Pie>
-                    </PieChart>
-                  </ResponsiveContainer>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    {allocType.map((e, i) => (
-                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                        <span style={{ width: 10, height: 10, borderRadius: "50%", background: e.color, display: "inline-block" }} />
-                        <span style={{ color: MUTE }}>{e.name}</span>
-                        <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{patrimonio ? ((e.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
-                      </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 14 }}>
+              <Panel title="Dónde está tu dinero">
+                {allocType.length === 0 ? <Empty /> : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+                    <ResponsiveContainer width={140} height={140}>
+                      <PieChart>
+                        <Pie data={allocType} dataKey="value" innerRadius={38} outerRadius={62} paddingAngle={2}>
+                          {allocType.map((e, i) => <Cell key={i} fill={e.color} stroke="none" />)}
+                        </Pie>
+                      </PieChart>
+                    </ResponsiveContainer>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {allocType.map((e, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: "50%", background: e.color, display: "inline-block" }} />
+                          <span style={{ color: MUTE }}>{e.name}</span>
+                          <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{patrimonio ? ((e.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <CtaLink label="Ver Allocation" onClick={() => setTab("allocation")} />
+              </Panel>
+
+              <Panel title="Estado de la estrategia">
+                {estadoEstrategia.length === 0 ? <Empty /> : (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {estadoEstrategia.map((b, i) => (
+                      <span key={i} style={{
+                        background: `${b.color}1A`, color: b.color, border: `1px solid ${b.color}`,
+                        borderRadius: 999, padding: "4px 12px", fontSize: 11, fontWeight: 700,
+                      }}>{b.text}</span>
                     ))}
                   </div>
+                )}
+                <CtaLink label="Analizar riesgo" onClick={() => setTab("resumen")} />
+              </Panel>
+            </div>
+
+            <Panel title="Qué cambió desde tu última visita">
+              {!cambiosRecientes ? (
+                <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay suficiente historial para comparar — vuelve mañana.</div>
+              ) : (
+                <div style={{ fontSize: 12, color: MUTE, lineHeight: 2 }}>
+                  <div>Desde {cambiosRecientes.baselineDate}:</div>
+                  <div>
+                    Patrimonio <b style={{ color: cambiosRecientes.deltaPatrimonio >= 0 ? GREEN : RED }}>
+                      {cambiosRecientes.deltaPatrimonio >= 0 ? "+" : ""}{fmt$2(cambiosRecientes.deltaPatrimonio)} ({fmtPct(cambiosRecientes.deltaPct)})
+                    </b>
+                  </div>
+                  {cambiosRecientes.movers.map((m) => (
+                    <div key={m.id}>{m.ticker} <b style={{ color: (m.market.changePct || 0) >= 0 ? GREEN : RED }}>{fmtPct1(m.market.changePct)}</b></div>
+                  ))}
                 </div>
               )}
+              <CtaLink label="Ver Performance" onClick={() => setTab("performance")} />
             </Panel>
 
-            <Panel title="Concentración y Semáforos">
+            <Panel title="Riesgo">
               {patrimonio === 0 ? <Empty /> : (
                 <>
                   <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
                   <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
                   <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
                 </>
-              )}
-            </Panel>
-
-            <Panel title="Exposición Temática" span={2}>
-              {temaData.length === 0 ? <Empty /> : (
-                <ResponsiveContainer width="100%" height={220}>
-                  <BarChart data={temaData} layout="vertical" margin={{ left: 20, right: 20 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={LINE} horizontal={false} />
-                    <XAxis type="number" tickFormatter={fmt$} stroke={MUTE} fontSize={11} />
-                    <YAxis type="category" dataKey="name" stroke={MUTE} fontSize={11} width={140} />
-                    <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
-                    <Bar dataKey="value" fill={GOLD} radius={[0, 4, 4, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
               )}
             </Panel>
           </div>
@@ -514,45 +647,6 @@ function Empty() {
   return <div style={{ color: MUTE, fontSize: 13 }}>Sin datos suficientes todavía.</div>;
 }
 
-function OpportunityRanking({ rows }) {
-  if (rows.length === 0) {
-    return (
-      <div style={{ color: MUTE, fontSize: 13 }}>
-        Ninguna de tus posiciones con convicción 4★ o 5★ está cerca de su mínimo de rango ahora mismo — o todavía no le has puesto convicción a ninguna en la pestaña "Tesis".
-      </div>
-    );
-  }
-  return (
-    <div style={{ display: "grid", gap: 10 }}>
-      {rows.map((p, i) => {
-        const color = p.rangePct < 15 ? GREEN : p.rangePct < 25 ? "#7FCF9E" : AMBER;
-        return (
-          <div key={p.id} style={{
-            display: "flex", alignItems: "center", gap: 16, background: NAVY_BG, border: `1px solid ${LINE}`,
-            borderRadius: 10, padding: "14px 18px", flexWrap: "wrap",
-          }}>
-            <div style={{ fontSize: 18, fontWeight: 700, color: MUTE, width: 24 }}>{i + 1}</div>
-            <div style={{ minWidth: 140 }}>
-              <div style={{ fontWeight: 700 }}>{p.ticker} <span style={{ color: MUTE, fontSize: 12, fontWeight: 400 }}>{p.name}</span></div>
-              <ConvictionStars value={p.thesis?.conviction} />
-            </div>
-            <div style={{ flex: 1, minWidth: 180 }}>
-              <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact />
-            </div>
-            <div style={{ textAlign: "right" }}>
-              <div className="num" style={{ fontSize: 15, fontWeight: 700 }}>{fmt$2(p.market.price)}</div>
-              <div className="num" style={{ fontSize: 11, color }}>{p.rangePct.toFixed(0)}% del rango</div>
-            </div>
-          </div>
-        );
-      })}
-      <div style={{ fontSize: 11, color: MUTE, marginTop: 4 }}>
-        Informativo, no es recomendación de compra — solo cruza tu propia convicción declarada con el rango de precio actual.
-      </div>
-    </div>
-  );
-}
-
 const TX_TYPE_LABEL = {
   compra: "COMPRA", venta: "VENTA", dividendo: "DIVIDENDO", split: "SPLIT", evento: "EVENTO",
 };
@@ -676,6 +770,156 @@ function DividendosTab({ rows }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function CtaLink({ label, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      background: "none", border: "none", color: GOLD, fontSize: 11, fontWeight: 700,
+      cursor: "pointer", padding: 0, marginTop: 10, display: "block",
+    }}>{label} →</button>
+  );
+}
+
+function TodayStatusCard({ estado, onNavigate }) {
+  const borderColor = estado.emoji === "🔴" ? RED : estado.emoji === "🟡" ? AMBER : GREEN;
+  return (
+    <div style={{ background: "#151129", border: `1.5px solid ${borderColor}`, borderRadius: 12, padding: "18px 22px" }}>
+      <div style={{ fontSize: 10, color: MUTE, letterSpacing: 1, marginBottom: 6 }}>¿NECESITO HACER ALGO HOY?</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 18 }}>{estado.emoji}</span>
+        <div className="display" style={{ fontSize: 22, fontWeight: 700 }}>{estado.label}</div>
+      </div>
+      {estado.detail && <div style={{ fontSize: 12, color: MUTE, marginTop: 6 }}>{estado.detail}</div>}
+      <CtaLink label="Abrir tesis" onClick={() => onNavigate("tesis")} />
+    </div>
+  );
+}
+
+function MoniAIBanner({ estado, estrategia, onNavigate }) {
+  // Vista previa determinística (Capa 1) con el mismo tono que tendrá Moni AI real
+  // cuando conectemos ese módulo. Ningún texto aquí lo genera un modelo todavía.
+  let text;
+  if (estado.emoji === "🔴") text = `Concentración elevada en ${estado.label.replace("Revisar concentración en ", "")}.`;
+  else if (estado.emoji === "🟡") text = `Oportunidad detectada. ${estado.label}.`;
+  else text = "Sin razones para modificar la estrategia.";
+  return (
+    <div style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+      <div style={{ fontSize: 12 }}><b style={{ color: GOLD }}>Moni AI —</b> {text}</div>
+      <button onClick={() => onNavigate("resumen")} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Continuar con Moni AI →</button>
+    </div>
+  );
+}
+
+function MarketPulseRow({ pulse }) {
+  if (!pulse) return null;
+  const item = (label, value, color) => (
+    <div style={{ fontSize: 11 }}><span style={{ color: MUTE }}>{label}</span> <b style={{ color: color || TXT }}>{value}</b></div>
+  );
+  return (
+    <div style={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 10, padding: "10px 16px", display: "flex", gap: 20, flexWrap: "wrap" }}>
+      {item("Fear & Greed (cripto)", pulse.fearGreed != null ? pulse.fearGreed : "sin dato", AMBER)}
+      {item("VIX", pulse.vix != null ? pulse.vix.toFixed(1) : "sin dato", pulse.vix != null && pulse.vix > 20 ? RED : GREEN)}
+      {item("NASDAQ (QQQ)", pulse.nasdaqChangePct != null ? fmtPct1(pulse.nasdaqChangePct) : "sin dato", (pulse.nasdaqChangePct || 0) >= 0 ? GREEN : RED)}
+      {item("BTC", pulse.btcChangePct != null ? fmtPct1(pulse.btcChangePct) : "sin dato", (pulse.btcChangePct || 0) >= 0 ? GREEN : RED)}
+    </div>
+  );
+}
+
+function ScoredOpportunities({ rows }) {
+  const [expanded, setExpanded] = useState(null);
+  if (rows.length === 0) {
+    return <div style={{ color: MUTE, fontSize: 13 }}>Sin oportunidades con Opportunity Score ≥ 50 ahora mismo.</div>;
+  }
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      {rows.map((o) => {
+        const scoreColor = o.score >= 80 ? GREEN : o.score >= 65 ? "#7FCF9E" : AMBER;
+        const isOpen = expanded === o.ticker;
+        return (
+          <div key={o.ticker} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: "10px 14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <div style={{ fontSize: 12 }}>
+                <b>{o.ticker}</b> <span style={{ color: MUTE, fontSize: 11 }}>{o.name}</span>
+                <span style={{ color: MUTE, fontSize: 10 }}> · {o.source === "cartera" ? `${"★".repeat(o.conviction)} en cartera` : "watchlist"}{o.hitTarget ? " · en tu precio objetivo" : ""}</span>
+              </div>
+              <button onClick={() => setExpanded(isOpen ? null : o.ticker)} style={{
+                background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+              }}>
+                <span className="num" style={{ color: scoreColor, fontWeight: 700, fontSize: 14 }}>{o.score}</span>
+                <span style={{ width: 14, height: 14, borderRadius: "50%", border: `1px solid ${MUTE}`, fontSize: 9, color: MUTE, display: "flex", alignItems: "center", justifyContent: "center" }}>i</span>
+              </button>
+            </div>
+            {isOpen && (
+              <div style={{ background: NAVY_BG, border: `1px dashed ${LINE}`, borderRadius: 6, padding: "8px 10px", marginTop: 8, fontSize: 10, color: MUTE }}>
+                Convicción → {o.breakdown.convictionPts} pts · Rango → {o.breakdown.rangePts} pts · Momentum → {o.breakdown.momentumPts} pts
+                {o.hitTarget && " · Precio objetivo alcanzado → +20 pts"} &nbsp;=&nbsp; <b style={{ color: TXT }}>{o.score}</b>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function GoalBar({ goal, patrimonio, goalPct, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [amount, setAmount] = useState(goal?.target_amount || "");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!amount || Number(amount) <= 0) { setErr("Pon un monto válido."); return; }
+    setBusy(true);
+    try {
+      await manageGoal({ pin, target_amount: Number(amount) });
+      setEditing(false);
+      onSaved();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  if (!goal && !editing) {
+    return (
+      <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${LINE}` }}>
+        <button onClick={() => setEditing(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+          + Definir meta patrimonial
+        </button>
+      </div>
+    );
+  }
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 8px", fontSize: 12, width: 120 };
+
+  return (
+    <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${LINE}` }}>
+      {!editing ? (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: MUTE, marginBottom: 4 }}>
+            <span>META PATRIMONIAL · {fmt$2(Number(goal.target_amount))} <span onClick={() => { setAmount(goal.target_amount); setEditing(true); }} style={{ color: GOLD, cursor: "pointer", marginLeft: 6 }}>editar</span></span>
+            <span style={{ color: GOLD, fontWeight: 700 }}>{goalPct != null ? goalPct.toFixed(1) : "0.0"}%</span>
+          </div>
+          <div style={{ height: 5, background: LINE, borderRadius: 3 }}>
+            <div style={{ height: "100%", width: `${goalPct || 0}%`, background: GOLD, borderRadius: 3 }} />
+          </div>
+        </>
+      ) : (
+        <form onSubmit={submit} style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <input style={inputStyle} type="number" step="any" placeholder="Meta ($)" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <input style={inputStyle} type="password" placeholder="PIN" value={pin} onChange={(e) => setPin(e.target.value)} />
+          <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            {busy ? "..." : "Guardar"}
+          </button>
+          <button type="button" onClick={() => setEditing(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Cancelar</button>
+          {err && <div style={{ color: RED, fontSize: 10, width: "100%" }}>{err}</div>}
+        </form>
+      )}
     </div>
   );
 }
