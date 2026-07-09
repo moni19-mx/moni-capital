@@ -231,7 +231,10 @@ export default function Dashboard() {
 
   const snapshotPosted = useRef(false);
   useEffect(() => {
-    if (!snapshotPosted.current && patrimonio > 0) {
+    // Solo se guarda si TODOS los tickers resolvieron precio -- un snapshot
+    // parcial (por un fallo de rate limit, por ejemplo) mostraría un
+    // patrimonio artificialmente bajo y ensuciaría Performance para siempre.
+    if (!snapshotPosted.current && patrimonio > 0 && missing.length === 0) {
       snapshotPosted.current = true;
       fetch("/api/snapshot", {
         method: "POST",
@@ -239,7 +242,7 @@ export default function Dashboard() {
         body: JSON.stringify({ patrimonio, invested, stocksValue, cryptoValue, cashValue }),
       }).catch(() => {});
     }
-  }, [patrimonio, invested, stocksValue, cryptoValue, cashValue]);
+  }, [patrimonio, invested, stocksValue, cryptoValue, cashValue, missing.length]);
 
   const top5 = [...withValue].sort((a, b) => b.value - a.value).slice(0, 5);
   const top1Pct = patrimonio ? (top5[0]?.value || 0) / patrimonio : 0;
@@ -1416,11 +1419,38 @@ function WatchlistAddForm({ result, onDone }) {
 }
 
 function AddForm({ onDone }) {
-  const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", shares: "", cost_basis: "" });
+  const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", shares: "", cost_basis: "", coingecko_id: "" });
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [showResults, setShowResults] = useState(false);
+  const debounceRef = useRef(null);
+
   function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
+
+  function onTickerChange(v) {
+    setForm((f) => ({ ...f, ticker: v.toUpperCase(), coingecko_id: "" }));
+    setShowResults(true);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (v.trim().length < 1) { setResults([]); return; }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const { results } = await searchAssets(v.trim());
+        setResults(results || []);
+      } catch (e) { setResults([]); }
+      finally { setSearching(false); }
+    }, 350);
+  }
+
+  function pickResult(r) {
+    setForm((f) => ({ ...f, ticker: r.ticker, name: r.name, type: r.type, coingecko_id: r.coingeckoId || "" }));
+    setResults([]);
+    setShowResults(false);
+  }
+
   async function submit(e) {
     e.preventDefault();
     setErr(null);
@@ -1435,6 +1465,7 @@ function AddForm({ onDone }) {
           ticker: form.ticker.toUpperCase(), name: form.name, type: form.type,
           sector: form.sector || null, tema: form.tema || null,
           shares: Number(form.shares), cost_basis: Number(form.cost_basis),
+          coingecko_id: form.coingecko_id || null,
         },
       });
       onDone();
@@ -1444,7 +1475,33 @@ function AddForm({ onDone }) {
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
   return (
     <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
-      <div><label style={{ fontSize: 11, color: MUTE }}>Ticker *</label><input style={inputStyle} value={form.ticker} onChange={(e) => set("ticker", e.target.value)} placeholder="AAPL" /></div>
+      <div style={{ position: "relative" }}>
+        <label style={{ fontSize: 11, color: MUTE }}>Ticker * (busca por nombre o símbolo)</label>
+        <input
+          style={inputStyle} value={form.ticker} autoComplete="off"
+          onChange={(e) => onTickerChange(e.target.value)}
+          onFocus={() => setShowResults(true)}
+          onBlur={() => setTimeout(() => setShowResults(false), 150)}
+          placeholder="Ej. Apple, AAPL, Solana…"
+        />
+        {showResults && (searching || results.length > 0) && (
+          <div style={{
+            position: "absolute", top: "100%", left: 0, right: 0, background: PANEL, border: `1px solid ${LINE}`,
+            borderRadius: 8, marginTop: 4, zIndex: 20, maxHeight: 220, overflowY: "auto",
+          }}>
+            {searching && <div style={{ padding: 10, fontSize: 12, color: MUTE }}>Buscando…</div>}
+            {results.map((r, i) => (
+              <button key={i} type="button" onMouseDown={() => pickResult(r)} style={{
+                display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
+                padding: "8px 10px", textAlign: "left", cursor: "pointer", color: TXT, fontSize: 12, borderBottom: `1px solid ${LINE}`,
+              }}>
+                <span><b>{r.ticker}</b> <span style={{ color: MUTE }}>{r.name}</span></span>
+                <span style={{ color: GOLD, fontSize: 9 }}>{r.type === "stock" ? "ACCIÓN" : "CRIPTO"}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Nombre *</label><input style={inputStyle} value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="Apple Inc" /></div>
       <div>
         <label style={{ fontSize: 11, color: MUTE }}>Tipo *</label>
