@@ -1,20 +1,16 @@
 // api/market-data.js
 // Devuelve precio en vivo + contexto (rango 52w/ATH-ATL, market cap, PE).
-// El precio SIEMPRE se pide en vivo. El rango/market cap/PE se cachea en
-// Supabase (tabla market_cache) por varias horas, porque casi no cambian
-// en el dia -- esto corta a la mitad las llamadas a Finnhub/CoinGecko y
-// evita que el rate limit gratuito tumbe los precios.
-// Nunca se inventa un dato: si algo falla, ese ticker sale en "errors" y
-// no aparece en "data".
+// El precio SIEMPRE se pide en vivo. El rango/market cap/PE usan el cache
+// compartido de lib/marketCache.js. Nunca se inventa un dato: si algo
+// falla, ese ticker sale en "errors" y no aparece en "data".
 
 import { createClient } from "@supabase/supabase-js";
+import { getCache, setCache } from "../lib/marketCache.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
-const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
 
 const COINGECKO_FALLBACK_IDS = {
   BTC: "bitcoin",
@@ -22,26 +18,6 @@ const COINGECKO_FALLBACK_IDS = {
   SOL: "solana",
   LINK: "chainlink",
 };
-
-async function getCache(ticker) {
-  try {
-    const { data } = await supabase.from("market_cache").select("*").eq("ticker", ticker).maybeSingle();
-    if (!data) return null;
-    const age = Date.now() - new Date(data.updated_at).getTime();
-    if (age > CACHE_TTL_MS) return null;
-    return data;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function setCache(ticker, type, fields) {
-  try {
-    await supabase.from("market_cache").upsert([{ ticker, type, ...fields, updated_at: new Date().toISOString() }]);
-  } catch (e) {
-    // si falla el guardado de cache no debe tronar la respuesta principal
-  }
-}
 
 async function getStockData(ticker, FINNHUB_KEY) {
   const quoteRes = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_KEY}`);
@@ -51,7 +27,7 @@ async function getStockData(ticker, FINNHUB_KEY) {
   }
 
   let high = null, low = null, marketCap = null, peRatio = null;
-  const cached = await getCache(ticker);
+  const cached = await getCache(supabase, ticker);
   if (cached) {
     high = cached.high; low = cached.low; marketCap = cached.market_cap; peRatio = cached.pe_ratio;
   } else {
@@ -62,7 +38,7 @@ async function getStockData(ticker, FINNHUB_KEY) {
     low = typeof metric["52WeekLow"] === "number" ? metric["52WeekLow"] : null;
     marketCap = typeof metric.marketCapitalization === "number" ? metric.marketCapitalization * 1_000_000 : null;
     peRatio = typeof metric.peBasicExclExtraTTM === "number" ? metric.peBasicExclExtraTTM : null;
-    await setCache(ticker, "stock", { high, low, market_cap: marketCap, pe_ratio: peRatio, range_label: "52 semanas" });
+    await setCache(supabase, ticker, "stock", { high, low, market_cap: marketCap, pe_ratio: peRatio, range_label: "52 semanas" });
   }
 
   return {
@@ -83,7 +59,7 @@ async function getCryptoData(ticker, coingeckoId) {
   }
 
   let high = null, low = null;
-  const cached = await getCache(ticker);
+  const cached = await getCache(supabase, ticker);
   if (cached) {
     high = cached.high; low = cached.low;
   } else {
@@ -93,7 +69,7 @@ async function getCryptoData(ticker, coingeckoId) {
     const d2 = await r2.json();
     high = typeof d2?.market_data?.ath?.usd === "number" ? d2.market_data.ath.usd : null;
     low = typeof d2?.market_data?.atl?.usd === "number" ? d2.market_data.atl.usd : null;
-    await setCache(ticker, "crypto", { high, low, market_cap: entry.usd_market_cap ?? null, pe_ratio: null, range_label: "histórico (ATH/ATL)" });
+    await setCache(supabase, ticker, "crypto", { high, low, market_cap: entry.usd_market_cap ?? null, pe_ratio: null, range_label: "histórico (ATH/ATL)" });
   }
 
   return {
