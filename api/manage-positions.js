@@ -38,14 +38,18 @@ export default async function handler(req, res) {
       // Cada compra nueva desde Gestionar tambien queda en el Historial,
       // para que ambas vistas cuenten siempre la misma historia.
       if (position.type !== "cash") {
-        await supabase.from("transactions").insert([{
-          date: new Date().toISOString().slice(0, 10),
-          ticker: position.ticker,
-          type: "compra",
-          amount: -Math.abs(Number(position.cost_basis)),
-          quantity: Number(position.shares),
-          notes: "Agregado desde Gestionar",
-        }]).catch(() => {}); // si esto falla, no debe tumbar el guardado de la posicion
+        try {
+          await supabase.from("transactions").insert([{
+            date: new Date().toISOString().slice(0, 10),
+            ticker: position.ticker,
+            type: "compra",
+            amount: -Math.abs(Number(position.cost_basis)),
+            quantity: Number(position.shares),
+            notes: "Agregado desde Gestionar",
+          }]);
+        } catch (e) {
+          // si esto falla, no debe tumbar el guardado de la posicion
+        }
       }
 
       return res.status(200).json({ ok: true, data });
