@@ -102,6 +102,7 @@ export default function Dashboard() {
   const [thesis, setThesis] = useState([]);
   const [snapshots, setSnapshots] = useState([]);
   const [cashMovements, setCashMovements] = useState([]);
+  const [transactions, setTransactions] = useState([]);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
   const [updatedAt, setUpdatedAt] = useState(null);
@@ -114,18 +115,20 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
         sb("snapshots").catch(() => []),
         sb("cash_movements").catch(() => []),
+        sb("transactions").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
       setThesis(th);
       setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
       setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
 
       const items = [];
       const seen = new Set();
@@ -300,7 +303,7 @@ export default function Dashboard() {
         </div>
 
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -402,6 +405,18 @@ export default function Dashboard() {
                 <Bar dataKey="value" fill="#7C8CF8" radius={[0, 4, 4, 0]} />
               </BarChart>
             </ResponsiveContainer>
+          </Panel>
+        )}
+
+        {tab === "historial" && (
+          <Panel title="Historial de transacciones">
+            <HistorialTab rows={transactions} />
+          </Panel>
+        )}
+
+        {tab === "dividendos" && (
+          <Panel title="Dividendos">
+            <DividendosTab rows={transactions} />
           </Panel>
         )}
 
@@ -533,6 +548,133 @@ function OpportunityRanking({ rows }) {
       })}
       <div style={{ fontSize: 11, color: MUTE, marginTop: 4 }}>
         Informativo, no es recomendación de compra — solo cruza tu propia convicción declarada con el rango de precio actual.
+      </div>
+    </div>
+  );
+}
+
+const TX_TYPE_LABEL = {
+  compra: "COMPRA", venta: "VENTA", dividendo: "DIVIDENDO", split: "SPLIT", evento: "EVENTO",
+};
+const TX_TYPE_COLOR = {
+  compra: RED, venta: GREEN, dividendo: GOLD, split: "#7C8CF8", evento: MUTE,
+};
+
+function HistorialTab({ rows }) {
+  const [filter, setFilter] = useState("todos");
+
+  const filtered = filter === "todos" ? rows : rows.filter((t) => t.type === filter);
+  const filterOptions = [
+    ["todos", "Todos"], ["compra", "Compras"], ["venta", "Ventas"],
+    ["dividendo", "Dividendos"], ["split", "Splits"],
+  ];
+
+  if (rows.length === 0) return <div style={{ color: MUTE, fontSize: 13 }}>Sin historial cargado todavía.</div>;
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+        {filterOptions.map(([key, label]) => (
+          <button key={key} onClick={() => setFilter(key)} style={{
+            background: filter === key ? GOLD : "none", color: filter === key ? "#1A1305" : MUTE,
+            border: `1px solid ${filter === key ? GOLD : LINE}`, borderRadius: 999, padding: "5px 14px",
+            fontSize: 12, fontWeight: 600, cursor: "pointer",
+          }}>{label}</button>
+        ))}
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 640 }}>
+          <thead>
+            <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+              <th style={{ padding: "8px 6px" }}>Fecha</th>
+              <th style={{ padding: "8px 6px" }}>Ticker</th>
+              <th style={{ padding: "8px 6px" }}>Tipo</th>
+              <th style={{ padding: "8px 6px", textAlign: "right" }}>Monto</th>
+              <th style={{ padding: "8px 6px", textAlign: "right" }}>Cantidad</th>
+              <th style={{ padding: "8px 6px" }}>Notas</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((t) => (
+              <tr key={t.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "10px 6px", color: MUTE }}>{t.date}</td>
+                <td style={{ padding: "10px 6px" }}><b>{t.ticker}</b></td>
+                <td style={{ padding: "10px 6px" }}>
+                  <span style={{
+                    color: TX_TYPE_COLOR[t.type] || MUTE, border: `1px solid ${TX_TYPE_COLOR[t.type] || MUTE}`,
+                    borderRadius: 4, padding: "2px 8px", fontSize: 10, fontWeight: 700,
+                  }}>{TX_TYPE_LABEL[t.type] || t.type?.toUpperCase()}</span>
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: Number(t.amount) > 0 ? GREEN : (Number(t.amount) < 0 ? RED : MUTE) }}>
+                  {t.amount != null ? fmt$2(Number(t.amount)) : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: MUTE }}>
+                  {t.quantity != null ? Number(t.quantity).toFixed(4) : "—"}
+                </td>
+                <td style={{ padding: "10px 6px", color: MUTE, fontSize: 12 }}>{t.notes || ""}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>
+        {filtered.length} {filtered.length === 1 ? "movimiento" : "movimientos"}. Los depósitos/retiros de efectivo viven en la pestaña "Efectivo", no aquí.
+      </div>
+    </div>
+  );
+}
+
+function DividendosTab({ rows }) {
+  const dividendos = rows.filter((t) => t.type === "dividendo");
+  const total = dividendos.reduce((a, t) => a + Number(t.amount || 0), 0);
+
+  const byTicker = {};
+  dividendos.forEach((t) => {
+    byTicker[t.ticker] = (byTicker[t.ticker] || 0) + Number(t.amount || 0);
+  });
+  const chartData = Object.entries(byTicker).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }));
+
+  if (dividendos.length === 0) {
+    return <div style={{ color: MUTE, fontSize: 13 }}>Sin dividendos registrados todavía.</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 24 }}>
+        <Metric label="Total recibido en dividendos" value={fmt$2(total)} color={GOLD} />
+        <Metric label="Empresas que pagaron" value={`${chartData.length}`} />
+        <Metric label="Pagos registrados" value={`${dividendos.length}`} />
+      </div>
+
+      <ResponsiveContainer width="100%" height={Math.max(160, chartData.length * 34)}>
+        <BarChart data={chartData} layout="vertical" margin={{ left: 20, right: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={LINE} horizontal={false} />
+          <XAxis type="number" tickFormatter={fmt$2} stroke={MUTE} fontSize={11} />
+          <YAxis type="category" dataKey="name" stroke={MUTE} fontSize={11} width={70} />
+          <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
+          <Bar dataKey="value" fill={GOLD} radius={[0, 4, 4, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+
+      <div style={{ marginTop: 24, overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 400 }}>
+          <thead>
+            <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+              <th style={{ padding: "8px 6px" }}>Fecha</th>
+              <th style={{ padding: "8px 6px" }}>Ticker</th>
+              <th style={{ padding: "8px 6px", textAlign: "right" }}>Monto</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dividendos.map((t) => (
+              <tr key={t.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "8px 6px", color: MUTE }}>{t.date}</td>
+                <td style={{ padding: "8px 6px" }}><b>{t.ticker}</b></td>
+                <td className="num" style={{ padding: "8px 6px", textAlign: "right", color: GOLD }}>{fmt$2(Number(t.amount))}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );
