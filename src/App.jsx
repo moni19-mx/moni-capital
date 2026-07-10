@@ -142,6 +142,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
   const [tab, setTab] = useState("resumen");
+  const [assetDetail, setAssetDetail] = useState(null); // { ticker, type, name, coingeckoId } | null
+
+  function openAsset(meta) { setAssetDetail(meta); }
+  function closeAsset() { setAssetDetail(null); }
   const [showAdd, setShowAdd] = useState(false);
 
   async function loadAll() {
@@ -409,6 +413,7 @@ export default function Dashboard() {
           <KpiCard icon={Eye} label="En watchlist" value={`${watchlist.length}`} />
         </div>
 
+        {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
           {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
@@ -418,6 +423,23 @@ export default function Dashboard() {
             }}>{label}</button>
           ))}
         </div>
+        )}
+
+        {assetDetail && (
+          <AssetDetailScreen
+            meta={assetDetail}
+            positions={enriched}
+            watchlist={watchlistEnriched}
+            transactions={transactions}
+            patrimonio={patrimonio}
+            onBack={closeAsset}
+            onSaved={loadAll}
+            onOpenAsset={openAsset}
+          />
+        )}
+
+        {!assetDetail && (
+        <>
 
         {tab === "resumen" && (
           <div style={{ display: "grid", gap: 14 }}>
@@ -511,13 +533,13 @@ export default function Dashboard() {
 
         {tab === "posiciones" && (
           <Panel title="Top Posiciones — con contexto de rango">
-            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} />
+            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} onOpenAsset={openAsset} />
           </Panel>
         )}
 
         {tab === "tesis" && (
           <Panel title="Investment Thesis — por qué tienes cada posición">
-            <ThesisTab rows={enriched.filter((p) => p.type !== "cash")} onSaved={loadAll} />
+            <ThesisTab rows={enriched.filter((p) => p.type !== "cash")} onSaved={loadAll} onOpenAsset={openAsset} />
           </Panel>
         )}
 
@@ -556,11 +578,11 @@ export default function Dashboard() {
           </Panel>
         )}
 
-        {tab === "buscar" && <SearchTab onWatchlistAdded={loadAll} />}
+        {tab === "buscar" && <SearchTab onWatchlistAdded={loadAll} onOpenAsset={openAsset} />}
 
         {tab === "watchlist" && (
           <Panel title="Watchlist">
-            <WatchlistTable rows={watchlistEnriched} onDeleted={loadAll} />
+            <WatchlistTable rows={watchlistEnriched} onDeleted={loadAll} onOpenAsset={openAsset} />
           </Panel>
         )}
 
@@ -581,6 +603,8 @@ export default function Dashboard() {
             {showAdd && <AddForm onDone={() => { setShowAdd(false); loadAll(); }} />}
             <ManageTable rows={enriched} onDeleted={loadAll} />
           </Panel>
+        )}
+        </>
         )}
 
         <div style={{ marginTop: 40, display: "flex", alignItems: "center", gap: 8, color: MUTE, fontSize: 12 }}>
@@ -1127,7 +1151,7 @@ function RangeBar({ price, low, high, label, compact }) {
   );
 }
 
-function RichPositionsTable({ rows, patrimonio }) {
+function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
   return (
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 760 }}>
@@ -1147,7 +1171,11 @@ function RichPositionsTable({ rows, patrimonio }) {
           {rows.map((p, i) => (
             <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
               <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
-              <td style={{ padding: "10px 6px" }}><b>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></td>
+              <td style={{ padding: "10px 6px" }}>
+                <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                  <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
+                </button>
+              </td>
               <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
               <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}</td>
               <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
@@ -1212,7 +1240,7 @@ function ManageTable({ rows, onDeleted }) {
   );
 }
 
-function WatchlistTable({ rows, onDeleted }) {
+function WatchlistTable({ rows, onDeleted, onOpenAsset }) {
   const [busyId, setBusyId] = useState(null);
   async function handleDelete(row) {
     const pin = window.prompt(`Ingresa tu PIN para quitar ${row.ticker} de la watchlist:`);
@@ -1243,7 +1271,11 @@ function WatchlistTable({ rows, onDeleted }) {
             const hitTarget = w.target_price != null && w.market?.price != null && w.market.price <= Number(w.target_price);
             return (
               <tr key={w.id} style={{ borderBottom: `1px solid ${LINE}` }}>
-                <td style={{ padding: "10px 6px" }}><b>{w.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{w.name}</span></td>
+                <td style={{ padding: "10px 6px" }}>
+                  <button onClick={() => onOpenAsset({ ticker: w.ticker, type: w.type, name: w.name, coingeckoId: w.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                    <b style={{ color: GOLD }}>{w.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{w.name}</span>
+                  </button>
+                </td>
                 <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{w.market ? fmt$2(w.market.price) : "sin dato"}</td>
                 <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (w.market?.changePct || 0) >= 0 ? GREEN : RED }}>
                   {w.market?.changePct != null ? fmtPct1(w.market.changePct) : "—"}
@@ -1267,20 +1299,14 @@ function WatchlistTable({ rows, onDeleted }) {
   );
 }
 
-function SearchTab({ onWatchlistAdded }) {
+function SearchTab({ onWatchlistAdded, onOpenAsset }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
-  const [selected, setSelected] = useState(null);
-  const [detail, setDetail] = useState(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [showWlForm, setShowWlForm] = useState(false);
   const debounceRef = useRef(null);
 
   function onChange(v) {
     setQ(v);
-    setSelected(null);
-    setDetail(null);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (v.trim().length < 1) { setResults([]); return; }
     debounceRef.current = setTimeout(async () => {
@@ -1291,17 +1317,6 @@ function SearchTab({ onWatchlistAdded }) {
       } catch (e) { setResults([]); }
       finally { setSearching(false); }
     }, 400);
-  }
-
-  async function selectResult(r) {
-    setSelected(r);
-    setShowWlForm(false);
-    setDetailLoading(true);
-    try {
-      const { data } = await fetchMarketData([{ ticker: r.ticker, type: r.type, coingeckoId: r.coingeckoId }]);
-      setDetail(data[r.ticker] || null);
-    } catch (e) { setDetail(null); }
-    finally { setDetailLoading(false); }
   }
 
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "10px 12px", fontSize: 14, width: "100%" };
@@ -1315,14 +1330,14 @@ function SearchTab({ onWatchlistAdded }) {
 
       {searching && <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Buscando…</div>}
 
-      {results.length > 0 && !selected && (
-        <div style={{ display: "grid", gap: 6, marginBottom: 20 }}>
+      {results.length > 0 && (
+        <div style={{ display: "grid", gap: 6 }}>
           {results.map((r, i) => (
-            <button key={i} onClick={() => selectResult(r)} style={{
+            <button key={i} onClick={() => onOpenAsset(r)} style={{
               background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
               textAlign: "left", cursor: "pointer", color: TXT, display: "flex", justifyContent: "space-between", alignItems: "center",
             }}>
-              <span><b>{r.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{r.name}</span></span>
+              <span><b style={{ color: GOLD }}>{r.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{r.name}</span></span>
               <span style={{ fontSize: 10, color: GOLD, border: `1px solid ${GOLD}`, borderRadius: 4, padding: "2px 6px" }}>
                 {r.type === "stock" ? "ACCIÓN" : "CRIPTO"}
               </span>
@@ -1330,46 +1345,8 @@ function SearchTab({ onWatchlistAdded }) {
           ))}
         </div>
       )}
-
-      {selected && (
-        <div style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: 20 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
-            <div>
-              <div style={{ fontSize: 20, fontWeight: 700 }}>{selected.ticker}</div>
-              <div style={{ color: MUTE, fontSize: 13 }}>{selected.name}</div>
-            </div>
-            <button onClick={() => { setSelected(null); setDetail(null); }} style={{ background: "none", border: "none", color: MUTE, cursor: "pointer", fontSize: 12 }}>✕ cerrar</button>
-          </div>
-
-          {detailLoading && <div style={{ color: MUTE, fontSize: 13 }}>Cargando datos reales…</div>}
-
-          {!detailLoading && detail && (
-            <>
-              <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 18 }}>
-                <Metric label="Precio actual" value={fmt$2(detail.price)} />
-                <Metric label="Cambio del día" value={detail.changePct != null ? fmtPct1(detail.changePct) : "—"} color={(detail.changePct || 0) >= 0 ? GREEN : RED} />
-                <Metric label="Cap. de mercado" value={fmtBig(detail.marketCap)} />
-                {detail.peRatio != null && <Metric label="P/E" value={detail.peRatio.toFixed(1)} />}
-              </div>
-              <RangeBar price={detail.price} low={detail.low} high={detail.high} label={detail.rangeLabel} />
-
-              <div style={{ marginTop: 20 }}>
-                {!showWlForm ? (
-                  <button onClick={() => setShowWlForm(true)} style={{
-                    background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
-                    fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
-                  }}><Plus size={16} /> Agregar a Watchlist</button>
-                ) : (
-                  <WatchlistAddForm result={selected} onDone={() => { setShowWlForm(false); onWatchlistAdded(); }} />
-                )}
-              </div>
-              <div style={{ fontSize: 11, color: MUTE, marginTop: 14 }}>
-                Si ya la compraste, agrégala en la pestaña "Gestionar" con tus acciones y costo real — la watchlist es solo para vigilar, no cuenta en tu patrimonio.
-              </div>
-            </>
-          )}
-          {!detailLoading && !detail && <div style={{ color: AMBER, fontSize: 13 }}>No se pudo obtener el dato en vivo de este activo ahora mismo.</div>}
-        </div>
+      {q.trim().length > 0 && !searching && results.length === 0 && (
+        <div style={{ color: MUTE, fontSize: 13 }}>Sin resultados para "{q}".</div>
       )}
     </Panel>
   );
@@ -1415,6 +1392,237 @@ function WatchlistAddForm({ result, onDone }) {
       </div>
       {err && <div style={{ gridColumn: "1/-1", color: RED, fontSize: 12 }}>{err}</div>}
     </form>
+  );
+}
+
+function AssetDetailScreen({ meta, positions, watchlist, transactions, patrimonio, onBack, onSaved, onOpenAsset }) {
+  const [market, setMarket] = useState(null);
+  const [loadingMarket, setLoadingMarket] = useState(false);
+  const [showThesisEdit, setShowThesisEdit] = useState(false);
+  const [showWlForm, setShowWlForm] = useState(false);
+
+  const position = positions.find((p) => p.ticker === meta.ticker);
+  const watchlistItem = watchlist.find((w) => w.ticker === meta.ticker);
+  const thesis = position?.thesis || null;
+
+  useEffect(() => {
+    if (position?.market) { setMarket(position.market); return; }
+    if (watchlistItem?.market) { setMarket(watchlistItem.market); return; }
+    setLoadingMarket(true);
+    fetchMarketData([{ ticker: meta.ticker, type: meta.type, coingeckoId: meta.coingeckoId }])
+      .then(({ data }) => setMarket(data[meta.ticker] || null))
+      .catch(() => setMarket(null))
+      .finally(() => setLoadingMarket(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta.ticker]);
+
+  const ranking = useMemo(() => {
+    const withValue = positions.filter((p) => p.value != null && p.type !== "cash");
+    const sorted = [...withValue].sort((a, b) => b.value - a.value);
+    const idx = sorted.findIndex((p) => p.ticker === meta.ticker);
+    return idx >= 0 ? { pos: idx + 1, total: sorted.length } : null;
+  }, [positions, meta.ticker]);
+
+  const pctPatrimonio = position?.value != null && patrimonio ? (position.value / patrimonio) * 100 : null;
+
+  const scoreData = useMemo(() => {
+    if (!market) return null;
+    return scoreBreakdown({ price: market.price, low: market.low, high: market.high, changePct: market.changePct, conviction: thesis?.conviction || 0 });
+  }, [market, thesis]);
+
+  const decision = useMemo(() => {
+    if (!position || !market) return { emoji: "⚪", label: "Sin posición propia", detail: "Este activo no es parte de tu portafolio todavía." };
+    if (pctPatrimonio != null && pctPatrimonio > 35) return { emoji: "🔴", label: "Revisar concentración", detail: `Pesa ${pctPatrimonio.toFixed(1)}% de tu patrimonio.` };
+    if (scoreData && scoreData.total >= 80) return { emoji: "🟡", label: "Revisar", detail: `Opportunity Score ${scoreData.total}.` };
+    return { emoji: "🟢", label: "Mantener", detail: "Sin señales relevantes ahora mismo." };
+  }, [position, market, pctPatrimonio, scoreData]);
+
+  const assetType = useMemo(() => {
+    const c = thesis?.conviction;
+    if (c === 5) return "Core Holding";
+    if (c === 4) return "High Conviction";
+    if (c === 3) return "Growth";
+    if (c === 2) return "Especulativa";
+    return "Sin clasificar";
+  }, [thesis]);
+
+  const timelineEvents = useMemo(() => {
+    const txEvents = (transactions || [])
+      .filter((t) => t.ticker === meta.ticker)
+      .map((t) => ({ date: t.date, label: TX_TYPE_LABEL[t.type] || (t.type || "").toUpperCase(), amount: t.amount, notes: t.notes }));
+    const thesisEvent = thesis?.updated_at
+      ? [{ date: String(thesis.updated_at).slice(0, 10), label: "TESIS ACTUALIZADA", amount: null, notes: null }]
+      : [];
+    return [...txEvents, ...thesisEvent].sort((a, b) => (a.date < b.date ? 1 : -1));
+  }, [transactions, meta.ticker, thesis]);
+
+  const dividendos = useMemo(
+    () => (transactions || []).filter((t) => t.ticker === meta.ticker && t.type === "dividendo"),
+    [transactions, meta.ticker]
+  );
+  const totalDividendos = dividendos.reduce((a, t) => a + Number(t.amount || 0), 0);
+
+  const reviewDays = thesis?.updated_at ? Math.floor((Date.now() - new Date(thesis.updated_at).getTime()) / 86400000) : null;
+  const decisionColor = decision.emoji === "🔴" ? RED : decision.emoji === "🟡" ? AMBER : decision.emoji === "🟢" ? GREEN : LINE;
+
+  return (
+    <div>
+      <button onClick={onBack} style={{ background: "none", border: "none", color: MUTE, cursor: "pointer", fontSize: 13, marginBottom: 16, display: "flex", alignItems: "center", gap: 6 }}>
+        <ChevronRight size={14} style={{ transform: "rotate(180deg)" }} /> Volver
+      </button>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div className="display" style={{ fontSize: 28, fontWeight: 700 }}>{meta.ticker}</div>
+          <div style={{ color: MUTE, fontSize: 14 }}>{meta.name}</div>
+        </div>
+        {market && (
+          <div style={{ textAlign: "right" }}>
+            <div className="num" style={{ fontSize: 26, fontWeight: 700 }}>{fmt$2(market.price)}</div>
+            <div className="num" style={{ fontSize: 13, color: (market.changePct || 0) >= 0 ? GREEN : RED }}>
+              {market.changePct != null ? fmtPct1(market.changePct) : "—"} hoy
+            </div>
+          </div>
+        )}
+      </div>
+
+      {loadingMarket && <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>Cargando datos reales…</div>}
+      {market && (
+        <div style={{ marginBottom: 20 }}>
+          <RangeBar price={market.price} low={market.low} high={market.high} label={market.rangeLabel} />
+          <div style={{ display: "flex", gap: 20, marginTop: 8, fontSize: 11, color: MUTE }}>
+            <span>Cap. mercado: {fmtBig(market.marketCap)}</span>
+            {market.peRatio != null && <span>P/E: {market.peRatio.toFixed(1)}</span>}
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: "#151129", border: `1.5px solid ${decisionColor}`, borderRadius: 12, padding: "16px 20px", marginBottom: 16 }}>
+        <div style={{ fontSize: 10, color: MUTE, letterSpacing: 1, marginBottom: 6 }}>DECISION BOX</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <span style={{ fontSize: 16 }}>{decision.emoji}</span>
+          <div style={{ fontSize: 17, fontWeight: 700 }}>{decision.label}</div>
+        </div>
+        <div style={{ fontSize: 12, color: MUTE }}>{decision.detail}</div>
+        <div style={{ display: "flex", gap: 20, marginTop: 10, fontSize: 11, color: MUTE, flexWrap: "wrap" }}>
+          <span>Convicción: <ConvictionStars value={thesis?.conviction} /></span>
+          <span>Última revisión: {reviewDays != null ? `hace ${reviewDays} día${reviewDays === 1 ? "" : "s"}` : "sin registrar"}</span>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gap: 16 }}>
+        {position ? (
+          <Panel title="Tu posición">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 14 }}>
+              <Metric label="Acciones/Unidades" value={`${position.shares}`} />
+              <Metric label="Costo base" value={fmt$2(Number(position.cost_basis))} />
+              <Metric label="Valor actual" value={position.value != null ? fmt$2(position.value) : "—"} />
+              <Metric label="Ganancia" value={position.gain != null ? fmt$2(position.gain) : "—"} color={position.gain >= 0 ? GREEN : RED} />
+            </div>
+          </Panel>
+        ) : (
+          <Panel title={watchlistItem ? "En tu Watchlist" : "Descubrimiento"}>
+            {watchlistItem ? (
+              <div style={{ fontSize: 13, color: MUTE }}>
+                Precio objetivo: {watchlistItem.target_price != null ? fmt$2(Number(watchlistItem.target_price)) : "sin definir"}<br />
+                {watchlistItem.notes && <>Notas: {watchlistItem.notes}<br /></>}
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: MUTE }}>No la tienes ni la vigilas todavía.</div>
+            )}
+            {!watchlistItem && !showWlForm && (
+              <button onClick={() => setShowWlForm(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer", marginTop: 12 }}>
+                + Agregar a Watchlist
+              </button>
+            )}
+            {showWlForm && (
+              <WatchlistAddForm
+                result={{ ticker: meta.ticker, name: meta.name, type: meta.type, coingeckoId: meta.coingeckoId }}
+                onDone={() => { setShowWlForm(false); onSaved(); }}
+              />
+            )}
+          </Panel>
+        )}
+
+        {position && (
+          <Panel title="Portfolio Impact">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 14 }}>
+              <Metric label="Peso actual" value={pctPatrimonio != null ? `${pctPatrimonio.toFixed(2)}%` : "—"} />
+              <Metric label="Ranking" value={ranking ? `#${ranking.pos} de ${ranking.total}` : "—"} />
+              <Metric label="Sector" value={position.sector || "Sin definir"} />
+              <Metric label="Tema" value={position.tema || "Sin definir"} />
+              <Metric label="Tipo de activo" value={assetType} />
+            </div>
+          </Panel>
+        )}
+
+        {position && (
+          <Panel title="Investment Thesis">
+            {!showThesisEdit ? (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
+                  <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
+                  <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
+                  <ThesisField label="¿Qué la haría vender?" value={thesis?.sell_trigger} />
+                  <ThesisField label="Horizonte" value={thesis?.horizon} />
+                  <ThesisField label="Riesgos" value={thesis?.risks} />
+                </div>
+                <button onClick={() => setShowThesisEdit(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>
+                  {thesis ? "Revisar tesis" : "Definir tesis"}
+                </button>
+              </>
+            ) : (
+              <ThesisEditForm ticker={meta.ticker} current={thesis} onDone={() => { setShowThesisEdit(false); onSaved(); }} />
+            )}
+          </Panel>
+        )}
+
+        {scoreData && (
+          <Panel title="Opportunity Score">
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <div className="num" style={{ fontSize: 28, fontWeight: 700, color: scoreData.total >= 80 ? GREEN : scoreData.total >= 65 ? "#7FCF9E" : AMBER }}>
+                {scoreData.total}
+              </div>
+              <div style={{ fontSize: 11, color: MUTE }}>
+                Convicción {scoreData.convictionPts} pts · Rango {scoreData.rangePts} pts · Momentum {scoreData.momentumPts} pts
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        <Panel title="Timeline">
+          {timelineEvents.length === 0 ? <Empty /> : (
+            <div style={{ display: "grid", gap: 8 }}>
+              {timelineEvents.map((e, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${LINE}`, fontSize: 12, flexWrap: "wrap", gap: 6 }}>
+                  <div><span style={{ color: MUTE }}>{e.date}</span> — <b>{e.label}</b> {e.notes && <span style={{ color: MUTE }}>({e.notes})</span>}</div>
+                  {e.amount != null && <div className="num">{fmt$2(Number(e.amount))}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>Resultados y notas de Journal aparecerán aquí cuando ese módulo exista.</div>
+        </Panel>
+
+        <Panel title="Dividendos de este activo">
+          {dividendos.length === 0 ? (
+            <div style={{ color: MUTE, fontSize: 13 }}>Sin dividendos registrados de {meta.ticker}.</div>
+          ) : (
+            <>
+              <Metric label="Total recibido" value={fmt$2(totalDividendos)} color={GOLD} />
+              <div style={{ marginTop: 12, display: "grid", gap: 6 }}>
+                {dividendos.map((d, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                    <span style={{ color: MUTE }}>{d.date}</span>
+                    <span className="num" style={{ color: GOLD }}>{fmt$2(Number(d.amount))}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </Panel>
+      </div>
+    </div>
   );
 }
 
@@ -1531,7 +1739,7 @@ function ConvictionStars({ value }) {
   return <span style={{ color, letterSpacing: 1 }}>{stars}</span>;
 }
 
-function ThesisTab({ rows, onSaved }) {
+function ThesisTab({ rows, onSaved, onOpenAsset }) {
   const [editing, setEditing] = useState(null);
 
   return (
@@ -1549,10 +1757,10 @@ function ThesisTab({ rows, onSaved }) {
         return (
           <div key={p.id} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: 18 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 700 }}>{p.ticker} <span style={{ color: MUTE, fontSize: 13, fontWeight: 400 }}>{p.name}</span></div>
+              <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                <div style={{ fontSize: 16, fontWeight: 700, color: GOLD }}>{p.ticker} <span style={{ color: MUTE, fontSize: 13, fontWeight: 400 }}>{p.name}</span></div>
                 <div style={{ marginTop: 4 }}><ConvictionStars value={p.thesis?.conviction} /></div>
-              </div>
+              </button>
               <button onClick={() => setEditing(isEditing ? null : p.ticker)} style={{
                 background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6,
                 padding: "6px 12px", fontSize: 12, cursor: "pointer",
