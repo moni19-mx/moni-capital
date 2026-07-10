@@ -103,6 +103,15 @@ async function manageGoal(payload) {
   return data;
 }
 
+async function manageJournal(payload) {
+  const res = await fetch("/api/manage-journal", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
 async function fetchMarketPulse() {
   const res = await fetch("/api/market-pulse");
   if (!res.ok) return null;
@@ -135,6 +144,7 @@ export default function Dashboard() {
   const [cashMovements, setCashMovements] = useState([]);
   const [transactions, setTransactions] = useState([]);
   const [goal, setGoal] = useState(null);
+  const [journalEntries, setJournalEntries] = useState([]);
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
@@ -152,7 +162,7 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goals] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goals, journal] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
@@ -160,6 +170,7 @@ export default function Dashboard() {
         sb("cash_movements").catch(() => []),
         sb("transactions").catch(() => []),
         sb("goals").catch(() => []),
+        sb("journal_entries").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
@@ -168,6 +179,7 @@ export default function Dashboard() {
       setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setGoal(goals && goals.length ? goals[0] : null);
+      setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
 
       fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
 
@@ -415,7 +427,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -431,6 +443,7 @@ export default function Dashboard() {
             positions={enriched}
             watchlist={watchlistEnriched}
             transactions={transactions}
+            journalEntries={journalEntries}
             patrimonio={patrimonio}
             onBack={closeAsset}
             onSaved={loadAll}
@@ -577,6 +590,8 @@ export default function Dashboard() {
             <DividendosTab rows={transactions} />
           </Panel>
         )}
+
+        {tab === "journal" && <JournalTab entries={journalEntries} onChanged={loadAll} />}
 
         {tab === "discover" && <DiscoverTab onWatchlistAdded={loadAll} onOpenAsset={openAsset} dailyOpportunities={scoredOpportunities} positions={enriched} />}
 
@@ -1345,6 +1360,240 @@ function WatchlistTable({ rows, onDeleted, onOpenAsset }) {
   );
 }
 
+const JOURNAL_TYPES = ["Compra", "Venta", "Reflexión", "Lección", "General"];
+const CONFIDENCE_STATES = [["muy_convencido", "Muy convencido"], ["conviccion_media", "Convicción media"], ["muchas_dudas", "Muchas dudas"]];
+const OUTCOME_RESULTS = [["confirmada", "Confirmada", GREEN], ["invalidada", "Invalidada", RED], ["parcial", "Parcial", AMBER]];
+
+function JournalTab({ entries, onChanged }) {
+  const [showForm, setShowForm] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+
+  const visible = entries.filter((e) => showArchived || !e.archived);
+  const stats = {
+    entradas: entries.filter((e) => !e.archived).length,
+    lecciones: entries.filter((e) => e.outcome_lesson).length,
+    confirmadas: entries.filter((e) => e.outcome_result === "confirmada").length,
+    invalidadas: entries.filter((e) => e.outcome_result === "invalidada").length,
+  };
+
+  return (
+    <Panel title="Investment Journal — tu bitácora de decisiones">
+      <div style={{ display: "flex", gap: 28, flexWrap: "wrap", marginBottom: 20 }}>
+        <Metric label="Entradas" value={`${stats.entradas}`} />
+        <Metric label="Lecciones aprendidas" value={`${stats.lecciones}`} color={GOLD} />
+        <Metric label="Tesis confirmadas" value={`${stats.confirmadas}`} color={GREEN} />
+        <Metric label="Tesis invalidadas" value={`${stats.invalidadas}`} color={RED} />
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap", alignItems: "center" }}>
+        <button onClick={() => setShowForm((s) => !s)} style={{
+          background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
+          fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+        }}><Plus size={16} /> {showForm ? "Cancelar" : "Nueva entrada"}</button>
+        <label style={{ fontSize: 12, color: MUTE, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+          <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} /> Ver archivadas
+        </label>
+      </div>
+
+      {showForm && <JournalEntryForm onDone={() => { setShowForm(false); onChanged(); }} />}
+
+      {visible.length === 0 ? (
+        <div style={{ color: MUTE, fontSize: 13 }}>Sin entradas todavía. Registra tu primera decisión con "+ Nueva entrada".</div>
+      ) : (
+        <div style={{ display: "grid", gap: 14 }}>
+          {visible.map((e) => <JournalEntryCard key={e.id} entry={e} onChanged={onChanged} />)}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function JournalEntryCard({ entry, onChanged }) {
+  const [showOutcomeForm, setShowOutcomeForm] = useState(false);
+
+  async function handleArchive() {
+    const pin = window.prompt(`Ingresa tu PIN para archivar esta entrada:`);
+    if (!pin) return;
+    try {
+      await manageJournal({ pin, action: "archive", id: entry.id });
+      onChanged();
+    } catch (e) { alert("No se pudo archivar: " + e.message); }
+  }
+
+  const outcomeInfo = OUTCOME_RESULTS.find(([k]) => k === entry.outcome_result);
+
+  return (
+    <div style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, opacity: entry.archived ? 0.55 : 1 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, color: GOLD, border: `1px solid ${GOLD}`, borderRadius: 4, padding: "2px 6px", fontWeight: 700 }}>{entry.type?.toUpperCase()}</span>
+            {entry.ticker && <b style={{ color: GOLD }}>{entry.ticker}</b>}
+            {entry.archived && <span style={{ fontSize: 10, color: MUTE }}>(archivada)</span>}
+          </div>
+          <div style={{ fontSize: 15, fontWeight: 700, marginTop: 6 }}>{entry.title}</div>
+          <div style={{ fontSize: 11, color: MUTE, marginTop: 2 }}>{entry.date}</div>
+        </div>
+        {!entry.archived && (
+          <button onClick={handleArchive} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>
+            Archivar
+          </button>
+        )}
+      </div>
+
+      <div style={{ fontSize: 13, marginTop: 10, whiteSpace: "pre-wrap" }}>{entry.content}</div>
+
+      <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 11, color: MUTE, flexWrap: "wrap" }}>
+        {entry.conviction_at_time && <span>Convicción al escribir: <ConvictionStars value={entry.conviction_at_time} /></span>}
+        {entry.confidence_state && <span>Estado: {CONFIDENCE_STATES.find(([k]) => k === entry.confidence_state)?.[1] || entry.confidence_state}</span>}
+      </div>
+
+      {entry.invalidation_criteria && (
+        <div style={{ marginTop: 10, fontSize: 11, color: MUTE, fontStyle: "italic" }}>
+          ¿Qué demostraría que estaba equivocado? {entry.invalidation_criteria}
+        </div>
+      )}
+
+      {entry.outcome_result ? (
+        <div style={{ marginTop: 14, background: "#0F1730", border: `1px solid ${outcomeInfo?.[2] || LINE}`, borderRadius: 8, padding: "10px 14px" }}>
+          <div style={{ fontSize: 10, color: outcomeInfo?.[2] || MUTE, fontWeight: 700, letterSpacing: 0.5 }}>
+            RESULTADO — {outcomeInfo?.[1] || entry.outcome_result} {entry.outcome_date && `(${entry.outcome_date})`}
+          </div>
+          {entry.outcome_lesson && <div style={{ fontSize: 12, marginTop: 6 }}>{entry.outcome_lesson}</div>}
+        </div>
+      ) : (
+        !entry.archived && (
+          <div style={{ marginTop: 12 }}>
+            {!showOutcomeForm ? (
+              <button onClick={() => setShowOutcomeForm(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+                + Agregar resultado
+              </button>
+            ) : (
+              <JournalOutcomeForm entryId={entry.id} onDone={() => { setShowOutcomeForm(false); onChanged(); }} />
+            )}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+function JournalOutcomeForm({ entryId, onDone }) {
+  const [result, setResult] = useState("");
+  const [lesson, setLesson] = useState("");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const inputStyle = { background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!result) { setErr("Elige un resultado."); return; }
+    setBusy(true);
+    try {
+      await manageJournal({ pin, action: "add_outcome", id: entryId, outcome: { outcome_result: result, outcome_lesson: lesson || null } });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: "grid", gap: 10, marginTop: 8, background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: 14 }}>
+      <div>
+        <label style={{ fontSize: 11, color: MUTE }}>Resultado *</label>
+        <select style={inputStyle} value={result} onChange={(e) => setResult(e.target.value)}>
+          <option value="">Elige uno…</option>
+          {OUTCOME_RESULTS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Lección aprendida</label><textarea style={inputStyle} rows={2} value={lesson} onChange={(e) => setLesson(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+      <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+        {busy ? "Guardando…" : "Guardar resultado"}
+      </button>
+      {err && <div style={{ color: RED, fontSize: 11 }}>{err}</div>}
+    </form>
+  );
+}
+
+function JournalEntryForm({ onDone, presetTicker }) {
+  const [ticker, setTicker] = useState(presetTicker || "");
+  const [type, setType] = useState("Reflexión");
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [conviction, setConviction] = useState("");
+  const [confidenceState, setConfidenceState] = useState("");
+  const [invalidation, setInvalidation] = useState("");
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!title || !content) { setErr("Título y contenido son obligatorios."); return; }
+    setBusy(true);
+    try {
+      await manageJournal({
+        pin, action: "add",
+        entry: {
+          ticker: ticker ? ticker.toUpperCase() : null, type, title, content, date,
+          conviction_at_time: conviction ? Number(conviction) : null,
+          confidence_state: confidenceState || null,
+          invalidation_criteria: invalidation || null,
+        },
+      });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 20, display: "grid", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 12 }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Ticker (opcional)</label><input style={inputStyle} value={ticker} onChange={(e) => setTicker(e.target.value)} placeholder="Ej. ORCL" /></div>
+        <div>
+          <label style={{ fontSize: 11, color: MUTE }}>Tipo</label>
+          <select style={inputStyle} value={type} onChange={(e) => setType(e.target.value)}>
+            {JOURNAL_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Fecha</label><input style={inputStyle} type="date" value={date} onChange={(e) => setDate(e.target.value)} /></div>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Título *</label><input style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Ej. Por qué aumenté Oracle hoy" /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Contenido *</label><textarea style={inputStyle} rows={4} value={content} onChange={(e) => setContent(e.target.value)} /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12 }}>
+        <div>
+          <label style={{ fontSize: 11, color: MUTE }}>Convicción al escribir</label>
+          <select style={inputStyle} value={conviction} onChange={(e) => setConviction(e.target.value)}>
+            <option value="">Sin definir</option>
+            {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{"★".repeat(n)}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{ fontSize: 11, color: MUTE }}>Estado al escribir</label>
+          <select style={inputStyle} value={confidenceState} onChange={(e) => setConfidenceState(e.target.value)}>
+            <option value="">Sin definir</option>
+            {CONFIDENCE_STATES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+        </div>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>¿Qué tendría que pasar para demostrar que estaba equivocado? (opcional)</label><textarea style={inputStyle} rows={2} value={invalidation} onChange={(e) => setInvalidation(e.target.value)} /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "flex-end" }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 20px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          {busy ? "Guardando…" : "Guardar entrada"}
+        </button>
+      </div>
+      {err && <div style={{ color: RED, fontSize: 12 }}>{err}</div>}
+    </form>
+  );
+}
+
 function DiscoverTab({ onWatchlistAdded, onOpenAsset, dailyOpportunities, positions }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
@@ -1503,7 +1752,7 @@ function WatchlistAddForm({ result, onDone }) {
   );
 }
 
-function AssetDetailScreen({ meta, positions, watchlist, transactions, patrimonio, onBack, onSaved, onOpenAsset }) {
+function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEntries, patrimonio, onBack, onSaved, onOpenAsset }) {
   const [market, setMarket] = useState(null);
   const [loadingMarket, setLoadingMarket] = useState(false);
   const [showThesisEdit, setShowThesisEdit] = useState(false);
@@ -1561,8 +1810,11 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, patrimoni
     const thesisEvent = thesis?.updated_at
       ? [{ date: String(thesis.updated_at).slice(0, 10), label: "TESIS ACTUALIZADA", amount: null, notes: null }]
       : [];
-    return [...txEvents, ...thesisEvent].sort((a, b) => (a.date < b.date ? 1 : -1));
-  }, [transactions, meta.ticker, thesis]);
+    const journalEvents = (journalEntries || [])
+      .filter((j) => j.ticker === meta.ticker && !j.archived)
+      .map((j) => ({ date: j.date, label: `JOURNAL — ${j.title}`, amount: null, notes: j.outcome_result ? `Resultado: ${j.outcome_result}` : null }));
+    return [...txEvents, ...thesisEvent, ...journalEvents].sort((a, b) => (a.date < b.date ? 1 : -1));
+  }, [transactions, meta.ticker, thesis, journalEntries]);
 
   const dividendos = useMemo(
     () => (transactions || []).filter((t) => t.ticker === meta.ticker && t.type === "dividendo"),
@@ -1709,7 +1961,7 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, patrimoni
               ))}
             </div>
           )}
-          <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>Resultados y notas de Journal aparecerán aquí cuando ese módulo exista.</div>
+          <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>Incluye compras, ventas, dividendos, cambios de tesis y entradas del Investment Journal de este ticker.</div>
         </Panel>
 
         <Panel title="Dividendos de este activo">
