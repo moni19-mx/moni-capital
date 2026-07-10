@@ -1,6 +1,10 @@
 // api/search.js
-// Busca activos reales por nombre o ticker: acciones via Finnhub, cripto via CoinGecko.
-// Devuelve una lista combinada y acotada de resultados.
+// Busca activos reales por nombre/ticker (Finnhub + CoinGecko) Y por
+// concepto/tema curado (lib/concepts.js). Si el termino coincide con un
+// concepto conocido, esos resultados van primero -- son intencionales,
+// no una coincidencia de texto.
+
+import { resolveConcept } from "../lib/concepts.js";
 
 export default async function handler(req, res) {
   try {
@@ -9,8 +13,21 @@ export default async function handler(req, res) {
       return res.status(200).json({ results: [] });
     }
 
-    const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
     const results = [];
+    const seen = new Set();
+
+    const conceptMatches = resolveConcept(q);
+    if (conceptMatches) {
+      conceptMatches.forEach((c) => {
+        const key = `${c.ticker}-${c.type}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ ...c, fromConcept: true });
+        }
+      });
+    }
+
+    const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
     try {
       const r = await fetch(`https://finnhub.io/api/v1/search?q=${encodeURIComponent(q)}&token=${FINNHUB_KEY}`);
@@ -19,7 +36,11 @@ export default async function handler(req, res) {
         .filter((it) => it.type === "Common Stock" || it.type === "ETP" || it.type === "ADR")
         .slice(0, 8)
         .forEach((it) => {
-          results.push({ ticker: it.symbol, name: it.description, type: "stock" });
+          const key = `${it.symbol}-stock`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push({ ticker: it.symbol, name: it.description, type: "stock" });
+          }
         });
     } catch (e) {
       /* si falla acciones, seguimos con cripto */
@@ -29,12 +50,12 @@ export default async function handler(req, res) {
       const r2 = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(q)}`);
       const d2 = await r2.json();
       (d2.coins || []).slice(0, 6).forEach((c) => {
-        results.push({
-          ticker: (c.symbol || "").toUpperCase(),
-          name: c.name,
-          type: "crypto",
-          coingeckoId: c.id,
-        });
+        const ticker = (c.symbol || "").toUpperCase();
+        const key = `${ticker}-crypto`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ ticker, name: c.name, type: "crypto", coingeckoId: c.id });
+        }
       });
     } catch (e) {
       /* si falla cripto, seguimos con lo que haya de acciones */
