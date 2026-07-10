@@ -32,7 +32,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "missing_ticker" });
   }
 
-  const payload = { ticker, ...(fields || {}) };
+  const payload = { ticker, ...(fields || {}), updated_at: new Date().toISOString() };
 
   try {
     const { data: existing, error: findErr } = await supabase
