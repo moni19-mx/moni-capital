@@ -269,7 +269,7 @@ export default function Dashboard() {
           price: p.market.price, low: p.market.low, high: p.market.high,
           changePct: p.market.changePct, conviction: p.thesis?.conviction || 0,
         });
-        return { ticker: p.ticker, name: p.name, source: "cartera", conviction: p.thesis?.conviction || 0, market: p.market, breakdown: b, score: b.total };
+        return { ticker: p.ticker, name: p.name, type: p.type, coingeckoId: p.coingecko_id, source: "cartera", conviction: p.thesis?.conviction || 0, market: p.market, breakdown: b, score: b.total };
       });
     const fromWatchlist = watchlist
       .filter((w) => marketData[w.ticker])
@@ -278,7 +278,7 @@ export default function Dashboard() {
         const b = scoreBreakdown({ price: md.price, low: md.low, high: md.high, changePct: md.changePct, conviction: 0 });
         const hitTarget = w.target_price != null && md.price <= Number(w.target_price);
         const total = Math.min(100, b.total + (hitTarget ? 20 : 0));
-        return { ticker: w.ticker, name: w.name, source: "watchlist", conviction: 0, market: md, breakdown: { ...b, total }, score: total, hitTarget };
+        return { ticker: w.ticker, name: w.name, type: w.type, coingeckoId: w.coingecko_id, source: "watchlist", conviction: 0, market: md, breakdown: { ...b, total }, score: total, hitTarget };
       });
     return [...fromPortfolio, ...fromWatchlist]
       .filter((o) => o.score >= 50)
@@ -415,7 +415,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["buscar", "Buscar"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -578,7 +578,7 @@ export default function Dashboard() {
           </Panel>
         )}
 
-        {tab === "buscar" && <SearchTab onWatchlistAdded={loadAll} onOpenAsset={openAsset} />}
+        {tab === "discover" && <DiscoverTab onWatchlistAdded={loadAll} onOpenAsset={openAsset} dailyOpportunities={scoredOpportunities} positions={enriched} />}
 
         {tab === "watchlist" && (
           <Panel title="Watchlist">
@@ -1240,8 +1240,15 @@ function ManageTable({ rows, onDeleted }) {
   );
 }
 
+const WATCHLIST_STATUSES = [
+  ["investigando", "Investigando"],
+  ["vigilando", "Vigilando"],
+  ["listo", "Lista para comprar"],
+];
+
 function WatchlistTable({ rows, onDeleted, onOpenAsset }) {
   const [busyId, setBusyId] = useState(null);
+
   async function handleDelete(row) {
     const pin = window.prompt(`Ingresa tu PIN para quitar ${row.ticker} de la watchlist:`);
     if (!pin) return;
@@ -1252,69 +1259,119 @@ function WatchlistTable({ rows, onDeleted, onOpenAsset }) {
     } catch (e) { alert("No se pudo eliminar: " + e.message); }
     finally { setBusyId(null); }
   }
-  if (rows.length === 0) return <div style={{ color: MUTE, fontSize: 13 }}>Tu watchlist está vacía. Agrega activos desde la pestaña "Buscar".</div>;
+
+  async function handleStatusChange(row, newStatus) {
+    const pin = window.prompt(`Ingresa tu PIN para mover ${row.ticker} a "${WATCHLIST_STATUSES.find(([k]) => k === newStatus)[1]}":`);
+    if (!pin) return;
+    setBusyId(row.id);
+    try {
+      await manageWatchlist({ pin, action: "update", id: row.id, item: { status: newStatus } });
+      onDeleted();
+    } catch (e) { alert("No se pudo mover: " + e.message); }
+    finally { setBusyId(null); }
+  }
+
+  if (rows.length === 0) return <div style={{ color: MUTE, fontSize: 13 }}>Tu watchlist está vacía. Agrega activos desde "Discover".</div>;
+
   return (
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 780 }}>
-        <thead>
-          <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
-            <th style={{ padding: "8px 6px" }}>Activo</th>
-            <th style={{ padding: "8px 6px", textAlign: "right" }}>Precio</th>
-            <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
-            <th style={{ padding: "8px 6px" }}>Rango</th>
-            <th style={{ padding: "8px 6px", textAlign: "right" }}>Tu precio objetivo</th>
-            <th style={{ padding: "8px 6px" }}></th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((w) => {
-            const hitTarget = w.target_price != null && w.market?.price != null && w.market.price <= Number(w.target_price);
-            return (
-              <tr key={w.id} style={{ borderBottom: `1px solid ${LINE}` }}>
-                <td style={{ padding: "10px 6px" }}>
-                  <button onClick={() => onOpenAsset({ ticker: w.ticker, type: w.type, name: w.name, coingeckoId: w.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
-                    <b style={{ color: GOLD }}>{w.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{w.name}</span>
-                  </button>
-                </td>
-                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{w.market ? fmt$2(w.market.price) : "sin dato"}</td>
-                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (w.market?.changePct || 0) >= 0 ? GREEN : RED }}>
-                  {w.market?.changePct != null ? fmtPct1(w.market.changePct) : "—"}
-                </td>
-                <td style={{ padding: "10px 6px" }}>{w.market ? <RangeBar price={w.market.price} low={w.market.low} high={w.market.high} label={w.market.rangeLabel} compact /> : "—"}</td>
-                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: hitTarget ? GREEN : TXT }}>
-                  {w.target_price != null ? fmt$2(Number(w.target_price)) : "—"}{hitTarget && " ✓"}
-                </td>
-                <td style={{ padding: "10px 6px", textAlign: "right" }}>
-                  <button onClick={() => handleDelete(w)} disabled={busyId === w.id} style={{
-                    background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
-                    cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
-                  }}><Trash2 size={12} /> {busyId === w.id ? "…" : "Quitar"}</button>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+    <div style={{ display: "grid", gap: 20 }}>
+      {WATCHLIST_STATUSES.map(([statusKey, statusLabel]) => {
+        const group = rows.filter((w) => (w.status || "investigando") === statusKey);
+        return (
+          <div key={statusKey}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: GOLD, marginBottom: 8, letterSpacing: 0.5 }}>
+              {statusLabel} <span style={{ color: MUTE, fontWeight: 400 }}>({group.length})</span>
+            </div>
+            {group.length === 0 ? (
+              <div style={{ color: MUTE, fontSize: 12, fontStyle: "italic", marginBottom: 4 }}>Nada aquí todavía.</div>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 780 }}>
+                  <thead>
+                    <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
+                      <th style={{ padding: "8px 6px" }}>Activo</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>Precio</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
+                      <th style={{ padding: "8px 6px" }}>Rango</th>
+                      <th style={{ padding: "8px 6px", textAlign: "right" }}>Precio objetivo</th>
+                      <th style={{ padding: "8px 6px" }}>Mover a</th>
+                      <th style={{ padding: "8px 6px" }}></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group.map((w) => {
+                      const hitTarget = w.target_price != null && w.market?.price != null && w.market.price <= Number(w.target_price);
+                      return (
+                        <tr key={w.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                          <td style={{ padding: "10px 6px" }}>
+                            <button onClick={() => onOpenAsset({ ticker: w.ticker, type: w.type, name: w.name, coingeckoId: w.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                              <b style={{ color: GOLD }}>{w.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{w.name}</span>
+                            </button>
+                          </td>
+                          <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{w.market ? fmt$2(w.market.price) : "sin dato"}</td>
+                          <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (w.market?.changePct || 0) >= 0 ? GREEN : RED }}>
+                            {w.market?.changePct != null ? fmtPct1(w.market.changePct) : "—"}
+                          </td>
+                          <td style={{ padding: "10px 6px" }}>{w.market ? <RangeBar price={w.market.price} low={w.market.low} high={w.market.high} label={w.market.rangeLabel} compact /> : "—"}</td>
+                          <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: hitTarget ? GREEN : TXT }}>
+                            {w.target_price != null ? fmt$2(Number(w.target_price)) : "—"}{hitTarget && " ✓"}
+                          </td>
+                          <td style={{ padding: "10px 6px" }}>
+                            <select
+                              value={statusKey} disabled={busyId === w.id}
+                              onChange={(e) => handleStatusChange(w, e.target.value)}
+                              style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "4px 6px", fontSize: 11 }}
+                            >
+                              {WATCHLIST_STATUSES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                            </select>
+                          </td>
+                          <td style={{ padding: "10px 6px", textAlign: "right" }}>
+                            <button onClick={() => handleDelete(w)} disabled={busyId === w.id} style={{
+                              background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
+                              cursor: "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 4,
+                            }}><Trash2 size={12} /> {busyId === w.id ? "…" : "Quitar"}</button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function SearchTab({ onWatchlistAdded, onOpenAsset }) {
+function DiscoverTab({ onWatchlistAdded, onOpenAsset, dailyOpportunities, positions }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
+  const [enriched, setEnriched] = useState({});
+  const [quickAddFor, setQuickAddFor] = useState(null);
   const debounceRef = useRef(null);
+
+  const top3 = (dailyOpportunities || []).slice(0, 3);
 
   function onChange(v) {
     setQ(v);
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (v.trim().length < 1) { setResults([]); return; }
+    if (v.trim().length < 1) { setResults([]); setEnriched({}); return; }
     debounceRef.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const { results } = await searchAssets(v.trim());
-        setResults(results || []);
-      } catch (e) { setResults([]); }
+        const { results: found } = await searchAssets(v.trim());
+        setResults(found || []);
+        const toEnrich = (found || []).slice(0, 6).map((r) => ({ ticker: r.ticker, type: r.type, coingeckoId: r.coingeckoId }));
+        if (toEnrich.length) {
+          const { data } = await fetchMarketData(toEnrich);
+          setEnriched(data || {});
+        } else {
+          setEnriched({});
+        }
+      } catch (e) { setResults([]); setEnriched({}); }
       finally { setSearching(false); }
     }, 400);
   }
@@ -1322,33 +1379,84 @@ function SearchTab({ onWatchlistAdded, onOpenAsset }) {
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "10px 12px", fontSize: 14, width: "100%" };
 
   return (
-    <Panel title="Buscar cualquier activo (real, no solo lo tuyo)">
-      <div style={{ position: "relative", marginBottom: 16 }}>
-        <Search size={16} color={MUTE} style={{ position: "absolute", left: 12, top: 12 }} />
-        <input style={{ ...inputStyle, paddingLeft: 36 }} value={q} onChange={(e) => onChange(e.target.value)} placeholder="Ej. Tesla, TSLA, Solana, Uber…" />
-      </div>
+    <div style={{ display: "grid", gap: 16 }}>
+      <Panel title="Oportunidades del día">
+        {top3.length === 0 ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>Sin oportunidades con Opportunity Score alto ahora mismo.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {top3.map((o) => (
+              <button key={o.ticker} onClick={() => onOpenAsset({ ticker: o.ticker, type: o.type || "stock", name: o.name, coingeckoId: o.coingeckoId })} style={{
+                background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
+                display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", textAlign: "left", width: "100%",
+              }}>
+                <span><b style={{ color: GOLD }}>{o.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{o.source === "cartera" ? "en cartera" : "watchlist"}</span></span>
+                <span className="num" style={{ color: o.score >= 80 ? GREEN : AMBER, fontWeight: 700 }}>{o.score}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </Panel>
 
-      {searching && <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Buscando…</div>}
-
-      {results.length > 0 && (
-        <div style={{ display: "grid", gap: 6 }}>
-          {results.map((r, i) => (
-            <button key={i} onClick={() => onOpenAsset(r)} style={{
-              background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
-              textAlign: "left", cursor: "pointer", color: TXT, display: "flex", justifyContent: "space-between", alignItems: "center",
-            }}>
-              <span><b style={{ color: GOLD }}>{r.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{r.name}</span></span>
-              <span style={{ fontSize: 10, color: GOLD, border: `1px solid ${GOLD}`, borderRadius: 4, padding: "2px 6px" }}>
-                {r.type === "stock" ? "ACCIÓN" : "CRIPTO"}
-              </span>
-            </button>
-          ))}
+      <Panel title="Descubrir — ticker, nombre o tema (IA, Cloud, Energía, Semiconductores, Fintech, Cripto…)">
+        <div style={{ position: "relative", marginBottom: 16 }}>
+          <Search size={16} color={MUTE} style={{ position: "absolute", left: 12, top: 12 }} />
+          <input style={{ ...inputStyle, paddingLeft: 36 }} value={q} onChange={(e) => onChange(e.target.value)} placeholder="Ej. Tesla, TSLA, IA, Energía…" />
         </div>
-      )}
-      {q.trim().length > 0 && !searching && results.length === 0 && (
-        <div style={{ color: MUTE, fontSize: 13 }}>Sin resultados para "{q}".</div>
-      )}
-    </Panel>
+
+        {searching && <div style={{ color: MUTE, fontSize: 12, marginBottom: 12 }}>Buscando…</div>}
+
+        {results.length > 0 && (
+          <div style={{ display: "grid", gap: 8 }}>
+            {results.map((r, i) => {
+              const md = enriched[r.ticker];
+              const owned = positions.find((p) => p.ticker === r.ticker);
+              let score = null, rangePct = null;
+              const reasons = [];
+              if (md) {
+                const b = scoreBreakdown({ price: md.price, low: md.low, high: md.high, changePct: md.changePct, conviction: owned?.thesis?.conviction || 0 });
+                score = b.total;
+                if (md.low != null && md.high != null && md.high > md.low) rangePct = ((md.price - md.low) / (md.high - md.low)) * 100;
+                if (owned?.thesis?.conviction >= 4) reasons.push("Convicción alta");
+                if (rangePct != null && rangePct < 25) reasons.push("Cerca de su mínimo");
+                if (r.fromConcept) reasons.push(`Tema: ${q.trim()}`);
+                if (md.changePct != null && md.changePct < -3) reasons.push("Momentum negativo reciente");
+              }
+              return (
+                <div key={i} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: "12px 14px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+                    <button onClick={() => onOpenAsset(r)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left", flex: 1, minWidth: 160 }}>
+                      <div><b style={{ color: GOLD }}>{r.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{r.name}</span></div>
+                      {md && (
+                        <div className="num" style={{ fontSize: 13, marginTop: 4 }}>
+                          {fmt$2(md.price)} <span style={{ color: (md.changePct || 0) >= 0 ? GREEN : RED, fontSize: 11 }}>{md.changePct != null ? fmtPct1(md.changePct) : ""}</span>
+                        </div>
+                      )}
+                    </button>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      {score != null && <span className="num" style={{ color: score >= 80 ? GREEN : score >= 65 ? "#7FCF9E" : AMBER, fontWeight: 700 }}>{score}</span>}
+                      <button onClick={() => setQuickAddFor(quickAddFor === r.ticker ? null : r.ticker)} style={{
+                        background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, width: 26, height: 26, cursor: "pointer", fontWeight: 700,
+                      }}>+</button>
+                    </div>
+                  </div>
+                  {md && rangePct != null && <div style={{ marginTop: 8 }}><RangeBar price={md.price} low={md.low} high={md.high} label={md.rangeLabel} compact /></div>}
+                  {reasons.length > 0 && (
+                    <div style={{ marginTop: 8, fontSize: 10, color: MUTE }}>¿Por qué? {reasons.join(" · ")}</div>
+                  )}
+                  {quickAddFor === r.ticker && (
+                    <WatchlistAddForm result={r} onDone={() => { setQuickAddFor(null); onWatchlistAdded(); }} />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {q.trim().length > 0 && !searching && results.length === 0 && (
+          <div style={{ color: MUTE, fontSize: 13 }}>Sin resultados para "{q}".</div>
+        )}
+      </Panel>
+    </div>
   );
 }
 
