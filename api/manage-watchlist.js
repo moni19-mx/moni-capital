@@ -32,7 +32,15 @@ export default async function handler(req, res) {
       if (!item || !item.ticker || !item.type) {
         return res.status(400).json({ error: "missing_fields" });
       }
-      const { data, error } = await supabase.from("watchlist").insert([item]).select();
+      const payload = { status: "investigando", ...item };
+      const { data, error } = await supabase.from("watchlist").insert([payload]).select();
+      if (error) throw error;
+      return res.status(200).json({ ok: true, data });
+    }
+
+    if (action === "update") {
+      if (!id) return res.status(400).json({ error: "missing_id" });
+      const { data, error } = await supabase.from("watchlist").update(item).eq("id", id).select();
       if (error) throw error;
       return res.status(200).json({ ok: true, data });
     }
