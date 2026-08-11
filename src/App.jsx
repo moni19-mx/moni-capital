@@ -427,7 +427,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["allocation", "Allocation"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -556,27 +556,15 @@ export default function Dashboard() {
           </Panel>
         )}
 
-        {tab === "allocation" && (
-          <Panel title="Sector / Categoría (solo acciones)">
-            <ResponsiveContainer width="100%" height={480}>
-              <BarChart
-                data={Object.entries(
-                  withValue.filter((p) => p.type === "stock").reduce((acc, p) => {
-                    const key = p.sector || "Sin sector";
-                    acc[key] = (acc[key] || 0) + p.value;
-                    return acc;
-                  }, {})
-                ).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }))}
-                layout="vertical" margin={{ left: 20, right: 30 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke={LINE} horizontal={false} />
-                <XAxis type="number" tickFormatter={fmt$} stroke={MUTE} fontSize={11} />
-                <YAxis type="category" dataKey="name" stroke={MUTE} fontSize={11} width={170} />
-                <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
-                <Bar dataKey="value" fill="#7C8CF8" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </Panel>
+        {tab === "wealth" && (
+          <WealthTab
+            patrimonio={patrimonio} invested={invested} totalGain={totalGain} totalPct={totalPct}
+            stocksValue={stocksValue} cryptoValue={cryptoValue} cashValue={cashValue}
+            withValue={withValue} top5={top5} top1Pct={top1Pct} top3Pct={top3Pct} concColor={concColor}
+            allocType={allocType} snapshots={snapshots} goal={goal} goalPct={goalPct}
+            transactions={transactions} cashMovements={cashMovements}
+            onOpenAsset={openAsset}
+          />
         )}
 
         {tab === "historial" && (
@@ -1223,14 +1211,26 @@ function ManageTable({ rows, onDeleted }) {
     } catch (e) { alert("No se pudo eliminar: " + e.message); }
     finally { setBusyId(null); }
   }
+  async function handleRoleChange(row, newRole) {
+    const pin = window.prompt(`Ingresa tu PIN para actualizar el rol estratégico de ${row.ticker}:`);
+    if (!pin) return;
+    setBusyId(row.id);
+    try {
+      await managePosition({ pin, action: "update", id: row.id, position: { strategic_role: newRole || null } });
+      onDeleted();
+    } catch (e) { alert("No se pudo actualizar: " + e.message); }
+    finally { setBusyId(null); }
+  }
   return (
     <div style={{ overflowX: "auto" }}>
-    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginTop: 10, minWidth: 600 }}>
+    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, marginTop: 10, minWidth: 700 }}>
       <thead>
         <tr style={{ color: MUTE, textAlign: "left", borderBottom: `1px solid ${LINE}` }}>
           <th style={{ padding: "8px 6px" }}>Ticker</th><th style={{ padding: "8px 6px" }}>Nombre</th>
           <th style={{ padding: "8px 6px" }}>Tipo</th><th style={{ padding: "8px 6px", textAlign: "right" }}>Acciones/Unid.</th>
-          <th style={{ padding: "8px 6px", textAlign: "right" }}>Costo</th><th style={{ padding: "8px 6px" }}></th>
+          <th style={{ padding: "8px 6px", textAlign: "right" }}>Costo</th>
+          <th style={{ padding: "8px 6px" }}>Rol estratégico</th>
+          <th style={{ padding: "8px 6px" }}></th>
         </tr>
       </thead>
       <tbody>
@@ -1241,6 +1241,16 @@ function ManageTable({ rows, onDeleted }) {
             <td style={{ padding: "10px 6px", color: MUTE }}>{p.type}</td>
             <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{p.shares}</td>
             <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(Number(p.cost_basis))}</td>
+            <td style={{ padding: "10px 6px" }}>
+              <select
+                value={p.strategic_role || ""} disabled={busyId === p.id}
+                onChange={(e) => handleRoleChange(p, e.target.value)}
+                style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "4px 6px", fontSize: 11 }}
+              >
+                <option value="">Sin clasificar</option>
+                {STRATEGIC_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </td>
             <td style={{ padding: "10px 6px", textAlign: "right" }}>
               <button onClick={() => handleDelete(p)} disabled={busyId === p.id} style={{
                 background: "none", border: `1px solid ${RED}`, color: RED, borderRadius: 6, padding: "4px 8px",
@@ -1363,6 +1373,261 @@ function WatchlistTable({ rows, onDeleted, onOpenAsset }) {
 const JOURNAL_TYPES = ["Compra", "Venta", "Reflexión", "Lección", "General"];
 const CONFIDENCE_STATES = [["muy_convencido", "Muy convencido"], ["conviccion_media", "Convicción media"], ["muchas_dudas", "Muchas dudas"]];
 const OUTCOME_RESULTS = [["confirmada", "Confirmada", GREEN], ["invalidada", "Invalidada", RED], ["parcial", "Parcial", AMBER]];
+
+const STRATEGIC_ROLES = ["Core Holding", "High Conviction", "Growth", "Speculative", "Defensive", "Cash"];
+
+function computeVolatility(snapshots) {
+  if (!snapshots || snapshots.length < 10) return null;
+  const values = snapshots.map((s) => Number(s.patrimonio));
+  const returns = [];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i - 1] > 0) returns.push((values[i] - values[i - 1]) / values[i - 1]);
+  }
+  if (returns.length < 9) return null;
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+  return Math.sqrt(variance) * 100;
+}
+
+function aggregateForLongTerm(snapshots) {
+  const clean = snapshots.map((s) => ({ date: s.date, Patrimonio: Number(s.patrimonio) }));
+  if (clean.length <= 60) return clean;
+  const byWeek = {};
+  clean.forEach((s) => {
+    const d = new Date(s.date);
+    const firstJan = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const week = Math.ceil(((d - firstJan) / 86400000 + firstJan.getUTCDay() + 1) / 7);
+    byWeek[`${d.getUTCFullYear()}-W${week}`] = s; // se queda el ultimo snapshot de esa semana
+  });
+  return Object.values(byWeek);
+}
+
+function WealthTab({
+  patrimonio, invested, totalGain, totalPct, stocksValue, cryptoValue, cashValue,
+  withValue, top5, top1Pct, top3Pct, concColor, allocType, snapshots, goal, goalPct,
+  transactions, cashMovements, onOpenAsset,
+}) {
+  const bySector = useMemo(() => {
+    const map = {};
+    withValue.filter((p) => p.type === "stock").forEach((p) => {
+      const key = p.sector || "Sin sector";
+      map[key] = (map[key] || 0) + p.value;
+    });
+    return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }));
+  }, [withValue]);
+
+  const byTema = useMemo(() => {
+    const map = {};
+    withValue.filter((p) => p.type !== "cash").forEach((p) => {
+      const key = p.tema || "Sin clasificar";
+      map[key] = (map[key] || 0) + p.value;
+    });
+    if (cashValue > 0) map["Efectivo"] = (map["Efectivo"] || 0) + cashValue;
+    return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }));
+  }, [withValue, cashValue]);
+
+  const byRole = useMemo(() => {
+    const map = {};
+    withValue.filter((p) => p.type !== "cash").forEach((p) => {
+      const key = p.strategic_role || "Sin clasificar";
+      map[key] = (map[key] || 0) + p.value;
+    });
+    if (cashValue > 0) map["Cash"] = (map["Cash"] || 0) + cashValue;
+    return Object.entries(map).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value }));
+  }, [withValue, cashValue]);
+
+  const costoVigente = withValue.reduce((a, p) => a + Number(p.cost_basis), 0);
+  const valorActual = stocksValue + cryptoValue;
+  const gananciaPosiciones = valorActual - costoVigente;
+  const dividendosTotal = (transactions || []).filter((t) => t.type === "dividendo").reduce((a, t) => a + Number(t.amount || 0), 0);
+  const retirosTotal = (cashMovements || []).filter((m) => m.type === "retiro").reduce((a, m) => a + Number(m.amount || 0), 0);
+
+  const volatilidad = useMemo(() => computeVolatility(snapshots), [snapshots]);
+  const longTermData = useMemo(() => aggregateForLongTerm(snapshots), [snapshots]);
+
+  const goalHistoryData = useMemo(() => {
+    if (!goal?.target_amount) return [];
+    return snapshots.map((s) => ({ date: s.date, "% de meta": Math.min(100, (Number(s.patrimonio) / Number(goal.target_amount)) * 100) }));
+  }, [snapshots, goal]);
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <Panel title="1. Patrimonio Total">
+        <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
+          <Metric label="Patrimonio actual" value={fmt$2(patrimonio)} />
+          <Metric label="Rendimiento total" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
+          <Metric label="Ganancia/Pérdida total" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} />
+        </div>
+        {snapshots.length < 5 && (
+          <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>El historial de largo plazo apenas empieza a acumularse — se vuelve más útil con cada semana que pasa.</div>
+        )}
+      </Panel>
+
+      <Panel title="2. Allocation">
+        {allocType.length === 0 ? <Empty /> : (
+          <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
+            <ResponsiveContainer width={160} height={160}>
+              <PieChart>
+                <Pie data={allocType} dataKey="value" innerRadius={45} outerRadius={70} paddingAngle={2}>
+                  {allocType.map((e, i) => <Cell key={i} fill={e.color} stroke="none" />)}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {allocType.map((e, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: e.color, display: "inline-block" }} />
+                  <span style={{ color: MUTE }}>{e.name}</span>
+                  <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{patrimonio ? ((e.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="3. Diversificación">
+        <div style={{ display: "grid", gap: 22 }}>
+          {[["Por sector (acciones)", bySector], ["Por tema de inversión", byTema], ["Por rol estratégico", byRole]].map(([label, data]) => (
+            <div key={label}>
+              <div style={{ fontSize: 11, color: MUTE, marginBottom: 8, fontWeight: 600 }}>{label}</div>
+              {data.length === 0 ? <Empty /> : (
+                <ResponsiveContainer width="100%" height={Math.max(80, data.length * 32)}>
+                  <BarChart data={data} layout="vertical" margin={{ left: 10, right: 20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={LINE} horizontal={false} />
+                    <XAxis type="number" tickFormatter={fmt$} stroke={MUTE} fontSize={10} />
+                    <YAxis type="category" dataKey="name" stroke={MUTE} fontSize={10} width={140} />
+                    <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
+                    <Bar dataKey="value" fill="#7C8CF8" radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="4. Concentración">
+        <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
+        <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
+        <div style={{ marginTop: 14 }}>
+          {top5.map((p, i) => (
+            <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
+              display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
+              borderBottom: `1px solid ${LINE}`, padding: "8px 0", cursor: "pointer", color: TXT, fontSize: 12, textAlign: "left",
+            }}>
+              <span>{i + 1}. <b style={{ color: GOLD }}>{p.ticker}</b></span>
+              <span className="num">{fmt$2(p.value)} · {patrimonio ? ((p.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
+            </button>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="5. Evolución del Patrimonio">
+        {longTermData.length < 2 ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>Necesitas más historial para ver una evolución de largo plazo.</div>
+        ) : (
+          <>
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={longTermData} margin={{ left: 10, right: 20, top: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={LINE} />
+                <XAxis dataKey="date" stroke={MUTE} fontSize={11} />
+                <YAxis stroke={MUTE} fontSize={11} tickFormatter={fmt$} width={70} />
+                <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
+                <Line type="monotone" dataKey="Patrimonio" stroke={GOLD} strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+            {snapshots.length > 60 && <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>Agrupado por semana para que la tendencia de largo plazo se vea clara.</div>}
+          </>
+        )}
+      </Panel>
+
+      <Panel title="6. Flujo de Capital">
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 16 }}>
+          <Metric label="Aportes netos (Efectivo)" value={fmt$2(cashValue)} />
+          <Metric label="Costo vigente de posiciones" value={fmt$2(costoVigente)} />
+          <Metric label="Valor actual de posiciones" value={fmt$2(valorActual)} />
+          <Metric label="Ganancia/Pérdida (posiciones)" value={fmt$2(gananciaPosiciones)} color={gananciaPosiciones >= 0 ? GREEN : RED} />
+          <Metric label="Dividendos recibidos" value={fmt$2(dividendosTotal)} color={GOLD} />
+          <Metric label="Retiros" value={fmt$2(retirosTotal)} />
+          <Metric label="Intereses" value="No tengo ese dato registrado todavía." />
+        </div>
+        <div style={{ fontSize: 10, color: MUTE, marginTop: 14 }}>
+          "Aportes netos" y "Costo vigente de posiciones" hoy se registran por separado — no están conectados automáticamente entre sí en Moni Capital.
+        </div>
+      </Panel>
+
+      <Panel title="7. Riesgo">
+        <SemRow label="Liquidez (Efectivo / Patrimonio)" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
+        <SemRow label="Concentración (Top 1)" value={top1Pct} color={concColor} />
+        <div style={{ fontSize: 12, color: MUTE, marginTop: 10 }}>
+          Diversificación: {byTema.length} tema{byTema.length === 1 ? "" : "s"} distintos representados.
+        </div>
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${LINE}` }}>
+          <div style={{ fontSize: 11, color: MUTE, marginBottom: 4 }}>Volatilidad (variación diaria del patrimonio)</div>
+          {volatilidad == null ? (
+            <div style={{ fontSize: 13, color: MUTE, fontStyle: "italic" }}>Necesitas más historial para calcular esta métrica.</div>
+          ) : (
+            <div className="num" style={{ fontSize: 20, fontWeight: 700 }}>{volatilidad.toFixed(2)}%</div>
+          )}
+        </div>
+      </Panel>
+
+      <Panel title="8. Metas">
+        {!goal?.target_amount ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>No has definido una meta patrimonial todavía — hazlo desde el Hero en Resumen.</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", gap: 28, flexWrap: "wrap", marginBottom: 16 }}>
+              <Metric label="Meta patrimonial" value={fmt$2(Number(goal.target_amount))} />
+              <Metric label="Progreso actual" value={`${goalPct != null ? goalPct.toFixed(1) : "0.0"}%`} color={GOLD} />
+            </div>
+            {goalHistoryData.length >= 2 && (
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart data={goalHistoryData} margin={{ left: 10, right: 20, top: 10 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={LINE} />
+                  <XAxis dataKey="date" stroke={MUTE} fontSize={10} />
+                  <YAxis stroke={MUTE} fontSize={10} tickFormatter={(v) => `${v}%`} width={50} domain={[0, 100]} />
+                  <Tooltip formatter={(v) => `${v.toFixed(1)}%`} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
+                  <Line type="monotone" dataKey="% de meta" stroke={GOLD} strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+            <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>El progreso histórico aplica tu meta de hoy retroactivamente — no guardamos metas anteriores.</div>
+          </>
+        )}
+      </Panel>
+
+      <Panel title="Wealth DNA">
+        <div style={{ display: "grid", gap: 20 }}>
+          <div>
+            <div style={{ fontSize: 11, color: MUTE, marginBottom: 8, fontWeight: 600 }}>Por tema</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {byTema.map((t, i) => (
+                <span key={i} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 999, padding: "5px 12px", fontSize: 11 }}>
+                  {t.name} <b style={{ color: GOLD }}>{patrimonio ? ((t.value / patrimonio) * 100).toFixed(0) : 0}%</b>
+                </span>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: MUTE, marginBottom: 8, fontWeight: 600 }}>Por rol estratégico</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {byRole.map((t, i) => (
+                <span key={i} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 999, padding: "5px 12px", fontSize: 11 }}>
+                  {t.name} <b style={{ color: GOLD }}>{patrimonio ? ((t.value / patrimonio) * 100).toFixed(0) : 0}%</b>
+                </span>
+              ))}
+            </div>
+            <div style={{ fontSize: 10, color: MUTE, marginTop: 8 }}>
+              El rol estratégico lo defines tú por posición (en Gestionar o Asset Detail) — nunca se infiere solo.
+            </div>
+          </div>
+        </div>
+      </Panel>
+    </div>
+  );
+}
 
 function JournalTab({ entries, onChanged }) {
   const [showForm, setShowForm] = useState(false);
@@ -1555,7 +1820,7 @@ function JournalEntryForm({ onDone, presetTicker }) {
   return (
     <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 20, display: "grid", gap: 12 }}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 12 }}>
-        <div><label style={{ fontSize: 11, color: MUTE }}>Ticker (opcional)</label><input style={inputStyle} value={ticker} onChange={(e) => setTicker(e.target.value)} placeholder="Ej. ORCL" /></div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Ticker (opcional)</label><TickerSearchInput value={ticker} onChange={setTicker} onPick={(r) => setTicker(r.ticker)} placeholder="Ej. Oracle, ORCL…" /></div>
         <div>
           <label style={{ fontSize: 11, color: MUTE }}>Tipo</label>
           <select style={inputStyle} value={type} onChange={(e) => setType(e.target.value)}>
@@ -1794,15 +2059,6 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
     return { emoji: "🟢", label: "Mantener", detail: "Sin señales relevantes ahora mismo." };
   }, [position, market, pctPatrimonio, scoreData]);
 
-  const assetType = useMemo(() => {
-    const c = thesis?.conviction;
-    if (c === 5) return "Core Holding";
-    if (c === 4) return "High Conviction";
-    if (c === 3) return "Growth";
-    if (c === 2) return "Especulativa";
-    return "Sin clasificar";
-  }, [thesis]);
-
   const timelineEvents = useMemo(() => {
     const txEvents = (transactions || [])
       .filter((t) => t.ticker === meta.ticker)
@@ -1911,7 +2167,7 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
               <Metric label="Ranking" value={ranking ? `#${ranking.pos} de ${ranking.total}` : "—"} />
               <Metric label="Sector" value={position.sector || "Sin definir"} />
               <Metric label="Tema" value={position.tema || "Sin definir"} />
-              <Metric label="Tipo de activo" value={assetType} />
+              <Metric label="Tipo de activo" value={position.strategic_role || "Sin clasificar"} />
             </div>
           </Panel>
         )}
@@ -1986,37 +2242,75 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
   );
 }
 
-function AddForm({ onDone }) {
-  const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", shares: "", cost_basis: "", coingecko_id: "" });
-  const [pin, setPin] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
+function TickerSearchInput({ value, onChange, onPick, placeholder }) {
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const debounceRef = useRef(null);
 
-  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
-
-  function onTickerChange(v) {
-    setForm((f) => ({ ...f, ticker: v.toUpperCase(), coingecko_id: "" }));
+  function handleChange(v) {
+    onChange(v.toUpperCase());
     setShowResults(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (v.trim().length < 1) { setResults([]); return; }
     debounceRef.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const { results } = await searchAssets(v.trim());
-        setResults(results || []);
+        const { results: found } = await searchAssets(v.trim());
+        setResults(found || []);
       } catch (e) { setResults([]); }
       finally { setSearching(false); }
     }, 350);
   }
 
-  function pickResult(r) {
-    setForm((f) => ({ ...f, ticker: r.ticker, name: r.name, type: r.type, coingecko_id: r.coingeckoId || "" }));
+  function pick(r) {
+    onPick(r);
     setResults([]);
     setShowResults(false);
+  }
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        style={inputStyle} value={value} autoComplete="off"
+        onChange={(e) => handleChange(e.target.value)}
+        onFocus={() => setShowResults(true)}
+        onBlur={() => setTimeout(() => setShowResults(false), 150)}
+        placeholder={placeholder || "Ej. Apple, AAPL, Solana…"}
+      />
+      {showResults && (searching || results.length > 0) && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, background: PANEL, border: `1px solid ${LINE}`,
+          borderRadius: 8, marginTop: 4, zIndex: 20, maxHeight: 220, overflowY: "auto",
+        }}>
+          {searching && <div style={{ padding: 10, fontSize: 12, color: MUTE }}>Buscando…</div>}
+          {results.map((r, i) => (
+            <button key={i} type="button" onMouseDown={() => pick(r)} style={{
+              display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
+              padding: "8px 10px", textAlign: "left", cursor: "pointer", color: TXT, fontSize: 12, borderBottom: `1px solid ${LINE}`,
+            }}>
+              <span><b>{r.ticker}</b> <span style={{ color: MUTE }}>{r.name}</span></span>
+              <span style={{ color: GOLD, fontSize: 9 }}>{r.type === "stock" ? "ACCIÓN" : "CRIPTO"}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddForm({ onDone }) {
+  const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", strategic_role: "", shares: "", cost_basis: "", coingecko_id: "" });
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
+
+  function pickResult(r) {
+    setForm((f) => ({ ...f, ticker: r.ticker, name: r.name, type: r.type, coingecko_id: r.coingeckoId || "" }));
   }
 
   async function submit(e) {
@@ -2031,7 +2325,7 @@ function AddForm({ onDone }) {
         pin, action: "add",
         position: {
           ticker: form.ticker.toUpperCase(), name: form.name, type: form.type,
-          sector: form.sector || null, tema: form.tema || null,
+          sector: form.sector || null, tema: form.tema || null, strategic_role: form.strategic_role || null,
           shares: Number(form.shares), cost_basis: Number(form.cost_basis),
           coingecko_id: form.coingecko_id || null,
         },
@@ -2043,32 +2337,9 @@ function AddForm({ onDone }) {
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
   return (
     <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
-      <div style={{ position: "relative" }}>
+      <div>
         <label style={{ fontSize: 11, color: MUTE }}>Ticker * (busca por nombre o símbolo)</label>
-        <input
-          style={inputStyle} value={form.ticker} autoComplete="off"
-          onChange={(e) => onTickerChange(e.target.value)}
-          onFocus={() => setShowResults(true)}
-          onBlur={() => setTimeout(() => setShowResults(false), 150)}
-          placeholder="Ej. Apple, AAPL, Solana…"
-        />
-        {showResults && (searching || results.length > 0) && (
-          <div style={{
-            position: "absolute", top: "100%", left: 0, right: 0, background: PANEL, border: `1px solid ${LINE}`,
-            borderRadius: 8, marginTop: 4, zIndex: 20, maxHeight: 220, overflowY: "auto",
-          }}>
-            {searching && <div style={{ padding: 10, fontSize: 12, color: MUTE }}>Buscando…</div>}
-            {results.map((r, i) => (
-              <button key={i} type="button" onMouseDown={() => pickResult(r)} style={{
-                display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
-                padding: "8px 10px", textAlign: "left", cursor: "pointer", color: TXT, fontSize: 12, borderBottom: `1px solid ${LINE}`,
-              }}>
-                <span><b>{r.ticker}</b> <span style={{ color: MUTE }}>{r.name}</span></span>
-                <span style={{ color: GOLD, fontSize: 9 }}>{r.type === "stock" ? "ACCIÓN" : "CRIPTO"}</span>
-              </button>
-            ))}
-          </div>
-        )}
+        <TickerSearchInput value={form.ticker} onChange={(v) => set("ticker", v)} onPick={pickResult} />
       </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Nombre *</label><input style={inputStyle} value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="Apple Inc" /></div>
       <div>
@@ -2079,6 +2350,13 @@ function AddForm({ onDone }) {
       </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Sector</label><input style={inputStyle} value={form.sector} onChange={(e) => set("sector", e.target.value)} /></div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Tema estratégico</label><input style={inputStyle} value={form.tema} onChange={(e) => set("tema", e.target.value)} /></div>
+      <div>
+        <label style={{ fontSize: 11, color: MUTE }}>Rol estratégico</label>
+        <select style={inputStyle} value={form.strategic_role} onChange={(e) => set("strategic_role", e.target.value)}>
+          <option value="">Sin clasificar</option>
+          {STRATEGIC_ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+        </select>
+      </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Acciones/Unidades *</label><input style={inputStyle} type="number" step="any" value={form.shares} onChange={(e) => set("shares", e.target.value)} /></div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Costo total ($) *</label><input style={inputStyle} type="number" step="any" value={form.cost_basis} onChange={(e) => set("cost_basis", e.target.value)} /></div>
       <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
