@@ -96,6 +96,18 @@ async function runQuestion(question, history, provider, FINNHUB_KEY) {
 }
 
 export default async function handler(req, res) {
+  // CORS: la herramienta de benchmark corre como archivo local en el
+  // navegador (origen distinto al del sitio desplegado), asi que el
+  // preflight OPTIONS necesita respuesta explicita o el navegador bloquea
+  // la peticion real antes de que salga siquiera.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "method_not_allowed" });
   }
@@ -138,11 +150,6 @@ export default async function handler(req, res) {
     }
 
     if (resource === "benchmark_question") {
-      // Corre UNA pregunta contra UN proveedor especifico. Se llama 24
-      // veces desde el navegador (12 preguntas x 2 proveedores) en vez de
-      // hacer las 24 dentro de una sola funcion -- el plan gratuito de
-      // Vercel mata funciones que tardan mas de ~10s, y 24 llamadas reales
-      // encadenadas facilmente pasan ese limite.
       const { provider, questionIndex } = req.body || {};
       if (!provider || questionIndex == null) return res.status(400).json({ error: "missing_fields" });
       const question = EVALUATION_SET_V1[questionIndex];
