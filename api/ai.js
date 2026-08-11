@@ -6,10 +6,9 @@
 // 2 acciones:
 // - chat: una pregunta, corre el tool-calling loop contra el proveedor
 //   activo (MONI_AI_PROVIDER), guarda el turno en ai_conversations.
-// - benchmark: corre el Evaluation Set v1 completo contra AMBOS
-//   proveedores, secuencial, y devuelve resultados crudos -- sin
-//   inventar un "ganador", eso lo decide un humano viendo las respuestas
-//   reales.
+// - benchmark_question: UNA pregunta contra UN proveedor especifico -- se
+//   llama 24 veces desde el navegador (ver herramienta que sigue), nunca
+//   las 24 dentro de una sola funcion de Vercel.
 //
 // Regla que nunca cambia: el modelo NUNCA calcula un numero financiero.
 // Solo interpreta lo que devuelven las tools de lib/aiTools.js.
@@ -138,20 +137,26 @@ export default async function handler(req, res) {
       return res.status(200).json(result);
     }
 
+    if (resource === "benchmark_question") {
+      // Corre UNA pregunta contra UN proveedor especifico. Se llama 24
+      // veces desde el navegador (12 preguntas x 2 proveedores) en vez de
+      // hacer las 24 dentro de una sola funcion -- el plan gratuito de
+      // Vercel mata funciones que tardan mas de ~10s, y 24 llamadas reales
+      // encadenadas facilmente pasan ese limite.
+      const { provider, questionIndex } = req.body || {};
+      if (!provider || questionIndex == null) return res.status(400).json({ error: "missing_fields" });
+      const question = EVALUATION_SET_V1[questionIndex];
+      if (!question) return res.status(400).json({ error: "invalid_question_index" });
+
+      const r = await runQuestion(question, [], provider, FINNHUB_KEY);
+      return res.status(200).json({ provider, question, questionIndex, ...r });
+    }
+
     if (resource === "benchmark") {
-      if (!confirm) {
-        return res.status(400).json({ error: "confirmation_required", detail: "El benchmark hace 24 llamadas reales (12 preguntas x 2 proveedores) y tiene costo real. Manda confirm:true para ejecutarlo." });
-      }
-
-      const results = [];
-      for (const provider of ["anthropic", "openai"]) {
-        for (const question of EVALUATION_SET_V1) {
-          const r = await runQuestion(question, [], provider, FINNHUB_KEY);
-          results.push({ provider, question, ...r });
-        }
-      }
-
-      return res.status(200).json({ ok: true, evaluationSetVersion: "v1", results });
+      return res.status(400).json({
+        error: "deprecated",
+        detail: "Usa 'benchmark_question' una pregunta a la vez desde la herramienta del navegador -- correr las 24 en el servidor excede el limite de duracion de Vercel Hobby.",
+      });
     }
 
     return res.status(400).json({ error: "unknown_resource" });
