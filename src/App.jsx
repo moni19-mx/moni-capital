@@ -58,77 +58,23 @@ async function searchAssets(q) {
   return res.json();
 }
 
-async function managePosition(payload) {
-  const res = await fetch("/api/manage-positions", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+async function callManage(resource, payload) {
+  const res = await fetch("/api/manage", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ resource, ...payload }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
   return data;
 }
 
-async function manageWatchlist(payload) {
-  const res = await fetch("/api/manage-watchlist", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageThesis(payload) {
-  const res = await fetch("/api/manage-thesis", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageCash(payload) {
-  const res = await fetch("/api/manage-cash", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageGoal(payload) {
-  const res = await fetch("/api/manage-goal", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageDecisions(payload) {
-  const res = await fetch("/api/manage-decisions", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageRebalance(payload) {
-  const res = await fetch("/api/manage-rebalance", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
-
-async function manageJournal(payload) {
-  const res = await fetch("/api/manage-journal", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
-  return data;
-}
+async function managePosition(payload) { return callManage("positions", payload); }
+async function manageWatchlist(payload) { return callManage("watchlist", payload); }
+async function manageThesis(payload) { return callManage("thesis", payload); }
+async function manageCash(payload) { return callManage("cash", payload); }
+async function manageGoal(payload) { return callManage("goal", payload); }
+async function manageDecisions(payload) { return callManage("decisions", payload); }
+async function manageRebalance(payload) { return callManage("rebalance", payload); }
+async function manageJournal(payload) { return callManage("journal", payload); }
 
 async function fetchMarketPulse() {
   const res = await fetch("/api/market-pulse");
