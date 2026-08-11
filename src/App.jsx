@@ -143,7 +143,7 @@ export default function Dashboard() {
   const [snapshots, setSnapshots] = useState([]);
   const [cashMovements, setCashMovements] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [goal, setGoal] = useState(null);
+  const [goals, setGoals] = useState([]);
   const [journalEntries, setJournalEntries] = useState([]);
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
@@ -162,7 +162,7 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goals, journal] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goalsData, journal] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
@@ -178,7 +178,7 @@ export default function Dashboard() {
       setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
       setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setGoal(goals && goals.length ? goals[0] : null);
+      setGoals(goalsData || []);
       setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
 
       fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
@@ -354,7 +354,8 @@ export default function Dashboard() {
     return { baselineDate: baseline.date, deltaPatrimonio, deltaPct, movers };
   }, [snapshots, patrimonio, withValue]);
 
-  const goalPct = goal?.target_amount ? Math.min(100, (patrimonio / Number(goal.target_amount)) * 100) : null;
+  const primaryGoal = goals.find((g) => g.is_primary) || goals[0] || null;
+  const goalPct = primaryGoal?.target_amount ? Math.min(100, (patrimonio / Number(primaryGoal.target_amount)) * 100) : null;
 
   return (
     <div style={{ background: NAVY_BG, minHeight: "100vh", color: TXT, fontFamily: "'IBM Plex Sans','Inter',sans-serif" }}>
@@ -415,7 +416,7 @@ export default function Dashboard() {
             <Metric label="Ganancia / Pérdida" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
             <Metric label="Rendimiento" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
           </div>
-          <GoalBar goal={goal} patrimonio={patrimonio} goalPct={goalPct} onSaved={loadAll} />
+          <GoalBar goal={primaryGoal} patrimonio={patrimonio} goalPct={goalPct} onNavigate={setTab} />
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 28 }}>
@@ -427,7 +428,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -561,10 +562,14 @@ export default function Dashboard() {
             patrimonio={patrimonio} invested={invested} totalGain={totalGain} totalPct={totalPct}
             stocksValue={stocksValue} cryptoValue={cryptoValue} cashValue={cashValue}
             withValue={withValue} top5={top5} top1Pct={top1Pct} top3Pct={top3Pct} concColor={concColor}
-            allocType={allocType} snapshots={snapshots} goal={goal} goalPct={goalPct}
+            allocType={allocType} snapshots={snapshots} goal={primaryGoal} goalPct={goalPct}
             transactions={transactions} cashMovements={cashMovements}
             onOpenAsset={openAsset}
           />
+        )}
+
+        {tab === "goals" && (
+          <GoalsTab goals={goals} patrimonio={patrimonio} snapshots={snapshots} onChanged={loadAll} />
         )}
 
         {tab === "historial" && (
@@ -895,61 +900,26 @@ function ScoredOpportunities({ rows }) {
   );
 }
 
-function GoalBar({ goal, patrimonio, goalPct, onSaved }) {
-  const [editing, setEditing] = useState(false);
-  const [amount, setAmount] = useState(goal?.target_amount || "");
-  const [pin, setPin] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-
-  async function submit(e) {
-    e.preventDefault();
-    setErr(null);
-    if (!amount || Number(amount) <= 0) { setErr("Pon un monto válido."); return; }
-    setBusy(true);
-    try {
-      await manageGoal({ pin, target_amount: Number(amount) });
-      setEditing(false);
-      onSaved();
-    } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
-  }
-
-  if (!goal && !editing) {
+function GoalBar({ goal, patrimonio, goalPct, onNavigate }) {
+  if (!goal) {
     return (
       <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${LINE}` }}>
-        <button onClick={() => setEditing(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+        <button onClick={() => onNavigate("goals")} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
           + Definir meta patrimonial
         </button>
       </div>
     );
   }
 
-  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 8px", fontSize: 12, width: 120 };
-
   return (
     <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${LINE}` }}>
-      {!editing ? (
-        <>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: MUTE, marginBottom: 4 }}>
-            <span>META PATRIMONIAL · {fmt$2(Number(goal.target_amount))} <span onClick={() => { setAmount(goal.target_amount); setEditing(true); }} style={{ color: GOLD, cursor: "pointer", marginLeft: 6 }}>editar</span></span>
-            <span style={{ color: GOLD, fontWeight: 700 }}>{goalPct != null ? goalPct.toFixed(1) : "0.0"}%</span>
-          </div>
-          <div style={{ height: 5, background: LINE, borderRadius: 3 }}>
-            <div style={{ height: "100%", width: `${goalPct || 0}%`, background: GOLD, borderRadius: 3 }} />
-          </div>
-        </>
-      ) : (
-        <form onSubmit={submit} style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <input style={inputStyle} type="number" step="any" placeholder="Meta ($)" value={amount} onChange={(e) => setAmount(e.target.value)} />
-          <input style={inputStyle} type="password" placeholder="PIN" value={pin} onChange={(e) => setPin(e.target.value)} />
-          <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
-            {busy ? "..." : "Guardar"}
-          </button>
-          <button type="button" onClick={() => setEditing(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Cancelar</button>
-          {err && <div style={{ color: RED, fontSize: 10, width: "100%" }}>{err}</div>}
-        </form>
-      )}
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: MUTE, marginBottom: 4 }}>
+        <span>{(goal.name || "META PATRIMONIAL").toUpperCase()} · {fmt$2(Number(goal.target_amount))} <span onClick={() => onNavigate("goals")} style={{ color: GOLD, cursor: "pointer", marginLeft: 6 }}>ver plan →</span></span>
+        <span style={{ color: GOLD, fontWeight: 700 }}>{goalPct != null ? goalPct.toFixed(1) : "0.0"}%</span>
+      </div>
+      <div style={{ height: 5, background: LINE, borderRadius: 3 }}>
+        <div style={{ height: "100%", width: `${goalPct || 0}%`, background: GOLD, borderRadius: 3 }} />
+      </div>
     </div>
   );
 }
@@ -1402,6 +1372,74 @@ function aggregateForLongTerm(snapshots) {
   return Object.values(byWeek);
 }
 
+const MILESTONES = [100000, 250000, 500000, 1000000, 2000000, 5000000];
+
+// Simula mes a mes cuantos meses toma llegar de "current" a "target" con una
+// aportacion mensual fija y un rendimiento anual esperado. Deterministico,
+// sin IA -- es la misma formula usada en todo Goals (Fecha estimada, Plan
+// de accion, Goal Coach).
+function simulateMonthsToGoal(current, target, monthlyContribution, annualReturnPct) {
+  if (current >= target) return 0;
+  const monthlyRate = (annualReturnPct || 0) / 100 / 12;
+  let amount = current;
+  for (let m = 1; m <= 1200; m++) {
+    amount = amount * (1 + monthlyRate) + (monthlyContribution || 0);
+    if (amount >= target) return m;
+  }
+  return null;
+}
+
+// Busqueda binaria: que aportacion mensual se necesita para llegar en
+// exactamente "months" meses.
+function solveRequiredContribution(current, target, months, annualReturnPct) {
+  if (current >= target) return 0;
+  if (months <= 0) return null;
+  let lo = 0, hi = Math.max(target, 1_000_000);
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    const reached = simulateMonthsToGoal(current, target, mid, annualReturnPct);
+    if (reached != null && reached <= months) hi = mid; else lo = mid;
+  }
+  return Math.round(hi);
+}
+
+// Busqueda binaria: cuanto hay que aumentar la aportacion para llegar
+// "monthsEarlier" meses antes que con la aportacion actual.
+function solveDeltaForEarlierMonths(current, target, contribution, annualReturnPct, monthsEarlier) {
+  const baseMonths = simulateMonthsToGoal(current, target, contribution, annualReturnPct);
+  if (baseMonths == null || baseMonths <= 0) return null;
+  const desiredMonths = Math.max(0, baseMonths - monthsEarlier);
+  const requiredTotal = solveRequiredContribution(current, target, desiredMonths, annualReturnPct);
+  if (requiredTotal == null) return null;
+  return Math.max(0, requiredTotal - contribution);
+}
+
+function addMonthsToToday(months) {
+  const d = new Date();
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
+function monthsBetweenDates(a, b) {
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+}
+
+function fmtDateShort(d) {
+  return d.toLocaleDateString("es-MX", { year: "numeric", month: "short" });
+}
+
+function computeMilestones(snapshots, patrimonio) {
+  return MILESTONES.map((threshold) => {
+    const hit = snapshots.find((s) => Number(s.patrimonio) >= threshold);
+    return {
+      threshold,
+      reached: !!hit || patrimonio >= threshold,
+      date: hit ? hit.date : null,
+      snapshot: hit || null,
+    };
+  });
+}
+
 function WealthTab({
   patrimonio, invested, totalGain, totalPct, stocksValue, cryptoValue, cashValue,
   withValue, top5, top1Pct, top3Pct, concColor, allocType, snapshots, goal, goalPct,
@@ -1626,6 +1664,263 @@ function WealthTab({
         </div>
       </Panel>
     </div>
+  );
+}
+
+function GoalsTab({ goals, patrimonio, snapshots, onChanged }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editingGoal, setEditingGoal] = useState(null);
+  const [openMilestone, setOpenMilestone] = useState(null);
+  const [plannerContribution, setPlannerContribution] = useState(null);
+  const [plannerReturn, setPlannerReturn] = useState(null);
+
+  const primary = goals.find((g) => g.is_primary) || goals[0] || null;
+
+  const contribution = plannerContribution != null ? plannerContribution : Number(primary?.monthly_contribution || 0);
+  const annualReturn = plannerReturn != null ? plannerReturn : Number(primary?.expected_annual_return || 0);
+
+  if (!primary) {
+    return (
+      <Panel title="Goals — planificación patrimonial">
+        <div style={{ color: MUTE, fontSize: 13, marginBottom: 16 }}>
+          Aún no tienes ninguna meta. Goals responde "¿a dónde quiero llegar?" — crea tu primera meta para empezar a planificar.
+        </div>
+        {!showForm ? (
+          <button onClick={() => setShowForm(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+            + Nueva meta
+          </button>
+        ) : (
+          <GoalForm onDone={() => { setShowForm(false); onChanged(); }} makesPrimary />
+        )}
+      </Panel>
+    );
+  }
+
+  const goalPct = primary.target_amount ? Math.min(100, (patrimonio / Number(primary.target_amount)) * 100) : 0;
+  const monthsToGoal = simulateMonthsToGoal(patrimonio, Number(primary.target_amount), contribution, annualReturn);
+  const estimatedDate = monthsToGoal != null ? addMonthsToToday(monthsToGoal) : null;
+
+  let requiredContribution = null, planStatus = null, monthsToTargetDate = null;
+  if (primary.target_date) {
+    monthsToTargetDate = monthsBetweenDates(new Date(), new Date(primary.target_date));
+    requiredContribution = solveRequiredContribution(patrimonio, Number(primary.target_amount), monthsToTargetDate, annualReturn);
+    if (monthsToGoal != null) {
+      if (monthsToGoal < monthsToTargetDate - 1) planStatus = { label: "Adelantado", color: GREEN };
+      else if (monthsToGoal > monthsToTargetDate + 1) planStatus = { label: "Retrasado", color: RED };
+      else planStatus = { label: "En línea", color: AMBER };
+    }
+  }
+
+  const coachMessages = [];
+  if (monthsToGoal == null) {
+    coachMessages.push("Con tus supuestos actuales no alcanzarías la meta en un plazo razonable. Necesitas aumentar tu aportación o tu rendimiento esperado.");
+  } else {
+    if (primary.target_date && requiredContribution != null) {
+      if (requiredContribution > contribution + 1) {
+        coachMessages.push(`Con tus supuestos actuales no llegarás en la fecha deseada. Necesitas aportar ${fmt$2(requiredContribution)}/mes en vez de ${fmt$2(contribution)}/mes.`);
+      } else if (requiredContribution < contribution - 1) {
+        coachMessages.push(`Puedes reducir tu aportación a ${fmt$2(requiredContribution)}/mes y mantener tu fecha objetivo.`);
+      } else {
+        coachMessages.push("Tu aportación actual está alineada con tu fecha objetivo.");
+      }
+    }
+    const delta = solveDeltaForEarlierMonths(patrimonio, Number(primary.target_amount), contribution, annualReturn, 12);
+    if (delta != null && delta > 1) {
+      coachMessages.push(`Aumenta tu aportación ${fmt$2(delta)}/mes para llegar un año antes.`);
+    }
+  }
+
+  const milestones = computeMilestones(snapshots, patrimonio);
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <Panel title="1-2. Meta principal y Progreso">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 11, color: MUTE }}>{primary.name || "Meta principal"}</div>
+            <div className="display" style={{ fontSize: 26, fontWeight: 700 }}>{fmt$2(Number(primary.target_amount))}</div>
+          </div>
+          <button onClick={() => { setEditingGoal(primary); setShowForm(true); }} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>Editar</button>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: MUTE, marginBottom: 4 }}>
+          <span>{fmt$2(patrimonio)} de {fmt$2(Number(primary.target_amount))}</span>
+          <span style={{ color: GOLD, fontWeight: 700 }}>{goalPct.toFixed(1)}%</span>
+        </div>
+        <div style={{ height: 6, background: LINE, borderRadius: 3 }}>
+          <div style={{ height: "100%", width: `${goalPct}%`, background: GOLD, borderRadius: 3 }} />
+        </div>
+      </Panel>
+
+      <Panel title="3. Fecha estimada">
+        {monthsToGoal == null ? (
+          <div style={{ color: RED, fontSize: 13 }}>Con tus supuestos actuales, no hay una fecha estimada alcanzable.</div>
+        ) : monthsToGoal === 0 ? (
+          <div style={{ color: GREEN, fontSize: 15, fontWeight: 700 }}>¡Ya alcanzaste esta meta!</div>
+        ) : (
+          <>
+            <div className="display" style={{ fontSize: 22, fontWeight: 700, color: GOLD }}>{fmtDateShort(estimatedDate)}</div>
+            <div style={{ fontSize: 11, color: MUTE, marginTop: 6 }}>
+              Con {fmt$2(contribution)}/mes de aportación y {annualReturn}% de rendimiento anual esperado — tus supuestos, no una promesa del sistema.
+            </div>
+          </>
+        )}
+      </Panel>
+
+      {primary.target_date && (
+        <Panel title="4-5. Plan de acción y Estado del plan">
+          <div style={{ display: "flex", gap: 28, flexWrap: "wrap", marginBottom: 12 }}>
+            <Metric label="Fecha objetivo" value={fmtDateShort(new Date(primary.target_date))} />
+            <Metric label="Aportación necesaria" value={requiredContribution != null ? `${fmt$2(requiredContribution)}/mes` : "—"} />
+            {planStatus && <Metric label="Estado del plan" value={planStatus.label} color={planStatus.color} />}
+          </div>
+        </Panel>
+      )}
+
+      <Panel title="Goal Coach">
+        <div style={{ fontSize: 10, color: MUTE, marginBottom: 10 }}>Determinístico — cálculos, nunca interpretación.</div>
+        {coachMessages.length === 0 ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>Sin recomendaciones por ahora.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {coachMessages.map((m, i) => (
+              <div key={i} style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 8, padding: "10px 14px", fontSize: 12 }}>{m}</div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="6. Milestones">
+        <div style={{ display: "grid", gap: 8 }}>
+          {milestones.map((m) => (
+            <div key={m.threshold} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontSize: 13 }}>
+                  {m.reached ? "✅" : "⬜"} <b>{fmtBig(m.threshold)}</b>
+                  {m.reached && m.date && <span style={{ color: MUTE, fontSize: 11 }}> · {m.date}</span>}
+                </div>
+                {m.reached && m.snapshot && (
+                  <button onClick={() => setOpenMilestone(openMilestone === m.threshold ? null : m.threshold)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>
+                    Ver cómo llegué
+                  </button>
+                )}
+              </div>
+              {openMilestone === m.threshold && m.snapshot && (
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${LINE}`, fontSize: 11, color: MUTE, display: "grid", gap: 4 }}>
+                  <div>Fotografía real de ese día (resumen agregado, no posición por posición):</div>
+                  <div>Patrimonio: <b style={{ color: TXT }}>{fmt$2(Number(m.snapshot.patrimonio))}</b></div>
+                  <div>Invertido: <b style={{ color: TXT }}>{fmt$2(Number(m.snapshot.invested))}</b></div>
+                  <div>Acciones: {fmt$2(Number(m.snapshot.stocks_value || 0))} · Cripto: {fmt$2(Number(m.snapshot.crypto_value || 0))} · Efectivo: {fmt$2(Number(m.snapshot.cash_value || 0))}</div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="7. Planner">
+        <div style={{ fontSize: 11, color: MUTE, marginBottom: 14 }}>Ajusta y ve cómo cambia tu fecha estimada — sin guardar nada.</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px,1fr))", gap: 16 }}>
+          <div>
+            <label style={{ fontSize: 11, color: MUTE }}>Aportación mensual ($)</label>
+            <input type="number" step="any" value={contribution} onChange={(e) => setPlannerContribution(Number(e.target.value))}
+              style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" }} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: MUTE }}>Rendimiento anual esperado (%)</label>
+            <input type="number" step="any" value={annualReturn} onChange={(e) => setPlannerReturn(Number(e.target.value))}
+              style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" }} />
+          </div>
+        </div>
+        {(plannerContribution != null || plannerReturn != null) && (
+          <button onClick={() => { setPlannerContribution(null); setPlannerReturn(null); }} style={{ marginTop: 12, background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>
+            Restablecer a mis supuestos guardados
+          </button>
+        )}
+      </Panel>
+
+      <Panel title="8. Metas múltiples">
+        <div style={{ display: "grid", gap: 8, marginBottom: 14 }}>
+          {goals.map((g) => (
+            <div key={g.id} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center", background: NAVY_BG,
+              border: `1px solid ${g.is_primary ? GOLD : LINE}`, borderRadius: 8, padding: "10px 14px", fontSize: 12,
+            }}>
+              <span>{g.is_primary && "⭐ "}<b>{g.name}</b> <span style={{ color: MUTE }}>{fmt$2(Number(g.target_amount))}</span></span>
+              <button onClick={() => { setEditingGoal(g); setShowForm(true); }} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>Editar</button>
+            </div>
+          ))}
+        </div>
+        {!showForm ? (
+          <button onClick={() => { setEditingGoal(null); setShowForm(true); }} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+            + Nueva meta
+          </button>
+        ) : (
+          <GoalForm current={editingGoal} onDone={() => { setShowForm(false); setEditingGoal(null); onChanged(); }} onCancel={() => { setShowForm(false); setEditingGoal(null); }} />
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function GoalForm({ current, onDone, onCancel, makesPrimary }) {
+  const [name, setName] = useState(current?.name || "");
+  const [targetAmount, setTargetAmount] = useState(current?.target_amount || "");
+  const [targetDate, setTargetDate] = useState(current?.target_date || "");
+  const [monthlyContribution, setMonthlyContribution] = useState(current?.monthly_contribution || "");
+  const [expectedReturn, setExpectedReturn] = useState(current?.expected_annual_return || "");
+  const [isPrimary, setIsPrimary] = useState(current?.is_primary ?? !!makesPrimary);
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!name || !targetAmount) { setErr("Nombre y monto objetivo son obligatorios."); return; }
+    setBusy(true);
+    try {
+      const goalPayload = {
+        name, target_amount: Number(targetAmount),
+        target_date: targetDate || null,
+        monthly_contribution: monthlyContribution ? Number(monthlyContribution) : null,
+        expected_annual_return: expectedReturn ? Number(expectedReturn) : null,
+        is_primary: isPrimary,
+      };
+      if (current) {
+        await manageGoal({ pin, action: "update", id: current.id, goal: goalPayload });
+      } else {
+        await manageGoal({ pin, action: "add", goal: goalPayload });
+      }
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginTop: 14, display: "grid", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12 }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Nombre *</label><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Patrimonio principal, Retiro, Casa" /></div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Monto objetivo ($) *</label><input style={inputStyle} type="number" step="any" value={targetAmount} onChange={(e) => setTargetAmount(e.target.value)} /></div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Fecha objetivo (opcional)</label><input style={inputStyle} type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} /></div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px,1fr))", gap: 12 }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Aportación mensual asumida ($)</label><input style={inputStyle} type="number" step="any" value={monthlyContribution} onChange={(e) => setMonthlyContribution(e.target.value)} /></div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Rendimiento anual esperado (%)</label><input style={inputStyle} type="number" step="any" value={expectedReturn} onChange={(e) => setExpectedReturn(e.target.value)} /></div>
+      </div>
+      <label style={{ fontSize: 12, color: MUTE, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+        <input type="checkbox" checked={isPrimary} onChange={(e) => setIsPrimary(e.target.checked)} /> Meta principal (aparece en TODAY y Wealth)
+      </label>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 12, alignItems: "flex-end" }}>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 20px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          {busy ? "Guardando…" : "Guardar"}
+        </button>
+        {onCancel && <button type="button" onClick={onCancel} style={{ background: "none", border: "none", color: MUTE, fontSize: 12, cursor: "pointer" }}>Cancelar</button>}
+      </div>
+      {err && <div style={{ color: RED, fontSize: 12 }}>{err}</div>}
+    </form>
   );
 }
 
