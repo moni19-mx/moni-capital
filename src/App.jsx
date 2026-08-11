@@ -103,6 +103,24 @@ async function manageGoal(payload) {
   return data;
 }
 
+async function manageDecisions(payload) {
+  const res = await fetch("/api/manage-decisions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
+async function manageRebalance(payload) {
+  const res = await fetch("/api/manage-rebalance", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
 async function manageJournal(payload) {
   const res = await fetch("/api/manage-journal", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
@@ -145,6 +163,8 @@ export default function Dashboard() {
   const [transactions, setTransactions] = useState([]);
   const [goals, setGoals] = useState([]);
   const [journalEntries, setJournalEntries] = useState([]);
+  const [decisions, setDecisions] = useState([]);
+  const [rebalanceTargets, setRebalanceTargets] = useState([]);
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
@@ -162,7 +182,7 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goalsData, journal] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
@@ -171,6 +191,8 @@ export default function Dashboard() {
         sb("transactions").catch(() => []),
         sb("goals").catch(() => []),
         sb("journal_entries").catch(() => []),
+        sb("decisions").catch(() => []),
+        sb("rebalance_targets").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
@@ -180,6 +202,8 @@ export default function Dashboard() {
       setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setGoals(goalsData || []);
       setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      setDecisions(decisionsData || []);
+      setRebalanceTargets(rebalanceData || []);
 
       fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
 
@@ -428,7 +452,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["command", "Command Center"], ["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -454,6 +478,16 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <>
+
+        {tab === "command" && (
+          <CommandCenterTab
+            estadoDeHoy={estadoDeHoy} scoredOpportunities={scoredOpportunities}
+            withValue={withValue} cashValue={cashValue} patrimonio={patrimonio} top1Pct={top1Pct}
+            enriched={enriched} primaryGoal={primaryGoal}
+            decisions={decisions} rebalanceTargets={rebalanceTargets}
+            onOpenAsset={openAsset} onChanged={loadAll}
+          />
+        )}
 
         {tab === "resumen" && (
           <div style={{ display: "grid", gap: 14 }}>
@@ -1414,6 +1448,36 @@ function solveDeltaForEarlierMonths(current, target, contribution, annualReturnP
   return Math.max(0, requiredTotal - contribution);
 }
 
+// Compartida entre GoalsTab y CommandCenterTab -- misma logica, un solo lugar.
+// Devuelve {title, detail}[] en vez de texto plano para poder usarse tanto
+// como mensajes de Goal Coach como senales trackeables en Command Center.
+function computeGoalCoachSignals(goal, patrimonio, contribution, annualReturn) {
+  if (!goal?.target_amount) return [];
+  const target = Number(goal.target_amount);
+  const monthsToGoal = simulateMonthsToGoal(patrimonio, target, contribution, annualReturn);
+  const signals = [];
+  if (monthsToGoal == null) {
+    signals.push({ title: "Meta no alcanzable con supuestos actuales", detail: "Con tus supuestos actuales no alcanzarías la meta en un plazo razonable. Necesitas aumentar tu aportación o tu rendimiento esperado." });
+    return signals;
+  }
+  if (goal.target_date) {
+    const monthsToTargetDate = monthsBetweenDates(new Date(), new Date(goal.target_date));
+    const required = solveRequiredContribution(patrimonio, target, monthsToTargetDate, annualReturn);
+    if (required != null) {
+      if (required > contribution + 1) {
+        signals.push({ title: "Ajustar aportación mensual", detail: `Con tus supuestos actuales no llegarás en la fecha deseada. Necesitas aportar ${fmt$2(required)}/mes en vez de ${fmt$2(contribution)}/mes.` });
+      } else if (required < contribution - 1) {
+        signals.push({ title: "Puedes reducir tu aportación", detail: `Con ${fmt$2(required)}/mes mantienes tu fecha objetivo.` });
+      }
+    }
+  }
+  const delta = solveDeltaForEarlierMonths(patrimonio, target, contribution, annualReturn, 12);
+  if (delta != null && delta > 1) {
+    signals.push({ title: "Puedes acelerar tu meta", detail: `Aumenta tu aportación ${fmt$2(delta)}/mes para llegar un año antes.` });
+  }
+  return signals;
+}
+
 function addMonthsToToday(months) {
   const d = new Date();
   d.setMonth(d.getMonth() + months);
@@ -1438,6 +1502,307 @@ function computeMilestones(snapshots, patrimonio) {
       snapshot: hit || null,
     };
   });
+}
+
+function computeRebalanceDeviations(targets, withValue, cashValue, patrimonio) {
+  if (!patrimonio) return [];
+  const byTema = {}, byRole = {};
+  withValue.filter((p) => p.type !== "cash").forEach((p) => {
+    const t = p.tema || "Sin clasificar"; byTema[t] = (byTema[t] || 0) + p.value;
+    const r = p.strategic_role || "Sin clasificar"; byRole[r] = (byRole[r] || 0) + p.value;
+  });
+  if (cashValue > 0) { byTema["Efectivo"] = (byTema["Efectivo"] || 0) + cashValue; byRole["Cash"] = (byRole["Cash"] || 0) + cashValue; }
+
+  return (targets || []).map((t) => {
+    const map = t.dimension === "tema" ? byTema : byRole;
+    const actualValue = map[t.label] || 0;
+    const actualPct = (actualValue / patrimonio) * 100;
+    return { ...t, actualPct, diff: actualPct - Number(t.target_pct) };
+  }).filter((d) => Math.abs(d.diff) > 10);
+}
+
+function computeSystemHealth({ enriched, top1Pct, cashValue, patrimonio, primaryGoal, rebalanceDeviations, openDecisionsCount }) {
+  let health = 100;
+  const factors = [];
+
+  const staleCount = enriched.filter((p) => p.type !== "cash").filter((p) => {
+    if (!p.thesis?.updated_at) return true;
+    return (Date.now() - new Date(p.thesis.updated_at).getTime()) / 86400000 > 180;
+  }).length;
+  if (staleCount > 0) {
+    const penalty = Math.min(30, staleCount * 5);
+    health -= penalty; factors.push({ label: `${staleCount} tesis desactualizada${staleCount === 1 ? "" : "s"} o sin definir`, penalty });
+  }
+  if (!primaryGoal?.target_amount) {
+    health -= 15; factors.push({ label: "Sin meta principal definida", penalty: 15 });
+  }
+  if (top1Pct > 0.35) {
+    health -= 15; factors.push({ label: "Concentración elevada", penalty: 15 });
+  }
+  if (rebalanceDeviations.length > 0) {
+    const penalty = Math.min(20, rebalanceDeviations.length * 10);
+    health -= penalty; factors.push({ label: `${rebalanceDeviations.length} desviación${rebalanceDeviations.length === 1 ? "" : "es"} de rebalanceo`, penalty });
+  }
+  if (patrimonio && cashValue / patrimonio < 0.05) {
+    health -= 10; factors.push({ label: "Liquidez baja", penalty: 10 });
+  }
+  if (openDecisionsCount > 0) {
+    const penalty = Math.min(20, openDecisionsCount * 5);
+    health -= penalty; factors.push({ label: `${openDecisionsCount} decisión${openDecisionsCount === 1 ? "" : "es"} abierta${openDecisionsCount === 1 ? "" : "s"} sin revisar`, penalty });
+  }
+
+  return { score: Math.max(0, Math.min(100, Math.round(health))), factors };
+}
+
+const PRIORITY_ORDER = { alta: 0, media: 1, baja: 2 };
+const PRIORITY_COLOR = { alta: RED, media: AMBER, baja: MUTE };
+
+function CommandCenterTab({
+  estadoDeHoy, scoredOpportunities, withValue, cashValue, patrimonio, top1Pct,
+  enriched, primaryGoal, decisions, rebalanceTargets, onOpenAsset, onChanged,
+}) {
+  const [syncing, setSyncing] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showRebalanceForm, setShowRebalanceForm] = useState(false);
+
+  const rebalanceDeviations = useMemo(
+    () => computeRebalanceDeviations(rebalanceTargets, withValue, cashValue, patrimonio),
+    [rebalanceTargets, withValue, cashValue, patrimonio]
+  );
+
+  const openDecisions = decisions.filter((d) => d.status === "abierta");
+  const historyDecisions = decisions.filter((d) => d.status !== "abierta");
+
+  const health = useMemo(
+    () => computeSystemHealth({ enriched, top1Pct, cashValue, patrimonio, primaryGoal, rebalanceDeviations, openDecisionsCount: openDecisions.length }),
+    [enriched, top1Pct, cashValue, patrimonio, primaryGoal, rebalanceDeviations, openDecisions.length]
+  );
+
+  const exitThesisList = enriched.filter((p) => p.type !== "cash" && p.thesis?.sell_trigger);
+
+  function buildLiveSignals() {
+    const signals = [];
+    if (estadoDeHoy && estadoDeHoy.emoji !== "🟢") {
+      signals.push({ type: "estado_hoy", ticker: null, priority: estadoDeHoy.emoji === "🔴" ? "alta" : "media", title: estadoDeHoy.label, detail: estadoDeHoy.detail });
+    }
+    scoredOpportunities.filter((o) => o.score >= 80).forEach((o) => {
+      signals.push({ type: "oportunidad", ticker: o.ticker, priority: o.score >= 90 ? "alta" : "media", title: `Oportunidad: ${o.ticker}`, detail: `Opportunity Score ${o.score}.` });
+    });
+    rebalanceDeviations.forEach((d) => {
+      signals.push({ type: "rebalanceo", ticker: null, priority: "media", title: `Rebalanceo: ${d.label}`, detail: `${d.actualPct.toFixed(1)}% actual vs ${Number(d.target_pct).toFixed(0)}% objetivo.` });
+    });
+    if (primaryGoal) {
+      computeGoalCoachSignals(primaryGoal, patrimonio, Number(primaryGoal.monthly_contribution || 0), Number(primaryGoal.expected_annual_return || 0))
+        .forEach((s) => signals.push({ type: "goal_coach", ticker: null, priority: "baja", title: s.title, detail: s.detail }));
+    }
+    return signals;
+  }
+
+  async function handleSync() {
+    setSyncing(true);
+    try {
+      const signals = buildLiveSignals();
+      await manageDecisions({ action: "sync", signals });
+      onChanged();
+    } catch (e) { alert("No se pudo sincronizar: " + e.message); }
+    finally { setSyncing(false); }
+  }
+
+  async function handleResolve(id, status) {
+    const pin = window.prompt(`Ingresa tu PIN para marcar esta decisión como "${status}":`);
+    if (!pin) return;
+    try {
+      await manageDecisions({ pin, action: "resolve", id, status });
+      onChanged();
+    } catch (e) { alert("No se pudo actualizar: " + e.message); }
+  }
+
+  async function handleDeleteTarget(id) {
+    const pin = window.prompt("Ingresa tu PIN para eliminar este objetivo de rebalanceo:");
+    if (!pin) return;
+    try {
+      await manageRebalance({ pin, action: "delete", id });
+      onChanged();
+    } catch (e) { alert("No se pudo eliminar: " + e.message); }
+  }
+
+  const sortedQueue = [...openDecisions].sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3));
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <Panel title="System Health">
+        <div style={{ display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+          <div className="num" style={{ fontSize: 40, fontWeight: 700, color: health.score >= 80 ? GREEN : health.score >= 55 ? AMBER : RED }}>
+            {health.score}
+          </div>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ height: 8, background: LINE, borderRadius: 4 }}>
+              <div style={{ height: "100%", width: `${health.score}%`, background: health.score >= 80 ? GREEN : health.score >= 55 ? AMBER : RED, borderRadius: 4 }} />
+            </div>
+            <div style={{ fontSize: 10, color: MUTE, marginTop: 4 }}>Claridad del sistema — no es una métrica financiera, mide qué tan alineado y al día está todo Moni Capital.</div>
+          </div>
+        </div>
+        {health.factors.length > 0 && (
+          <div style={{ marginTop: 14, display: "grid", gap: 6 }}>
+            {health.factors.map((f, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: MUTE }}>
+                <span>{f.label}</span><span>-{f.penalty}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Decision Queue">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: MUTE }}>Ordenada por prioridad, no por fecha.</div>
+          <button onClick={handleSync} disabled={syncing} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+            {syncing ? "Sincronizando…" : "Actualizar Decision Queue"}
+          </button>
+        </div>
+        {sortedQueue.length === 0 ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>Sin decisiones abiertas. Dale a "Actualizar" para revisar señales nuevas.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {sortedQueue.map((d) => (
+              <div key={d.id} style={{ background: NAVY_BG, border: `1px solid ${PRIORITY_COLOR[d.priority] || LINE}`, borderRadius: 8, padding: "10px 14px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+                  <div>
+                    <span style={{ fontSize: 9, color: PRIORITY_COLOR[d.priority] || MUTE, border: `1px solid ${PRIORITY_COLOR[d.priority] || MUTE}`, borderRadius: 4, padding: "2px 6px", fontWeight: 700, marginRight: 6 }}>
+                      {(d.priority || "media").toUpperCase()}
+                    </span>
+                    <b>{d.title}</b>
+                    {d.detail && <div style={{ fontSize: 11, color: MUTE, marginTop: 4 }}>{d.detail}</div>}
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    {d.ticker && (
+                      <button onClick={() => onOpenAsset({ ticker: d.ticker })} style={{ background: "none", border: `1px solid ${LINE}`, color: GOLD, borderRadius: 6, padding: "4px 8px", fontSize: 10, cursor: "pointer" }}>Ver</button>
+                    )}
+                    <button onClick={() => handleResolve(d.id, "revisada")} style={{ background: "none", border: `1px solid ${GREEN}`, color: GREEN, borderRadius: 6, padding: "4px 8px", fontSize: 10, cursor: "pointer" }}>Revisada</button>
+                    <button onClick={() => handleResolve(d.id, "ignorada")} style={{ background: "none", border: `1px solid ${MUTE}`, color: MUTE, borderRadius: 6, padding: "4px 8px", fontSize: 10, cursor: "pointer" }}>Ignorar</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Rebalanceo">
+        {rebalanceTargets.length === 0 ? (
+          <div style={{ color: MUTE, fontSize: 13, marginBottom: 14 }}>Sin objetivos definidos. Define un % objetivo por tema o rol para que el sistema te avise cuando te salgas de rango (±10 puntos).</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8, marginBottom: 14 }}>
+            {rebalanceTargets.map((t) => {
+              const dev = rebalanceDeviations.find((d) => d.id === t.id);
+              const map = t.dimension === "tema"
+                ? withValue.filter((p) => p.type !== "cash").reduce((a, p) => (p.tema === t.label ? a + p.value : a), 0) + (t.label === "Efectivo" ? cashValue : 0)
+                : withValue.filter((p) => p.type !== "cash").reduce((a, p) => (p.strategic_role === t.label ? a + p.value : a), 0) + (t.label === "Cash" ? cashValue : 0);
+              const actualPct = patrimonio ? (map / patrimonio) * 100 : 0;
+              return (
+                <div key={t.id} style={{ background: NAVY_BG, border: `1px solid ${dev ? AMBER : LINE}`, borderRadius: 8, padding: "10px 14px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                    <span><b>{t.label}</b> <span style={{ color: MUTE, fontSize: 10 }}>({t.dimension})</span></span>
+                    <span className="num">{actualPct.toFixed(1)}% actual · {Number(t.target_pct).toFixed(0)}% objetivo</span>
+                  </div>
+                  {dev && <div style={{ fontSize: 10, color: AMBER, marginTop: 4 }}>Fuera de rango por {Math.abs(dev.diff).toFixed(1)} puntos</div>}
+                  <button onClick={() => handleDeleteTarget(t.id)} style={{ background: "none", border: "none", color: MUTE, fontSize: 10, cursor: "pointer", marginTop: 6 }}>Eliminar objetivo</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!showRebalanceForm ? (
+          <button onClick={() => setShowRebalanceForm(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            + Nuevo objetivo
+          </button>
+        ) : (
+          <RebalanceTargetForm onDone={() => { setShowRebalanceForm(false); onChanged(); }} onCancel={() => setShowRebalanceForm(false)} />
+        )}
+      </Panel>
+
+      <Panel title="Exit Thesis — recordatorios de tu propio criterio de salida">
+        {exitThesisList.length === 0 ? (
+          <div style={{ color: MUTE, fontSize: 13 }}>Ninguna posición tiene un criterio de salida definido todavía. Se define en la Tesis de cada activo.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {exitThesisList.map((p) => (
+              <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
+                background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px", textAlign: "left", cursor: "pointer", width: "100%",
+              }}>
+                <div style={{ fontSize: 12 }}><b style={{ color: GOLD }}>{p.ticker}</b></div>
+                <div style={{ fontSize: 11, color: MUTE, marginTop: 4 }}>{p.thesis.sell_trigger}</div>
+              </button>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Decision History">
+        <button onClick={() => setShowHistory((s) => !s)} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer", marginBottom: 14 }}>
+          {showHistory ? "Ocultar historial" : `Ver historial (${historyDecisions.length})`}
+        </button>
+        {showHistory && (
+          historyDecisions.length === 0 ? (
+            <div style={{ color: MUTE, fontSize: 13 }}>Sin decisiones resueltas todavía.</div>
+          ) : (
+            <div style={{ display: "grid", gap: 6 }}>
+              {historyDecisions.map((d) => (
+                <div key={d.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "8px 0", borderBottom: `1px solid ${LINE}` }}>
+                  <span><b style={{ color: d.status === "revisada" ? GREEN : MUTE }}>{d.status?.toUpperCase()}</b> · {d.title}</span>
+                  <span style={{ color: MUTE }}>{d.resolved_at ? String(d.resolved_at).slice(0, 10) : ""}</span>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function RebalanceTargetForm({ onDone, onCancel }) {
+  const [dimension, setDimension] = useState("tema");
+  const [label, setLabel] = useState("");
+  const [targetPct, setTargetPct] = useState("");
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr(null);
+    if (!label || !targetPct) { setErr("Falta la etiqueta o el % objetivo."); return; }
+    setBusy(true);
+    try {
+      await manageRebalance({ pin, action: "add", target: { dimension, label, target_pct: Number(targetPct) } });
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 10, marginTop: 12, background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 8, padding: 14 }}>
+      <div>
+        <label style={{ fontSize: 11, color: MUTE }}>Dimensión</label>
+        <select style={inputStyle} value={dimension} onChange={(e) => setDimension(e.target.value)}>
+          <option value="tema">Tema</option>
+          <option value="role">Rol estratégico</option>
+        </select>
+      </div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Etiqueta (ej. "IA / Cloud" o "Core Holding")</label><input style={inputStyle} value={label} onChange={(e) => setLabel(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>% objetivo</label><input style={inputStyle} type="number" step="any" value={targetPct} onChange={(e) => setTargetPct(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 8 }}>
+        <button type="submit" disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+          {busy ? "…" : "Guardar"}
+        </button>
+        <button type="button" onClick={onCancel} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Cancelar</button>
+      </div>
+      {err && <div style={{ gridColumn: "1/-1", color: RED, fontSize: 11 }}>{err}</div>}
+    </form>
+  );
 }
 
 function WealthTab({
@@ -1711,24 +2076,7 @@ function GoalsTab({ goals, patrimonio, snapshots, onChanged }) {
     }
   }
 
-  const coachMessages = [];
-  if (monthsToGoal == null) {
-    coachMessages.push("Con tus supuestos actuales no alcanzarías la meta en un plazo razonable. Necesitas aumentar tu aportación o tu rendimiento esperado.");
-  } else {
-    if (primary.target_date && requiredContribution != null) {
-      if (requiredContribution > contribution + 1) {
-        coachMessages.push(`Con tus supuestos actuales no llegarás en la fecha deseada. Necesitas aportar ${fmt$2(requiredContribution)}/mes en vez de ${fmt$2(contribution)}/mes.`);
-      } else if (requiredContribution < contribution - 1) {
-        coachMessages.push(`Puedes reducir tu aportación a ${fmt$2(requiredContribution)}/mes y mantener tu fecha objetivo.`);
-      } else {
-        coachMessages.push("Tu aportación actual está alineada con tu fecha objetivo.");
-      }
-    }
-    const delta = solveDeltaForEarlierMonths(patrimonio, Number(primary.target_amount), contribution, annualReturn, 12);
-    if (delta != null && delta > 1) {
-      coachMessages.push(`Aumenta tu aportación ${fmt$2(delta)}/mes para llegar un año antes.`);
-    }
-  }
+  const coachMessages = computeGoalCoachSignals(primary, patrimonio, contribution, annualReturn).map((s) => s.detail);
 
   const milestones = computeMilestones(snapshots, patrimonio);
 
@@ -2474,7 +2822,7 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
                   <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
                   <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
-                  <ThesisField label="¿Qué la haría vender?" value={thesis?.sell_trigger} />
+                  <ThesisField label="Exit Thesis (criterio de salida)" value={thesis?.sell_trigger} />
                   <ThesisField label="Horizonte" value={thesis?.horizon} />
                   <ThesisField label="Riesgos" value={thesis?.risks} />
                 </div>
@@ -2710,7 +3058,7 @@ function ThesisTab({ rows, onSaved, onOpenAsset }) {
               <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13 }}>
                 <ThesisField label="¿Por qué la compré?" value={p.thesis?.why_bought} />
                 <ThesisField label="¿Qué tiene de especial?" value={p.thesis?.what_special} />
-                <ThesisField label="¿Qué la haría vender?" value={p.thesis?.sell_trigger} />
+                <ThesisField label="Exit Thesis (criterio de salida)" value={p.thesis?.sell_trigger} />
                 <ThesisField label="Horizonte" value={p.thesis?.horizon} />
                 <ThesisField label="Riesgos" value={p.thesis?.risks} />
               </div>
@@ -2782,7 +3130,7 @@ function ThesisEditForm({ ticker, current, onDone }) {
       </div>
       <div><label style={{ fontSize: 11, color: MUTE }}>¿Por qué la compré?</label><textarea style={inputStyle} rows={2} value={whyBought} onChange={(e) => setWhyBought(e.target.value)} /></div>
       <div><label style={{ fontSize: 11, color: MUTE }}>¿Qué tiene de especial?</label><textarea style={inputStyle} rows={2} value={whatSpecial} onChange={(e) => setWhatSpecial(e.target.value)} /></div>
-      <div><label style={{ fontSize: 11, color: MUTE }}>¿Qué tendría que pasar para venderla?</label><textarea style={inputStyle} rows={2} value={sellTrigger} onChange={(e) => setSellTrigger(e.target.value)} /></div>
+      <div><label style={{ fontSize: 11, color: MUTE }}>Exit Thesis — ¿qué tendría que pasar para vender? (tu criterio de salida)</label><textarea style={inputStyle} rows={2} value={sellTrigger} onChange={(e) => setSellTrigger(e.target.value)} /></div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         <div><label style={{ fontSize: 11, color: MUTE }}>Horizonte</label><input style={inputStyle} value={horizon} onChange={(e) => setHorizon(e.target.value)} placeholder="Ej. 10+ años" /></div>
         <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
