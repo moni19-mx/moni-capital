@@ -1,173 +1,168 @@
-// api/ai.js
-// Unico endpoint de Moni AI (disciplina de funciones aprendida el dia que
-// Vercel Hobby rechazo el deployment por pasarse de 12 funciones -- ver
-// api/manage.js para el mismo patron aplicado a las escrituras).
-//
-// 2 acciones:
-// - chat: una pregunta, corre el tool-calling loop contra el proveedor
-//   activo (MONI_AI_PROVIDER), guarda el turno en ai_conversations.
-// - benchmark_question: UNA pregunta contra UN proveedor especifico -- se
-//   llama 24 veces desde el navegador (ver herramienta que sigue), nunca
-//   las 24 dentro de una sola funcion de Vercel.
-//
-// Regla que nunca cambia: el modelo NUNCA calcula un numero financiero.
-// Solo interpreta lo que devuelven las tools de lib/aiTools.js.
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Moni AI — Benchmark Runner</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    background: #0A0E17; color: #E8EAF2; font-family: 'IBM Plex Sans', 'Inter', sans-serif;
+    max-width: 900px; margin: 0 auto; padding: 32px 24px;
+  }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: #8A93B0; font-size: 13px; margin-bottom: 24px; }
+  .card { background: #11172A; border: 1px solid #232B45; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  label { font-size: 11px; color: #8A93B0; display: block; margin-bottom: 4px; }
+  input {
+    background: #0A0E17; border: 1px solid #232B45; color: #E8EAF2; border-radius: 6px;
+    padding: 8px 10px; font-size: 13px; width: 100%; margin-bottom: 12px;
+  }
+  button {
+    background: #C9A34E; color: #1A1305; border: none; border-radius: 8px; padding: 10px 18px;
+    font-weight: 700; font-size: 13px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary { background: none; border: 1px solid #232B45; color: #8A93B0; }
+  .warn {
+    background: #1A1710; border: 1px solid #C9A34E; border-radius: 8px; padding: 12px 16px;
+    font-size: 12px; margin-bottom: 16px; color: #E8EAF2;
+  }
+  .progress-bar { height: 6px; background: #232B45; border-radius: 3px; overflow: hidden; margin: 12px 0; }
+  .progress-fill { height: 100%; background: #C9A34E; border-radius: 3px; width: 0%; transition: width 0.2s; }
+  .status { font-size: 12px; color: #8A93B0; margin-bottom: 12px; }
+  .row {
+    display: flex; justify-content: space-between; gap: 10px; padding: 8px 0;
+    border-bottom: 1px solid #232B45; font-size: 12px; align-items: center;
+  }
+  .row.error { color: #E5615A; }
+  .row.ok { color: #3FBF83; }
+  .badge {
+    font-size: 9px; border-radius: 4px; padding: 2px 6px; font-weight: 700;
+    border: 1px solid #8A93B0; color: #8A93B0; flex-shrink: 0;
+  }
+  textarea {
+    width: 100%; height: 200px; background: #0A0E17; border: 1px solid #232B45; color: #E8EAF2;
+    border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; margin-top: 12px;
+  }
+</style>
+</head>
+<body>
 
-import { createClient } from "@supabase/supabase-js";
-import { checkRateLimit, recordFailedAttempt } from "../lib/security.js";
-import { callModel } from "../lib/aiGateway.js";
-import { TOOL_DEFINITIONS, executeTool } from "../lib/aiTools.js";
-import { EVALUATION_SET_V1 } from "../lib/evaluationSet.js";
+<h1>Moni AI — Benchmark Runner</h1>
+<div class="sub">Corre el Evaluation Set v1 (12 preguntas × 2 proveedores = 24 llamadas reales) una por una. Esta página vive dentro de tu propio sitio, así que no hay problemas de permisos entre navegadores.</div>
 
-const supabase = createClient(
-  process.env.VITE_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+<div class="warn">
+  Esto hace <b>24 llamadas reales</b> a Anthropic y OpenAI — tiene costo real (normalmente menos de $1 USD en total). No cierres esta pestaña mientras corre.
+</div>
 
-const PROMPT_VERSION = "1.1";
+<div class="card">
+  <label>Tu PIN</label>
+  <input id="pin" type="password" />
+  <button id="runBtn" onclick="runBenchmark()">Correr benchmark completo (24 llamadas)</button>
+  <button class="secondary" onclick="stopBenchmark()">Detener</button>
+</div>
 
-const SYSTEM_PROMPT = `Eres Moni AI, el Chief Investment Officer del Family Office digital de tu unico cliente, llamado Moni Capital. (prompt v${PROMPT_VERSION})
+<div class="card" id="progressCard" style="display:none;">
+  <div class="status" id="statusText">Preparando…</div>
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+  <div id="resultsList"></div>
+</div>
 
-Reglas obligatorias:
-- Nunca inventas ni estimas un numero financiero. Todo dato sale de tus herramientas.
-- Cada herramienta devuelve status: "ok" | "not_found" | "error".
-  - Si status es "not_found": el dato genuinamente no existe. Di: "No tengo ese dato registrado todavía."
-  - Si status es "error": fallo tecnico consultando el dato. Di: "No pude consultar ese dato en este momento." NUNCA lo disfraces de "no existe".
-- Nunca calculas tu mismo un numero que una herramienta ya calculo -- solo lo interpretas y lo priorizas.
-- Voz: CIO. Breve. Directo. Nunca digas "creo que", "podria ser", "tal vez", "te recomiendo que compres". Da observaciones directas ancladas en datos reales.
-- Maximo 3-4 frases por respuesta, salvo que te pidan explicitamente mas detalle.
-- Nunca te presentas como un modelo de lenguaje generico. Eres Moni AI.
-- Si te preguntan algo fuera del portafolio de tu cliente, redirige brevemente a tu proposito: analizar SU patrimonio.`;
+<div class="card" id="exportCard" style="display:none;">
+  <div class="status">Resultado completo (JSON) — copia esto y pégaselo a Claude para que arme la tabla comparativa:</div>
+  <textarea id="jsonOutput" readonly onclick="this.select()"></textarea>
+  <button onclick="copyJson()" style="margin-top:8px;">Copiar JSON</button>
+</div>
 
-async function runQuestion(question, history, provider, FINNHUB_KEY) {
-  const messages = [...history, { role: "user", content: question }];
-  let finalText = null;
-  let loopGuard = 0;
-  const toolsUsed = [];
-  const usageTotals = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-  let lastMeta = null;
-  const startedAt = Date.now();
-  let errored = null;
+<script>
+const QUESTIONS = [
+  "¿Cuánto vale mi patrimonio?",
+  "¿Cuál es mi mayor posición?",
+  "¿Cuál es mi mayor riesgo?",
+  "¿Por qué compré Oracle?",
+  "¿Qué posiciones tienen tesis desactualizada?",
+  "¿Cómo voy contra mi meta principal?",
+  "¿Qué decisiones tengo pendientes?",
+  "¿Qué oportunidades existen dentro de mi cartera?",
+  "¿Qué aprendí de mis últimas entradas del Journal?",
+  "¿Qué cambió desde mi última visita?",
+  "Tengo $2,000 nuevos. Analiza cómo encajarían según mi estrategia actual.",
+  "¿Qué dato te falta para responder esta pregunta?",
+];
+const PROVIDERS = ["anthropic", "openai"];
 
-  try {
-    while (finalText === null && loopGuard < 5) {
-      loopGuard++;
-      const result = await callModel({
-        system: SYSTEM_PROMPT,
-        messages,
-        tools: TOOL_DEFINITIONS,
-        authContext: { authenticated: true },
-        providerOverride: provider,
-      });
-      lastMeta = result.usage;
-      usageTotals.inputTokens += result.usage.inputTokens || 0;
-      usageTotals.outputTokens += result.usage.outputTokens || 0;
-      usageTotals.totalTokens += result.usage.totalTokens || 0;
+let stopped = false;
 
-      if (result.stopReason === "tool_use") {
-        messages.push({ role: "assistant", content: result.contentBlocks });
-        const toolResults = [];
-        for (const call of result.toolCalls) {
-          toolsUsed.push(call.name);
-          const toolResult = await executeTool(call.name, call.input || {}, supabase, FINNHUB_KEY);
-          toolResults.push({ type: "tool_result", tool_use_id: call.id, content: JSON.stringify(toolResult) });
-        }
-        messages.push({ role: "user", content: toolResults });
-      } else {
-        finalText = result.content || "No tengo una respuesta para eso todavía.";
+function stopBenchmark() { stopped = true; }
+
+async function runBenchmark() {
+  stopped = false;
+  const pin = document.getElementById('pin').value;
+  if (!pin) { alert('Pon tu PIN primero.'); return; }
+
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('exportCard').style.display = 'none';
+  document.getElementById('resultsList').innerHTML = '';
+
+  const total = QUESTIONS.length * PROVIDERS.length;
+  let done = 0;
+  const results = [];
+
+  for (const provider of PROVIDERS) {
+    for (let i = 0; i < QUESTIONS.length; i++) {
+      if (stopped) {
+        document.getElementById('statusText').textContent = 'Detenido por el usuario.';
+        break;
       }
+      document.getElementById('statusText').textContent =
+        `Corriendo ${done + 1} de ${total} — ${provider} — "${QUESTIONS[i].slice(0, 40)}..."`;
+
+      let entry;
+      try {
+        const resp = await fetch('/api/ai', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resource: 'benchmark_question', pin, provider, questionIndex: i }),
+        });
+        const data = await resp.json();
+        entry = data;
+        if (!resp.ok) entry.httpError = data.error || resp.status;
+      } catch (e) {
+        entry = { provider, question: QUESTIONS[i], questionIndex: i, httpError: String(e) };
+      }
+
+      results.push(entry);
+      done++;
+      document.getElementById('progressFill').style.width = Math.round((done / total) * 100) + '%';
+
+      const row = document.createElement('div');
+      const hasError = entry.httpError || entry.error;
+      row.className = 'row ' + (hasError ? 'error' : 'ok');
+      row.innerHTML = `<span class="badge">${provider.toUpperCase()}</span>
+        <span style="flex:1;">${QUESTIONS[i]}</span>
+        <span>${hasError ? 'ERROR' : (entry.latencyMs ? entry.latencyMs + 'ms' : '')}</span>`;
+      document.getElementById('resultsList').prepend(row);
     }
-  } catch (e) {
-    errored = String(e.message || e);
+    if (stopped) break;
   }
 
-  if (finalText === null && !errored) {
-    finalText = "No pude terminar de procesar tu pregunta. Intenta de nuevo.";
-  }
+  document.getElementById('statusText').textContent = stopped
+    ? `Detenido — ${done} de ${total} completadas.`
+    : `Listo — ${done} de ${total} completadas.`;
+  document.getElementById('runBtn').disabled = false;
 
-  return {
-    answer: finalText,
-    error: errored,
-    toolsUsed,
-    toolLoopIterations: loopGuard,
-    latencyMs: Date.now() - startedAt,
-    usage: { ...usageTotals, model: lastMeta?.model, provider },
-  };
+  document.getElementById('jsonOutput').value = JSON.stringify({ evaluationSetVersion: 'v1', results }, null, 2);
+  document.getElementById('exportCard').style.display = 'block';
 }
 
-export default async function handler(req, res) {
-  // CORS: la herramienta de benchmark corre como archivo local en el
-  // navegador (origen distinto al del sitio desplegado), asi que el
-  // preflight OPTIONS necesita respuesta explicita o el navegador bloquea
-  // la peticion real antes de que salga siquiera.
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "method_not_allowed" });
-  }
-
-  const { resource, pin, question, session_id, confirm } = req.body || {};
-
-  const { blocked } = await checkRateLimit(supabase);
-  if (blocked) {
-    return res.status(429).json({ error: "rate_limited", detail: "Demasiados intentos fallidos. Espera unos minutos e intenta de nuevo." });
-  }
-  if (!pin || pin !== process.env.MONI_PIN) {
-    await recordFailedAttempt(supabase);
-    return res.status(401).json({ error: "invalid_pin" });
-  }
-
-  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
-
-  try {
-    if (resource === "chat") {
-      if (!question || !question.trim()) return res.status(400).json({ error: "missing_question" });
-
-      let history = [];
-      if (session_id) {
-        const { data } = await supabase.from("ai_conversations").select("*").eq("session_id", session_id).order("created_at", { ascending: true }).limit(12);
-        history = (data || []).map((m) => ({ role: m.role, content: m.content }));
-      }
-
-      const result = await runQuestion(question, history, null, FINNHUB_KEY);
-
-      if (session_id && !result.error) {
-        try {
-          await supabase.from("ai_conversations").insert([
-            { session_id, role: "user", content: question },
-            { session_id, role: "assistant", content: result.answer },
-          ]);
-        } catch (e) { /* no debe tumbar la respuesta ya generada */ }
-      }
-
-      return res.status(200).json(result);
-    }
-
-    if (resource === "benchmark_question") {
-      const { provider, questionIndex } = req.body || {};
-      if (!provider || questionIndex == null) return res.status(400).json({ error: "missing_fields" });
-      const question = EVALUATION_SET_V1[questionIndex];
-      if (!question) return res.status(400).json({ error: "invalid_question_index" });
-
-      const r = await runQuestion(question, [], provider, FINNHUB_KEY);
-      return res.status(200).json({ provider, question, questionIndex, ...r });
-    }
-
-    if (resource === "benchmark") {
-      return res.status(400).json({
-        error: "deprecated",
-        detail: "Usa 'benchmark_question' una pregunta a la vez desde la herramienta del navegador -- correr las 24 en el servidor excede el limite de duracion de Vercel Hobby.",
-      });
-    }
-
-    return res.status(400).json({ error: "unknown_resource" });
-  } catch (err) {
-    return res.status(500).json({ error: "ai_failed", detail: String(err.message || err) });
-  }
+function copyJson() {
+  const ta = document.getElementById('jsonOutput');
+  ta.select();
+  document.execCommand('copy');
+  alert('Copiado. Pégalo en el chat con Claude.');
 }
+</script>
+
+</body>
+</html>
