@@ -3,12 +3,17 @@
 // Vercel Hobby rechazo el deployment por pasarse de 12 funciones -- ver
 // api/manage.js para el mismo patron aplicado a las escrituras).
 //
-// 2 acciones:
+// 4 acciones:
 // - chat: una pregunta, corre el tool-calling loop contra el proveedor
 //   activo (MONI_AI_PROVIDER), guarda el turno en ai_conversations.
-// - benchmark_question: UNA pregunta contra UN proveedor especifico -- se
-//   llama 24 veces desde el navegador (ver herramienta que sigue), nunca
-//   las 24 dentro de una sola funcion de Vercel.
+// - benchmark_question: UNA pregunta contra UN proveedor especifico, con
+//   herramientas REALES en vivo (Live Test). Se llama muchas veces desde
+//   el navegador, nunca todas dentro de una sola funcion de Vercel.
+// - controlled_question: la MISMA pregunta contra UN proveedor, pero
+//   usando un toolCallLog ya capturado en vez de ejecutar las
+//   herramientas de verdad -- asi los 3 modelos reciben exactamente los
+//   mismos datos y la comparacion mide solo razonamiento, no suerte con
+//   Finnhub/CoinGecko en el momento.
 //
 // Regla que nunca cambia: el modelo NUNCA calcula un numero financiero.
 // Solo interpreta lo que devuelven las tools de lib/aiTools.js.
@@ -39,11 +44,16 @@ Reglas obligatorias:
 - Nunca te presentas como un modelo de lenguaje generico. Eres Moni AI.
 - Si te preguntan algo fuera del portafolio de tu cliente, redirige brevemente a tu proposito: analizar SU patrimonio.`;
 
-async function runQuestion(question, history, provider, FINNHUB_KEY) {
+// executorFn: (name, input) => Promise<toolResultObject>
+// En Live Test es executeTool real (Capa 1 de verdad). En Controlled Test
+// es un reemplazo que busca en un toolCallLog ya capturado, para que los
+// 3 modelos vean exactamente los mismos datos.
+async function runQuestion(question, history, provider, executorFn) {
   const messages = [...history, { role: "user", content: question }];
   let finalText = null;
   let loopGuard = 0;
   const toolsUsed = [];
+  const toolCallLog = [];
   const usageTotals = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   let lastMeta = null;
   const startedAt = Date.now();
@@ -69,7 +79,8 @@ async function runQuestion(question, history, provider, FINNHUB_KEY) {
         const toolResults = [];
         for (const call of result.toolCalls) {
           toolsUsed.push(call.name);
-          const toolResult = await executeTool(call.name, call.input || {}, supabase, FINNHUB_KEY);
+          const toolResult = await executorFn(call.name, call.input || {});
+          toolCallLog.push({ name: call.name, input: call.input || {}, result: toolResult });
           toolResults.push({ type: "tool_result", tool_use_id: call.id, content: JSON.stringify(toolResult) });
         }
         messages.push({ role: "user", content: toolResults });
@@ -89,17 +100,38 @@ async function runQuestion(question, history, provider, FINNHUB_KEY) {
     answer: finalText,
     error: errored,
     toolsUsed,
+    toolCallLog,
     toolLoopIterations: loopGuard,
     latencyMs: Date.now() - startedAt,
     usage: { ...usageTotals, model: lastMeta?.model, provider },
   };
 }
 
+// Reemplazo de executeTool para Controlled Test: busca en el log
+// capturado por nombre de herramienta, en orden (si se llama 2 veces la
+// misma tool, usa la siguiente entrada capturada). Si el modelo pide una
+// herramienta que no esta en el log capturado, se marca error explicito
+// -- nunca se inventa un resultado para esa herramienta.
+function makeControlledExecutor(capturedLog) {
+  const remaining = {};
+  (capturedLog || []).forEach((entry) => {
+    if (!remaining[entry.name]) remaining[entry.name] = [];
+    remaining[entry.name].push(entry.result);
+  });
+  return async (name) => {
+    const queue = remaining[name];
+    if (!queue || queue.length === 0) {
+      return { status: "error", data: null, asOf: new Date().toISOString(), source: "controlled_test", errorCode: "no_captured_result_for_replay" };
+    }
+    return queue.shift();
+  };
+}
+
+function liveExecutor(FINNHUB_KEY) {
+  return (name, input) => executeTool(name, input, supabase, FINNHUB_KEY);
+}
+
 export default async function handler(req, res) {
-  // CORS: la herramienta de benchmark corre como archivo local en el
-  // navegador (origen distinto al del sitio desplegado), asi que el
-  // preflight OPTIONS necesita respuesta explicita o el navegador bloquea
-  // la peticion real antes de que salga siquiera.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -112,7 +144,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "method_not_allowed" });
   }
 
-  const { resource, pin, question, session_id, confirm } = req.body || {};
+  const { resource, pin, question, session_id } = req.body || {};
 
   const { blocked } = await checkRateLimit(supabase);
   if (blocked) {
@@ -135,7 +167,7 @@ export default async function handler(req, res) {
         history = (data || []).map((m) => ({ role: m.role, content: m.content }));
       }
 
-      const result = await runQuestion(question, history, null, FINNHUB_KEY);
+      const result = await runQuestion(question, history, null, liveExecutor(FINNHUB_KEY));
 
       if (session_id && !result.error) {
         try {
@@ -155,15 +187,20 @@ export default async function handler(req, res) {
       const question = EVALUATION_SET_V1[questionIndex];
       if (!question) return res.status(400).json({ error: "invalid_question_index" });
 
-      const r = await runQuestion(question, [], provider, FINNHUB_KEY);
-      return res.status(200).json({ provider, question, questionIndex, ...r });
+      const r = await runQuestion(question, [], provider, liveExecutor(FINNHUB_KEY));
+      return res.status(200).json({ mode: "live", provider, question, questionIndex, ...r });
     }
 
-    if (resource === "benchmark") {
-      return res.status(400).json({
-        error: "deprecated",
-        detail: "Usa 'benchmark_question' una pregunta a la vez desde la herramienta del navegador -- correr las 24 en el servidor excede el limite de duracion de Vercel Hobby.",
-      });
+    if (resource === "controlled_question") {
+      const { provider, questionIndex, capturedLog } = req.body || {};
+      if (!provider || questionIndex == null || !Array.isArray(capturedLog)) {
+        return res.status(400).json({ error: "missing_fields" });
+      }
+      const question = EVALUATION_SET_V1[questionIndex];
+      if (!question) return res.status(400).json({ error: "invalid_question_index" });
+
+      const r = await runQuestion(question, [], provider, makeControlledExecutor(capturedLog));
+      return res.status(200).json({ mode: "controlled", provider, question, questionIndex, ...r });
     }
 
     return res.status(400).json({ error: "unknown_resource" });
