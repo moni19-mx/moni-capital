@@ -2,14 +2,15 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<title>Moni AI — Benchmark Runner</title>
+<title>Moni AI — Benchmark Runner v2</title>
 <style>
   * { box-sizing: border-box; }
   body {
     background: #0A0E17; color: #E8EAF2; font-family: 'IBM Plex Sans', 'Inter', sans-serif;
-    max-width: 900px; margin: 0 auto; padding: 32px 24px;
+    max-width: 950px; margin: 0 auto; padding: 32px 24px;
   }
   h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; color: #C9A34E; }
   .sub { color: #8A93B0; font-size: 13px; margin-bottom: 24px; }
   .card { background: #11172A; border: 1px solid #232B45; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
   label { font-size: 11px; color: #8A93B0; display: block; margin-bottom: 4px; }
@@ -19,7 +20,7 @@
   }
   button {
     background: #C9A34E; color: #1A1305; border: none; border-radius: 8px; padding: 10px 18px;
-    font-weight: 700; font-size: 13px; cursor: pointer;
+    font-weight: 700; font-size: 13px; cursor: pointer; margin-right: 8px;
   }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.secondary { background: none; border: 1px solid #232B45; color: #8A93B0; }
@@ -44,22 +45,52 @@
     width: 100%; height: 200px; background: #0A0E17; border: 1px solid #232B45; color: #E8EAF2;
     border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; margin-top: 12px;
   }
+  .tabs { display: flex; gap: 6px; margin-bottom: 20px; }
+  .tab { background: none; border: 1px solid #232B45; color: #8A93B0; border-radius: 999px; padding: 6px 16px; font-size: 12px; cursor: pointer; }
+  .tab.active { background: #C9A34E; color: #1A1305; border-color: #C9A34E; }
+  .hidden { display: none; }
 </style>
 </head>
 <body>
 
-<h1>Moni AI — Benchmark Runner</h1>
-<div class="sub">Corre el Evaluation Set v1 (12 preguntas × 2 proveedores = 24 llamadas reales) una por una. Esta página vive dentro de tu propio sitio, así que no hay problemas de permisos entre navegadores.</div>
+<h1>Moni AI — Benchmark Runner v2</h1>
+<div class="sub">Claude Sonnet 5 vs GPT-5.6 Sol vs GPT-5.6 Terra. Live Test (herramientas reales) y Controlled Test (mismos datos para los 3).</div>
 
 <div class="warn">
-  Esto hace <b>24 llamadas reales</b> a Anthropic y OpenAI — tiene costo real (normalmente menos de $1 USD en total). No cierres esta pestaña mientras corre.
+  Cada corrida hace llamadas reales con costo real. Live Test completo = 36 llamadas (12 preguntas × 3 modelos). Controlled Test = 1 corrida de captura (5 preguntas) + 15 réplicas (5 × 3 modelos). No cierres la pestaña mientras corre.
 </div>
 
 <div class="card">
   <label>Tu PIN</label>
   <input id="pin" type="password" />
-  <button id="runBtn" onclick="runBenchmark()">Correr benchmark completo (24 llamadas)</button>
-  <button class="secondary" onclick="stopBenchmark()">Detener</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('live')">Live Test</button>
+  <button class="tab" onclick="switchTab('controlled')">Controlled Test</button>
+</div>
+
+<div id="liveTab">
+  <div class="card">
+    <h2>Live Test — herramientas reales, 12 preguntas × 3 modelos</h2>
+    <button onclick="runLive()">Correr Live Test completo (36 llamadas)</button>
+    <button class="secondary" onclick="stopRun()">Detener</button>
+  </div>
+</div>
+
+<div id="controlledTab" class="hidden">
+  <div class="card">
+    <h2>Paso 1 — Capturar datos de referencia</h2>
+    <div class="sub" style="margin-bottom:12px;">Corre las 5 preguntas priorizadas UNA vez con herramientas reales (usando Claude como captura) para fijar los datos que verán los 3 modelos.</div>
+    <button onclick="captureReference()">Capturar datos (5 preguntas)</button>
+    <div id="captureStatus" class="status"></div>
+  </div>
+  <div class="card">
+    <h2>Paso 2 — Correr Controlled Test con los 3 modelos</h2>
+    <div class="sub" style="margin-bottom:12px;">Usa los datos capturados arriba — no vuelve a tocar Finnhub/CoinGecko/Supabase.</div>
+    <button id="controlledBtn" onclick="runControlled()" disabled>Correr Controlled Test (15 llamadas)</button>
+    <button class="secondary" onclick="stopRun()">Detener</button>
+  </div>
 </div>
 
 <div class="card" id="progressCard" style="display:none;">
@@ -69,13 +100,13 @@
 </div>
 
 <div class="card" id="exportCard" style="display:none;">
-  <div class="status">Resultado completo (JSON) — copia esto y pégaselo a Claude para que arme la tabla comparativa:</div>
+  <div class="status">Resultado completo (JSON) — copia esto y pégaselo a Claude:</div>
   <textarea id="jsonOutput" readonly onclick="this.select()"></textarea>
   <button onclick="copyJson()" style="margin-top:8px;">Copiar JSON</button>
 </div>
 
 <script>
-const QUESTIONS = [
+const ALL_QUESTIONS = [
   "¿Cuánto vale mi patrimonio?",
   "¿Cuál es mi mayor posición?",
   "¿Cuál es mi mayor riesgo?",
@@ -89,70 +120,121 @@ const QUESTIONS = [
   "Tengo $2,000 nuevos. Analiza cómo encajarían según mi estrategia actual.",
   "¿Qué dato te falta para responder esta pregunta?",
 ];
-const PROVIDERS = ["anthropic", "openai"];
+// Indices de las 5 preguntas priorizadas para Controlled Test
+const PRIORITY_INDICES = [2, 10, 4, 6, 3];
+const PROVIDERS = ["anthropic", "gpt-5.6-sol", "gpt-5.6-terra"];
 
 let stopped = false;
+let capturedLogs = {}; // questionIndex -> toolCallLog
 
-function stopBenchmark() { stopped = true; }
+function stopRun() { stopped = true; }
 
-async function runBenchmark() {
+function switchTab(tab) {
+  document.getElementById('liveTab').classList.toggle('hidden', tab !== 'live');
+  document.getElementById('controlledTab').classList.toggle('hidden', tab !== 'controlled');
+  document.querySelectorAll('.tab').forEach((b, i) => b.classList.toggle('active', (tab === 'live' && i === 0) || (tab === 'controlled' && i === 1)));
+}
+
+function renderRow(provider, question, entry) {
+  const row = document.createElement('div');
+  const hasError = entry.httpError || entry.error;
+  row.className = 'row ' + (hasError ? 'error' : 'ok');
+  row.innerHTML = `<span class="badge">${provider.toUpperCase()}</span>
+    <span style="flex:1;">${question}</span>
+    <span>${hasError ? 'ERROR' : (entry.latencyMs ? entry.latencyMs + 'ms' : '')}</span>`;
+  document.getElementById('resultsList').prepend(row);
+}
+
+async function callApi(pin, payload) {
+  try {
+    const resp = await fetch('/api/ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, ...payload }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) data.httpError = data.error || resp.status;
+    return data;
+  } catch (e) {
+    return { httpError: String(e) };
+  }
+}
+
+async function runLive() {
   stopped = false;
   const pin = document.getElementById('pin').value;
   if (!pin) { alert('Pon tu PIN primero.'); return; }
 
-  document.getElementById('runBtn').disabled = true;
   document.getElementById('progressCard').style.display = 'block';
   document.getElementById('exportCard').style.display = 'none';
   document.getElementById('resultsList').innerHTML = '';
 
-  const total = QUESTIONS.length * PROVIDERS.length;
+  const total = ALL_QUESTIONS.length * PROVIDERS.length;
   let done = 0;
   const results = [];
 
   for (const provider of PROVIDERS) {
-    for (let i = 0; i < QUESTIONS.length; i++) {
-      if (stopped) {
-        document.getElementById('statusText').textContent = 'Detenido por el usuario.';
-        break;
-      }
-      document.getElementById('statusText').textContent =
-        `Corriendo ${done + 1} de ${total} — ${provider} — "${QUESTIONS[i].slice(0, 40)}..."`;
-
-      let entry;
-      try {
-        const resp = await fetch('/api/ai', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resource: 'benchmark_question', pin, provider, questionIndex: i }),
-        });
-        const data = await resp.json();
-        entry = data;
-        if (!resp.ok) entry.httpError = data.error || resp.status;
-      } catch (e) {
-        entry = { provider, question: QUESTIONS[i], questionIndex: i, httpError: String(e) };
-      }
-
-      results.push(entry);
+    for (let i = 0; i < ALL_QUESTIONS.length; i++) {
+      if (stopped) break;
+      document.getElementById('statusText').textContent = `Live Test — ${done + 1} de ${total} — ${provider} — "${ALL_QUESTIONS[i].slice(0, 40)}..."`;
+      const entry = await callApi(pin, { resource: 'benchmark_question', provider, questionIndex: i });
+      results.push({ provider, question: ALL_QUESTIONS[i], questionIndex: i, ...entry });
       done++;
       document.getElementById('progressFill').style.width = Math.round((done / total) * 100) + '%';
-
-      const row = document.createElement('div');
-      const hasError = entry.httpError || entry.error;
-      row.className = 'row ' + (hasError ? 'error' : 'ok');
-      row.innerHTML = `<span class="badge">${provider.toUpperCase()}</span>
-        <span style="flex:1;">${QUESTIONS[i]}</span>
-        <span>${hasError ? 'ERROR' : (entry.latencyMs ? entry.latencyMs + 'ms' : '')}</span>`;
-      document.getElementById('resultsList').prepend(row);
+      renderRow(provider, ALL_QUESTIONS[i], entry);
     }
     if (stopped) break;
   }
 
-  document.getElementById('statusText').textContent = stopped
-    ? `Detenido — ${done} de ${total} completadas.`
-    : `Listo — ${done} de ${total} completadas.`;
-  document.getElementById('runBtn').disabled = false;
+  document.getElementById('statusText').textContent = `Live Test listo — ${done} de ${total} completadas.`;
+  document.getElementById('jsonOutput').value = JSON.stringify({ mode: 'live', results }, null, 2);
+  document.getElementById('exportCard').style.display = 'block';
+}
 
-  document.getElementById('jsonOutput').value = JSON.stringify({ evaluationSetVersion: 'v1', results }, null, 2);
+async function captureReference() {
+  const pin = document.getElementById('pin').value;
+  if (!pin) { alert('Pon tu PIN primero.'); return; }
+  capturedLogs = {};
+  document.getElementById('captureStatus').textContent = 'Capturando…';
+
+  for (const idx of PRIORITY_INDICES) {
+    document.getElementById('captureStatus').textContent = `Capturando: "${ALL_QUESTIONS[idx].slice(0, 50)}..."`;
+    const entry = await callApi(pin, { resource: 'benchmark_question', provider: 'anthropic', questionIndex: idx });
+    capturedLogs[idx] = entry.toolCallLog || [];
+  }
+
+  document.getElementById('captureStatus').textContent = `Listo — ${Object.keys(capturedLogs).length} preguntas capturadas.`;
+  document.getElementById('controlledBtn').disabled = false;
+}
+
+async function runControlled() {
+  stopped = false;
+  const pin = document.getElementById('pin').value;
+  if (!pin) { alert('Pon tu PIN primero.'); return; }
+
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('exportCard').style.display = 'none';
+  document.getElementById('resultsList').innerHTML = '';
+
+  const total = PRIORITY_INDICES.length * PROVIDERS.length;
+  let done = 0;
+  const results = [];
+
+  for (const provider of PROVIDERS) {
+    for (const idx of PRIORITY_INDICES) {
+      if (stopped) break;
+      document.getElementById('statusText').textContent = `Controlled Test — ${done + 1} de ${total} — ${provider} — "${ALL_QUESTIONS[idx].slice(0, 40)}..."`;
+      const entry = await callApi(pin, { resource: 'controlled_question', provider, questionIndex: idx, capturedLog: capturedLogs[idx] });
+      results.push({ provider, question: ALL_QUESTIONS[idx], questionIndex: idx, ...entry });
+      done++;
+      document.getElementById('progressFill').style.width = Math.round((done / total) * 100) + '%';
+      renderRow(provider, ALL_QUESTIONS[idx], entry);
+    }
+    if (stopped) break;
+  }
+
+  document.getElementById('statusText').textContent = `Controlled Test listo — ${done} de ${total} completadas.`;
+  document.getElementById('jsonOutput').value = JSON.stringify({ mode: 'controlled', capturedLogs, results }, null, 2);
   document.getElementById('exportCard').style.display = 'block';
 }
 
