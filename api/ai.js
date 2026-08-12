@@ -192,15 +192,17 @@ export default async function handler(req, res) {
     }
 
     if (resource === "controlled_question") {
-      const { provider, questionIndex, capturedLog } = req.body || {};
-      if (!provider || questionIndex == null || !Array.isArray(capturedLog)) {
+      // CONTROLLED TEST / ADVERSARIAL TEST: la pregunta viene como texto
+      // directo (no como indice) para poder usar tanto el Evaluation Set
+      // v1 como preguntas adversariales nuevas que no estan en ese set.
+      // NUNCA toca Finnhub/CoinGecko/Supabase -- todo sale de capturedLog.
+      const { provider, question: qText, capturedLog } = req.body || {};
+      if (!provider || !qText || !Array.isArray(capturedLog)) {
         return res.status(400).json({ error: "missing_fields" });
       }
-      const question = EVALUATION_SET_V1[questionIndex];
-      if (!question) return res.status(400).json({ error: "invalid_question_index" });
 
-      const r = await runQuestion(question, [], provider, makeControlledExecutor(capturedLog));
-      return res.status(200).json({ mode: "controlled", provider, question, questionIndex, ...r });
+      const r = await runQuestion(qText, [], provider, makeControlledExecutor(capturedLog));
+      return res.status(200).json({ mode: "controlled", provider, question: qText, ...r });
     }
 
     return res.status(400).json({ error: "unknown_resource" });
