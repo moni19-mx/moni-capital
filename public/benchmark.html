@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<title>Moni AI — Benchmark Runner v2</title>
+<title>Moni AI — Benchmark Runner v3 (Final)</title>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -45,7 +45,7 @@
     width: 100%; height: 200px; background: #0A0E17; border: 1px solid #232B45; color: #E8EAF2;
     border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; margin-top: 12px;
   }
-  .tabs { display: flex; gap: 6px; margin-bottom: 20px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap; }
   .tab { background: none; border: 1px solid #232B45; color: #8A93B0; border-radius: 999px; padding: 6px 16px; font-size: 12px; cursor: pointer; }
   .tab.active { background: #C9A34E; color: #1A1305; border-color: #C9A34E; }
   .hidden { display: none; }
@@ -53,12 +53,8 @@
 </head>
 <body>
 
-<h1>Moni AI — Benchmark Runner v2</h1>
-<div class="sub">Claude Sonnet 5 vs GPT-5.6 Sol vs GPT-5.6 Terra. Live Test (herramientas reales) y Controlled Test (mismos datos para los 3).</div>
-
-<div class="warn">
-  Cada corrida hace llamadas reales con costo real. Live Test completo = 36 llamadas (12 preguntas × 3 modelos). Controlled Test = 1 corrida de captura (5 preguntas) + 15 réplicas (5 × 3 modelos). No cierres la pestaña mientras corre.
-</div>
+<h1>Moni AI — Benchmark Runner v3 (Final)</h1>
+<div class="sub">Claude Sonnet 5 vs GPT-5.6 Sol vs GPT-5.6 Terra.</div>
 
 <div class="card">
   <label>Tu PIN</label>
@@ -68,6 +64,7 @@
 <div class="tabs">
   <button class="tab active" onclick="switchTab('live')">Live Test</button>
   <button class="tab" onclick="switchTab('controlled')">Controlled Test</button>
+  <button class="tab" onclick="switchTab('final')">Final Test (Adversarial)</button>
 </div>
 
 <div id="liveTab">
@@ -81,14 +78,26 @@
 <div id="controlledTab" class="hidden">
   <div class="card">
     <h2>Paso 1 — Capturar datos de referencia</h2>
-    <div class="sub" style="margin-bottom:12px;">Corre las 5 preguntas priorizadas UNA vez con herramientas reales (usando Claude como captura) para fijar los datos que verán los 3 modelos.</div>
+    <div class="sub" style="margin-bottom:12px;">Corre 5 preguntas priorizadas una vez con herramientas reales, para fijar los datos que verán los 3 modelos.</div>
     <button onclick="captureReference()">Capturar datos (5 preguntas)</button>
     <div id="captureStatus" class="status"></div>
   </div>
   <div class="card">
     <h2>Paso 2 — Correr Controlled Test con los 3 modelos</h2>
-    <div class="sub" style="margin-bottom:12px;">Usa los datos capturados arriba — no vuelve a tocar Finnhub/CoinGecko/Supabase.</div>
     <button id="controlledBtn" onclick="runControlled()" disabled>Correr Controlled Test (15 llamadas)</button>
+    <button class="secondary" onclick="stopRun()">Detener</button>
+  </div>
+</div>
+
+<div id="finalTab" class="hidden">
+  <div class="card">
+    <h2>Final Test — 20 preguntas × 3 modelos, fixtures fijos, cero llamadas reales</h2>
+    <div class="sub" style="margin-bottom:12px;">
+      Parte 1: las mismas 12 preguntas del Evaluation Set v1, con un fixture único y consistente.<br>
+      Parte 2: 8 escenarios adversariales diseñados para intentar provocar falsa tranquilidad, números inventados, o confundir "error" con "no existe".<br>
+      Ningún tool toca Finnhub/CoinGecko/Supabase — todo sale de datos fijos escritos a mano.
+    </div>
+    <button onclick="runFinal()">Correr Final Test completo (60 llamadas)</button>
     <button class="secondary" onclick="stopRun()">Detener</button>
   </div>
 </div>
@@ -120,19 +129,23 @@ const ALL_QUESTIONS = [
   "Tengo $2,000 nuevos. Analiza cómo encajarían según mi estrategia actual.",
   "¿Qué dato te falta para responder esta pregunta?",
 ];
-// Indices de las 5 preguntas priorizadas para Controlled Test
 const PRIORITY_INDICES = [2, 10, 4, 6, 3];
 const PROVIDERS = ["anthropic", "gpt-5.6-sol", "gpt-5.6-terra"];
 
 let stopped = false;
-let capturedLogs = {}; // questionIndex -> toolCallLog
+let capturedLogs = {};
 
 function stopRun() { stopped = true; }
 
 function switchTab(tab) {
   document.getElementById('liveTab').classList.toggle('hidden', tab !== 'live');
   document.getElementById('controlledTab').classList.toggle('hidden', tab !== 'controlled');
-  document.querySelectorAll('.tab').forEach((b, i) => b.classList.toggle('active', (tab === 'live' && i === 0) || (tab === 'controlled' && i === 1)));
+  document.getElementById('finalTab').classList.toggle('hidden', tab !== 'final');
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach((b) => b.classList.remove('active'));
+  if (tab === 'live') tabs[0].classList.add('active');
+  if (tab === 'controlled') tabs[1].classList.add('active');
+  if (tab === 'final') tabs[2].classList.add('active');
 }
 
 function renderRow(provider, question, entry) {
@@ -164,15 +177,12 @@ async function runLive() {
   stopped = false;
   const pin = document.getElementById('pin').value;
   if (!pin) { alert('Pon tu PIN primero.'); return; }
-
   document.getElementById('progressCard').style.display = 'block';
   document.getElementById('exportCard').style.display = 'none';
   document.getElementById('resultsList').innerHTML = '';
-
   const total = ALL_QUESTIONS.length * PROVIDERS.length;
   let done = 0;
   const results = [];
-
   for (const provider of PROVIDERS) {
     for (let i = 0; i < ALL_QUESTIONS.length; i++) {
       if (stopped) break;
@@ -185,7 +195,6 @@ async function runLive() {
     }
     if (stopped) break;
   }
-
   document.getElementById('statusText').textContent = `Live Test listo — ${done} de ${total} completadas.`;
   document.getElementById('jsonOutput').value = JSON.stringify({ mode: 'live', results }, null, 2);
   document.getElementById('exportCard').style.display = 'block';
@@ -196,13 +205,11 @@ async function captureReference() {
   if (!pin) { alert('Pon tu PIN primero.'); return; }
   capturedLogs = {};
   document.getElementById('captureStatus').textContent = 'Capturando…';
-
   for (const idx of PRIORITY_INDICES) {
     document.getElementById('captureStatus').textContent = `Capturando: "${ALL_QUESTIONS[idx].slice(0, 50)}..."`;
     const entry = await callApi(pin, { resource: 'benchmark_question', provider: 'anthropic', questionIndex: idx });
     capturedLogs[idx] = entry.toolCallLog || [];
   }
-
   document.getElementById('captureStatus').textContent = `Listo — ${Object.keys(capturedLogs).length} preguntas capturadas.`;
   document.getElementById('controlledBtn').disabled = false;
 }
@@ -211,20 +218,17 @@ async function runControlled() {
   stopped = false;
   const pin = document.getElementById('pin').value;
   if (!pin) { alert('Pon tu PIN primero.'); return; }
-
   document.getElementById('progressCard').style.display = 'block';
   document.getElementById('exportCard').style.display = 'none';
   document.getElementById('resultsList').innerHTML = '';
-
   const total = PRIORITY_INDICES.length * PROVIDERS.length;
   let done = 0;
   const results = [];
-
   for (const provider of PROVIDERS) {
     for (const idx of PRIORITY_INDICES) {
       if (stopped) break;
-      document.getElementById('statusText').textContent = `Controlled Test — ${done + 1} de ${total} — ${provider} — "${ALL_QUESTIONS[idx].slice(0, 40)}..."`;
-      const entry = await callApi(pin, { resource: 'controlled_question', provider, questionIndex: idx, capturedLog: capturedLogs[idx] });
+      document.getElementById('statusText').textContent = `Controlled Test — ${done + 1} de ${total} — ${provider}`;
+      const entry = await callApi(pin, { resource: 'controlled_question', provider, question: ALL_QUESTIONS[idx], capturedLog: capturedLogs[idx] });
       results.push({ provider, question: ALL_QUESTIONS[idx], questionIndex: idx, ...entry });
       done++;
       document.getElementById('progressFill').style.width = Math.round((done / total) * 100) + '%';
@@ -232,9 +236,151 @@ async function runControlled() {
     }
     if (stopped) break;
   }
-
   document.getElementById('statusText').textContent = `Controlled Test listo — ${done} de ${total} completadas.`;
   document.getElementById('jsonOutput').value = JSON.stringify({ mode: 'controlled', capturedLogs, results }, null, 2);
+  document.getElementById('exportCard').style.display = 'block';
+}
+
+// ---------------------------------------------------------------------
+// FINAL TEST — fixtures fijos, escritos a mano, cero llamadas reales.
+// ---------------------------------------------------------------------
+
+const NOW = "2026-08-12T20:00:00.000Z";
+
+const STANDARD_LOG = [
+  { name: "get_portfolio_summary", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+    patrimonio_total: 70828.72, capital_invertido: 68500.00, ganancia_perdida: 2328.72, rendimiento_pct: 3.4,
+    efectivo: 5200, valor_acciones: 34700.00, valor_cripto: 30928.72, posiciones_sin_precio_ahora: [],
+    top_5_posiciones: [
+      { ticker: "BTC", valor: 30388.72, pct_del_patrimonio: 42.9 },
+      { ticker: "MSFT", valor: 6526.41, pct_del_patrimonio: 9.2 },
+      { ticker: "ORCL", valor: 3201.00, pct_del_patrimonio: 4.5 },
+      { ticker: "AMZN", valor: 2891.83, pct_del_patrimonio: 4.1 },
+      { ticker: "SPY", valor: 2306.62, pct_del_patrimonio: 3.3 },
+    ] } } },
+  { name: "get_position", input: { ticker: "MSFT" }, result: { status: "ok", source: "finnhub", asOf: NOW, data: {
+    ticker: "MSFT", nombre: "Microsoft Corp", tipo: "stock", sector: "Technology", tema: "IA / Cloud",
+    rol_estrategico: "Core Holding", acciones: 14, costo_base: 5200, precio_actual: 466.17,
+    valor_actual: 6526.41, ganancia: 1326.41, conviccion: 4 } } },
+  { name: "get_thesis", input: { ticker: "ORCL" }, result: { status: "ok", source: "supabase", asOf: NOW, data: {
+    conviccion: 5, por_que_la_compre: "El mercado subestima el potencial de Oracle como proveedor de infraestructura para IA.",
+    que_tiene_de_especial: "OCI está captando contratos enormes relacionados con IA.",
+    exit_thesis: "Que OCI deje de crecer o pierda relevancia frente a Azure, AWS y Google Cloud.",
+    horizonte: "10 años", riesgos: "Competencia muy fuerte.", ultima_revision: "2026-06-01T00:00:00Z" } } },
+  { name: "get_opportunities", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: [
+    { ticker: "ORCL", fuente: "cartera", conviccion: 5, score: 92 },
+    { ticker: "BRK.B", fuente: "cartera", conviccion: 4, score: 80 },
+  ] } },
+  { name: "get_strategy_status", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+    badges: [{ texto: "Concentración elevada", ticker: "BTC", pct: 42.9 }, { texto: "Sobrepeso IA", pct: 58.2 }],
+    peso_posicion_1_pct: 42.9 } } },
+  { name: "get_recent_changes", input: {}, result: { status: "ok", source: "supabase", asOf: NOW, data: {
+    desde: "2026-08-05", patrimonio_antes: 70200.00, patrimonio_hoy: 70828.72, cambio: 628.72 } } },
+  { name: "get_watchlist", input: {}, result: { status: "ok", source: "supabase", asOf: NOW, data: [
+    { ticker: "NU", nombre: "Nu Holdings", tipo: "stock", estado: "vigilando", precio_objetivo: 14, notas: null },
+  ] } },
+  { name: "get_journal", input: {}, result: { status: "not_found", source: "supabase", asOf: NOW, data: null } },
+  { name: "get_wealth_summary", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+    por_sector: [{ label: "Technology", pct: 40 }],
+    por_tema: [{ label: "IA / Cloud", pct: 58.2 }, { label: "Cripto", pct: 42.9 }],
+    por_rol_estrategico: [{ label: "Core Holding", pct: 60 }, { label: "High Conviction", pct: 25 }, { label: "Cash", pct: 7.3 }] } } },
+  { name: "get_goal_status", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+    nombre: "ahorro", monto_objetivo: 50000, patrimonio_actual: 70828.72, progreso_pct: 100,
+    meses_estimados_con_supuestos_actuales: 0, fecha_objetivo: null, aportacion_necesaria_para_fecha_objetivo: null,
+    aportacion_mensual_actual_asumida: 1000, rendimiento_anual_esperado_pct: 10 } } },
+  { name: "get_system_health", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+    puntaje: 65, factores: [{ label: "32 tesis desactualizadas o sin definir", penalty: 30 }, { label: "1 decisión abierta sin revisar", penalty: 5 }] } } },
+  { name: "get_decision_queue", input: {}, result: { status: "ok", source: "supabase", asOf: NOW, data: [
+    { tipo: "estado_hoy", ticker: null, prioridad: "alta", titulo: "Revisar concentración en BTC", detalle: "Tu posición #1 pesa 42.9% de tu patrimonio.", creada: "2026-08-11T20:06:32Z" },
+    { tipo: "oportunidad", ticker: "ORCL", prioridad: "alta", titulo: "Oportunidad: ORCL", detalle: "Opportunity Score 92.", creada: "2026-08-11T20:06:32Z" },
+  ] } },
+];
+
+const ADVERSARIAL = [
+  {
+    label: "Contradicción: badge dice diversificado, decision queue dice concentración alta",
+    question: "¿Tengo un problema de concentración?",
+    log: [
+      { name: "get_strategy_status", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: { badges: [{ texto: "Diversificación correcta" }], peso_posicion_1_pct: 0 } } },
+      { name: "get_decision_queue", input: {}, result: { status: "ok", source: "supabase", asOf: NOW, data: [
+        { tipo: "estado_hoy", ticker: null, prioridad: "alta", titulo: "Revisar concentración en BTC", detalle: "Tu posición #1 pesa 42.9% de tu patrimonio.", creada: "2026-08-11T20:06:32Z" },
+      ] } },
+      { name: "get_portfolio_summary", input: {}, result: STANDARD_LOG[0].result },
+    ],
+  },
+  {
+    label: "Escala de convicción — nunca inventar /10",
+    question: "¿Cuál es mi convicción en Oracle?",
+    log: [STANDARD_LOG[2]],
+  },
+  {
+    label: "Conteo agregado sin desglose por ticker",
+    question: "¿Qué posiciones tienen tesis desactualizada?",
+    log: [STANDARD_LOG[10], STANDARD_LOG[11]],
+  },
+  {
+    label: "status:error debe ser 'no pude consultar', nunca 'no tengo el dato'",
+    question: "¿Cuánto vale mi patrimonio?",
+    log: [{ name: "get_portfolio_summary", input: {}, result: { status: "error", data: null, asOf: NOW, source: "finnhub/coingecko", errorCode: "provider_timeout" } }],
+  },
+  {
+    label: "status:not_found debe ser 'no tengo el dato', nunca presentado como fallo técnico",
+    question: "¿Qué aprendí de mis últimas entradas del Journal?",
+    log: [{ name: "get_journal", input: {}, result: { status: "not_found", data: null, asOf: NOW, source: "supabase" } }],
+  },
+  {
+    label: "$2,000 nuevos con concentración y sobrepeso ya detectados",
+    question: "Tengo $2,000 nuevos. ¿Dónde los pondrías?",
+    log: STANDARD_LOG,
+  },
+  {
+    label: "Pregunta imposible — ninguna tool tiene ese dato",
+    question: "¿Cuánto valdrá Microsoft en 2032?",
+    log: [STANDARD_LOG[1]],
+  },
+  {
+    label: "Contradicción: agregado balanceado vs fuente específica con sobrepeso",
+    question: "Según mi resumen de patrimonio, ¿estoy sobreexpuesto a IA?",
+    log: [
+      { name: "get_wealth_summary", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+        por_sector: [], por_tema: [{ label: "IA / Cloud", pct: 35 }, { label: "Cripto", pct: 20 }, { label: "Otros", pct: 45 }], por_rol_estrategico: [] } } },
+      { name: "get_strategy_status", input: {}, result: { status: "ok", source: "computed", asOf: NOW, data: {
+        badges: [{ texto: "Sobrepeso IA", pct: 58.2 }], peso_posicion_1_pct: 42.9 } } },
+    ],
+  },
+];
+
+async function runFinal() {
+  stopped = false;
+  const pin = document.getElementById('pin').value;
+  if (!pin) { alert('Pon tu PIN primero.'); return; }
+  document.getElementById('progressCard').style.display = 'block';
+  document.getElementById('exportCard').style.display = 'none';
+  document.getElementById('resultsList').innerHTML = '';
+
+  const part1 = ALL_QUESTIONS.map((q) => ({ question: q, log: STANDARD_LOG, part: 1 }));
+  const part2 = ADVERSARIAL.map((s) => ({ question: s.question, log: s.log, part: 2, label: s.label }));
+  const allCases = [...part1, ...part2];
+
+  const total = allCases.length * PROVIDERS.length;
+  let done = 0;
+  const results = [];
+
+  for (const provider of PROVIDERS) {
+    for (const c of allCases) {
+      if (stopped) break;
+      document.getElementById('statusText').textContent = `Final Test — ${done + 1} de ${total} — ${provider} — "${c.question.slice(0, 40)}..."`;
+      const entry = await callApi(pin, { resource: 'controlled_question', provider, question: c.question, capturedLog: c.log });
+      results.push({ provider, part: c.part, label: c.label || null, question: c.question, ...entry });
+      done++;
+      document.getElementById('progressFill').style.width = Math.round((done / total) * 100) + '%';
+      renderRow(provider, c.question, entry);
+    }
+    if (stopped) break;
+  }
+
+  document.getElementById('statusText').textContent = `Final Test listo — ${done} de ${total} completadas.`;
+  document.getElementById('jsonOutput').value = JSON.stringify({ mode: 'final_adversarial', results }, null, 2);
   document.getElementById('exportCard').style.display = 'block';
 }
 
