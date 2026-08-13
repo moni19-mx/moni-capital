@@ -81,6 +81,21 @@ async function manageDecisions(payload) { return callManage("decisions", payload
 async function manageRebalance(payload) { return callManage("rebalance", payload); }
 async function manageJournal(payload) { return callManage("journal", payload); }
 
+// Debe coincidir con PROMPT_VERSION en api/ai.js -- si sube, el hash del
+// Daily Brief cambia solo y el frontend sabe que hay que regenerar.
+const PROMPT_VERSION_FRONTEND = "1.1.1";
+
+async function callAI(resource, payload) {
+  const res = await fetch("/api/ai", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ resource, ...payload }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  return data;
+}
+
+async function generateInsight(payload) { return callAI("generate_insight", payload); }
+
 async function fetchMarketPulse() {
   const res = await fetch("/api/market-pulse");
   if (!res.ok) return null;
@@ -106,6 +121,7 @@ export default function Dashboard() {
   const [journalEntries, setJournalEntries] = useState([]);
   const [decisions, setDecisions] = useState([]);
   const [rebalanceTargets, setRebalanceTargets] = useState([]);
+  const [aiInsights, setAiInsights] = useState([]);
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
@@ -123,7 +139,7 @@ export default function Dashboard() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData, insightsData] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
@@ -134,6 +150,7 @@ export default function Dashboard() {
         sb("journal_entries").catch(() => []),
         sb("decisions").catch(() => []),
         sb("rebalance_targets").catch(() => []),
+        sb("ai_insights").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
@@ -145,6 +162,7 @@ export default function Dashboard() {
       setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
       setDecisions(decisionsData || []);
       setRebalanceTargets(rebalanceData || []);
+      setAiInsights([...(insightsData || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
 
       fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
 
@@ -206,6 +224,15 @@ export default function Dashboard() {
   const cashValue = cashMovements.reduce((a, m) => a + (m.type === "deposito" ? Number(m.amount) : -Number(m.amount)), 0);
 
   const patrimonio = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+
+  // Hash de frescura del Daily Brief: cambia si sube PROMPT_VERSION, si
+  // cambia de dia, o si el patrimonio se movio de forma material. No
+  // necesita ser criptografico -- solo distinguir "sigue vigente" de
+  // "hay que regenerar".
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const dailyBriefHash = `${PROMPT_VERSION_FRONTEND}::${todayISO}::${Math.round(patrimonio / 10) * 10}`;
+  const latestInsight = aiInsights.find((i) => i.scope === "today") || null;
+  const insightIsFresh = latestInsight?.based_on_hash === dailyBriefHash;
   const invested = withValue.reduce((a, p) => a + Number(p.cost_basis), 0) + cashValue;
   const totalGain = patrimonio - invested;
   const totalPct = invested ? totalGain / invested : 0;
@@ -434,7 +461,10 @@ export default function Dashboard() {
           <div style={{ display: "grid", gap: 14 }}>
             <TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} />
 
-            <MoniAIBanner estado={estadoDeHoy} estrategia={estadoEstrategia} onNavigate={setTab} />
+            <DailyBriefCard
+              latestInsight={latestInsight} insightIsFresh={insightIsFresh} hash={dailyBriefHash}
+              history={aiInsights} onGenerated={loadAll}
+            />
 
             <MarketPulseRow pulse={marketPulse} />
 
@@ -808,17 +838,116 @@ function TodayStatusCard({ estado, onNavigate }) {
   );
 }
 
-function MoniAIBanner({ estado, estrategia, onNavigate }) {
-  // Vista previa determinística (Capa 1) con el mismo tono que tendrá Moni AI real
-  // cuando conectemos ese módulo. Ningún texto aquí lo genera un modelo todavía.
-  let text;
-  if (estado.emoji === "🔴") text = `Concentración elevada en ${estado.label.replace("Revisar concentración en ", "")}.`;
-  else if (estado.emoji === "🟡") text = `Oportunidad detectada. ${estado.label}.`;
-  else text = "Sin razones para modificar la estrategia.";
+function BriefSection({ label, text }) {
+  if (!text) return null;
   return (
-    <div style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-      <div style={{ fontSize: 12 }}><b style={{ color: GOLD }}>Moni AI —</b> {text}</div>
-      <button onClick={() => onNavigate("resumen")} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Continuar con Moni AI →</button>
+    <div>
+      <div style={{ fontSize: 9, color: MUTE, letterSpacing: 0.5, marginBottom: 2 }}>{label.toUpperCase()}</div>
+      <div style={{ fontSize: 13 }}>{text}</div>
+    </div>
+  );
+}
+
+function timeAgo(iso) {
+  if (!iso) return "";
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "hace un momento";
+  if (mins < 60) return `hace ${mins} min`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `hace ${hrs}h`;
+  return `hace ${Math.floor(hrs / 24)}d`;
+}
+
+function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenerated }) {
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showPinInput, setShowPinInput] = useState(false);
+
+  async function handleGenerate() {
+    if (!pin) return;
+    setBusy(true); setErr(null);
+    try {
+      await generateInsight({ pin, scope: "today", hash });
+      setShowPinInput(false);
+      setPin("");
+      onGenerated(); // async, no bloquea el resto de TODAY -- solo esta tarjeta muestra su propio spinner
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+
+  const content = latestInsight?.content || null;
+  const confidence = latestInsight?.confidence;
+  const confidenceColor = confidence == null ? MUTE : confidence >= 80 ? GREEN : confidence >= 50 ? AMBER : RED;
+
+  return (
+    <div style={{ background: "#151129", border: `1px solid ${GOLD}`, borderRadius: 12, padding: "16px 20px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10, marginBottom: content ? 12 : 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 10, color: GOLD, letterSpacing: 1, fontWeight: 700 }}>MONI AI — DAILY BRIEF</span>
+          {content && <span style={{ fontSize: 10, color: MUTE }}>{timeAgo(latestInsight.generated_at)}</span>}
+        </div>
+        {confidence != null && content && (
+          <span style={{ fontSize: 10, color: confidenceColor, border: `1px solid ${confidenceColor}`, borderRadius: 4, padding: "2px 8px" }}>
+            Confidence {confidence}%
+          </span>
+        )}
+      </div>
+
+      {!content ? (
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 12 }}>Todavía no se ha generado el Daily Brief de hoy.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 10, marginBottom: 14 }}>
+          <BriefSection label="Estado General" text={content.estado_general} />
+          <BriefSection label="Prioridad del Día" text={content.prioridad_del_dia} />
+          <BriefSection label="Lo que cambió" text={content.que_cambio} />
+          <BriefSection label="Acción sugerida" text={content.accion_sugerida} />
+        </div>
+      )}
+
+      {content && !insightIsFresh && (
+        <div style={{ fontSize: 10, color: AMBER, marginBottom: 10 }}>Esto podría estar desactualizado — tus datos cambiaron desde que se generó.</div>
+      )}
+
+      {showPinInput ? (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <input type="password" placeholder="Tu PIN" value={pin} onChange={(e) => setPin(e.target.value)}
+            style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 10px", fontSize: 12, width: 120 }} />
+          <button onClick={handleGenerate} disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            {busy ? "Generando…" : "Confirmar"}
+          </button>
+          <button onClick={() => setShowPinInput(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Cancelar</button>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <button onClick={() => setShowPinInput(true)} style={{
+            background: content ? "none" : GOLD, color: content ? GOLD : "#1A1305", border: `1px solid ${GOLD}`,
+            borderRadius: 6, padding: "8px 16px", fontWeight: 700, fontSize: 12, cursor: "pointer",
+          }}>
+            {content ? "Actualizar" : "Generar Daily Brief"}
+          </button>
+          {history.length > 1 && (
+            <button onClick={() => setShowHistory((s) => !s)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>
+              {showHistory ? "Ocultar historial" : `Ver historial (${history.length})`}
+            </button>
+          )}
+        </div>
+      )}
+      {err && <div style={{ color: RED, fontSize: 11, marginTop: 8 }}>{err}</div>}
+
+      {showHistory && (
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${LINE}`, display: "grid", gap: 8, maxHeight: 260, overflowY: "auto" }}>
+          {history.slice(1, 30).map((h) => (
+            <div key={h.id} style={{ fontSize: 11, color: MUTE }}>
+              <b style={{ color: TXT }}>{new Date(h.generated_at).toLocaleString("es-MX")}</b>
+              {h.confidence != null && <span> ({h.confidence}% confianza)</span>}
+              <div style={{ marginTop: 2 }}>{h.content?.estado_general || "Sin contenido registrado."}</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
