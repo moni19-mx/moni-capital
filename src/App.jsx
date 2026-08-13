@@ -870,6 +870,37 @@ function TodayStatusCard({ estado, onNavigate }) {
   );
 }
 
+// Renderiza el texto de Moni AI respetando su estructura real: parrafos
+// separados por linea, **negritas**, y cada "💡 Idea externa" como su
+// propio bloque visual en vez de texto corrido.
+function FormattedAIText({ text }) {
+  if (!text) return null;
+  const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+
+  function renderInline(line) {
+    const parts = line.split(/(\*\*[^*]+\*\*)/g);
+    return parts.map((p, i) => p.startsWith("**") && p.endsWith("**")
+      ? <b key={i}>{p.slice(2, -2)}</b>
+      : <span key={i}>{p}</span>);
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      {lines.map((line, i) => {
+        const isExternalIdea = line.includes("💡 Idea externa");
+        if (isExternalIdea) {
+          return (
+            <div key={i} style={{ background: "#1A1530", border: "1px solid #B39DFF", borderRadius: 8, padding: "8px 12px", fontSize: 13 }}>
+              {renderInline(line)}
+            </div>
+          );
+        }
+        return <div key={i} style={{ fontSize: 14 }}>{renderInline(line)}</div>;
+      })}
+    </div>
+  );
+}
+
 function BriefSection({ label, text }) {
   if (!text) return null;
   return (
@@ -1000,6 +1031,7 @@ function MoniAITab({ latestInsight, insightIsFresh, hash, history, onGenerated, 
         history={history} onGenerated={onGenerated} pin={pin} onPinChange={onPinChange}
       />
       <AskMoniAI pin={pin} onPinChange={onPinChange} sessionId={sessionId} />
+      <ChatSection pin={pin} onPinChange={onPinChange} />
     </div>
   );
 }
@@ -1122,7 +1154,7 @@ function AskMoniAI({ pin, onPinChange, sessionId }) {
       {answer && (
         <div style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 16 }}>
           <div style={{ fontSize: 11, color: MUTE, marginBottom: 8 }}>{answer.question}</div>
-          <div style={{ fontSize: 14, marginBottom: 12 }}>{answer.answer}</div>
+          <div style={{ marginBottom: 12 }}><FormattedAIText text={answer.answer} /></div>
 
           {hadPartialOrError && (
             <div style={{ fontSize: 11, color: AMBER, marginBottom: 10 }}>⚠️ Esta respuesta se basa en datos parciales o con algún fallo técnico — revisa el detalle abajo.</div>
@@ -1160,6 +1192,135 @@ function AskMoniAI({ pin, onPinChange, sessionId }) {
           </div>
         </div>
       )}
+    </Panel>
+  );
+}
+
+// Chat -- misma backend, mismo tool-calling, misma autenticacion que Ask.
+// La diferencia real: manda session_id + historial visible completo, asi
+// que el usuario SI puede profundizar ("¿y de esos, cuál tiene mejor
+// convicción?") y el modelo ve los turnos anteriores (hasta 12, controlado
+// del lado del servidor -- eso es "contexto enviado", distinto de
+// "historial que ve el usuario", que aqui siempre es completo).
+function ChatSection({ pin, onPinChange }) {
+  const [sessionId, setSessionId] = useState(() => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now())));
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [pendingQuestion, setPendingQuestion] = useState(null);
+  const [pinInput, setPinInput] = useState("");
+  const [showPinInput, setShowPinInput] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [expandedMeta, setExpandedMeta] = useState({});
+
+  async function send(q, pinToUse) {
+    setMessages((m) => [...m, { role: "user", content: q }]);
+    setBusy(true); setErr(null);
+    try {
+      const result = await callAI("chat", { pin: pinToUse, question: q, session_id: sessionId });
+      onPinChange(pinToUse);
+      setMessages((m) => [...m, {
+        role: "assistant", content: result.answer, confidence: result.confidence,
+        toolsUsed: result.toolsUsed, toolCallLog: result.toolCallLog, error: result.error,
+      }]);
+      setShowPinInput(false);
+    } catch (e) {
+      setErr(e.message);
+      if (e.message === "PIN incorrecto") onPinChange("");
+      setMessages((m) => m.slice(0, -1)); // el mensaje del usuario no se pudo responder, no lo dejamos huerfano en el hilo
+    } finally {
+      setBusy(false);
+      setPendingQuestion(null);
+    }
+  }
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    const q = input.trim();
+    if (!q) return;
+    setInput("");
+    if (pin) { send(q, pin); return; }
+    setPendingQuestion(q);
+    setShowPinInput(true);
+  }
+
+  function submitPin() {
+    if (!pinInput) return;
+    send(pendingQuestion, pinInput);
+  }
+
+  function newConversation() {
+    setSessionId(typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+    setMessages([]);
+    setErr(null);
+    setExpandedMeta({});
+  }
+
+  function toggleMeta(i) { setExpandedMeta((m) => ({ ...m, [i]: !m[i] })); }
+
+  const questionCount = messages.filter((m) => m.role === "user").length;
+
+  return (
+    <Panel title="Chat — profundiza con memoria de la conversación">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: MUTE }}>
+          {questionCount > 0 ? `${questionCount} pregunta${questionCount === 1 ? "" : "s"} en esta conversación` : "Sin mensajes todavía en esta conversación"}
+        </div>
+        <button onClick={newConversation} disabled={busy} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+          Nueva conversación
+        </button>
+      </div>
+
+      {messages.length > 0 && (
+        <div style={{ display: "grid", gap: 10, maxHeight: 440, overflowY: "auto", marginBottom: 16, paddingRight: 4 }}>
+          {messages.map((m, i) => {
+            if (m.role === "user") {
+              return (
+                <div key={i} style={{ alignSelf: "flex-end", marginLeft: "auto", maxWidth: "85%", background: PANEL, border: `1px solid ${LINE}`, borderRadius: 10, padding: "8px 12px", fontSize: 13 }}>
+                  {m.content}
+                </div>
+              );
+            }
+            const hadPartialOrError = m.toolCallLog?.some((t) => t.result?.status === "partial" || t.result?.status === "error");
+            return (
+              <div key={i} style={{ maxWidth: "90%", background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 14px" }}>
+                <FormattedAIText text={m.content} />
+                <button onClick={() => toggleMeta(i)} style={{ background: "none", border: "none", color: MUTE, fontSize: 10, cursor: "pointer", marginTop: 8, padding: 0 }}>
+                  {expandedMeta[i] ? "Ocultar detalle ▲" : "Ver detalle ▼"}
+                </button>
+                {expandedMeta[i] && (
+                  <div style={{ marginTop: 6, fontSize: 10, color: MUTE, display: "grid", gap: 4 }}>
+                    {m.confidence != null && <div>Confidence: {m.confidence}%</div>}
+                    {m.toolsUsed?.length > 0 && <div>Herramientas: {m.toolsUsed.map((t) => TOOL_LABELS[t] || t).join(", ")}</div>}
+                    {hadPartialOrError && <div style={{ color: AMBER }}>⚠️ Esta respuesta usó datos parciales o con algún fallo técnico.</div>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} style={{ display: "flex", gap: 8, marginBottom: showPinInput ? 12 : 0 }}>
+        <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Escribe para profundizar…" disabled={busy}
+          style={{ flex: 1, background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "10px 12px", fontSize: 13 }} />
+        <button type="submit" disabled={busy || !input.trim()} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          {busy ? "…" : "Enviar"}
+        </button>
+      </form>
+
+      {showPinInput && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginTop: 12, background: NAVY_BG, border: `1px solid ${GOLD}`, borderRadius: 8, padding: 12 }}>
+          <span style={{ fontSize: 12, color: MUTE }}>Desbloquea Moni AI (una vez por sesión):</span>
+          <input type="password" placeholder="Tu PIN" value={pinInput} onChange={(e) => setPinInput(e.target.value)}
+            style={{ background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 10px", fontSize: 12, width: 120 }} />
+          <button onClick={submitPin} disabled={busy || !pinInput} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            {busy ? "…" : "Confirmar"}
+          </button>
+        </div>
+      )}
+
+      {err && <div style={{ color: RED, fontSize: 12, marginTop: 10 }}>{err}</div>}
     </Panel>
   );
 }
