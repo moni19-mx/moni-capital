@@ -9,15 +9,15 @@
 // comportamiento exacto, un solo archivo. El frontend ahora manda
 // { resource: "positions"|"watchlist"|"thesis"|"cash"|"goal"|"journal"|
 //   "decisions"|"rebalance", ...resto del payload de siempre }.
- 
+
 import { createClient } from "@supabase/supabase-js";
 import { checkRateLimit, recordFailedAttempt } from "../lib/security.js";
- 
+
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
- 
+
 // Verifica PIN + rate limit. Si falla, ya responde el error y devuelve false
 // -- el handler que llama debe hacer `if (!(await requirePin(...))) return;`
 async function requirePin(res, pin) {
@@ -33,7 +33,7 @@ async function requirePin(res, pin) {
   }
   return true;
 }
- 
+
 async function handlePositions(req, res, body) {
   const { pin, action, position, id } = body;
   if (!(await requirePin(res, pin))) return;
@@ -57,6 +57,34 @@ async function handlePositions(req, res, body) {
     if (error) throw error;
     return res.status(200).json({ ok: true, data });
   }
+  if (action === "merge_buy") {
+    // Suma una compra nueva a una posicion que YA existe -- evita crear una
+    // fila duplicada por el mismo ticker (el bug que causo BTC/MSFT/ORCL
+    // duplicados). El servidor hace la suma, nunca el navegador, para que
+    // no haya dos calculos distintos si dos pestañas mandan la misma compra.
+    if (!id || !position || position.shares == null || position.cost_basis == null) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+    const { data: existing, error: findErr } = await supabase.from("positions").select("*").eq("id", id).maybeSingle();
+    if (findErr) throw findErr;
+    if (!existing) return res.status(404).json({ error: "position_not_found" });
+
+    const newShares = Number(existing.shares) + Number(position.shares);
+    const newCostBasis = Number(existing.cost_basis) + Number(position.cost_basis);
+    const { data, error } = await supabase.from("positions").update({ shares: newShares, cost_basis: newCostBasis }).eq("id", id).select();
+    if (error) throw error;
+
+    if (existing.type !== "cash") {
+      try {
+        await supabase.from("transactions").insert([{
+          date: new Date().toISOString().slice(0, 10), ticker: existing.ticker, type: "compra",
+          amount: -Math.abs(Number(position.cost_basis)), quantity: Number(position.shares),
+          notes: "Compra adicional sumada a posición existente desde Gestionar",
+        }]);
+      } catch (e) { /* no debe tumbar el guardado */ }
+    }
+    return res.status(200).json({ ok: true, data });
+  }
   if (action === "delete") {
     if (!id) return res.status(400).json({ error: "missing_id" });
     const { error } = await supabase.from("positions").delete().eq("id", id);
@@ -65,7 +93,7 @@ async function handlePositions(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function handleWatchlist(req, res, body) {
   const { pin, action, item, id } = body;
   if (!(await requirePin(res, pin))) return;
@@ -90,7 +118,7 @@ async function handleWatchlist(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function handleThesis(req, res, body) {
   const { pin, ticker, fields } = body;
   if (!(await requirePin(res, pin))) return;
@@ -108,7 +136,7 @@ async function handleThesis(req, res, body) {
     return res.status(200).json({ ok: true, data });
   }
 }
- 
+
 async function handleCash(req, res, body) {
   const { pin, action, movement, id } = body;
   if (!(await requirePin(res, pin))) return;
@@ -127,13 +155,13 @@ async function handleCash(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function clearOtherPrimaryGoals(exceptId) {
   let q = supabase.from("goals").update({ is_primary: false });
   if (exceptId) q = q.neq("id", exceptId);
   await q.eq("is_primary", true);
 }
- 
+
 async function handleGoal(req, res, body) {
   const { pin, action, goal, id } = body;
   if (!(await requirePin(res, pin))) return;
@@ -161,7 +189,7 @@ async function handleGoal(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function handleJournal(req, res, body) {
   const { pin, action, entry, id, outcome } = body;
   if (!(await requirePin(res, pin))) return;
@@ -191,7 +219,7 @@ async function handleJournal(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function handleDecisions(req, res, body) {
   const { action, signals, pin, id, status } = body;
   if (action === "sync") {
@@ -221,7 +249,7 @@ async function handleDecisions(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 async function handleRebalance(req, res, body) {
   const { pin, action, target, id } = body;
   if (!(await requirePin(res, pin))) return;
@@ -245,7 +273,7 @@ async function handleRebalance(req, res, body) {
   }
   return res.status(400).json({ error: "unknown_action" });
 }
- 
+
 const HANDLERS = {
   positions: handlePositions,
   watchlist: handleWatchlist,
@@ -256,7 +284,7 @@ const HANDLERS = {
   decisions: handleDecisions,
   rebalance: handleRebalance,
 };
- 
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "method_not_allowed" });
@@ -274,4 +302,3 @@ export default async function handler(req, res) {
     }
   }
 }
- 
