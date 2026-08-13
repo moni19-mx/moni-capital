@@ -3,17 +3,18 @@
 // Vercel Hobby rechazo el deployment por pasarse de 12 funciones -- ver
 // api/manage.js para el mismo patron aplicado a las escrituras).
 //
-// 4 acciones:
+// 5 acciones:
 // - chat: una pregunta, corre el tool-calling loop contra el proveedor
-//   activo (MONI_AI_PROVIDER), guarda el turno en ai_conversations.
+//   activo (con failover automatico si el proveedor primario falla por
+//   transporte), guarda el turno en ai_conversations y el uso en ai_usage.
 // - benchmark_question: UNA pregunta contra UN proveedor especifico, con
-//   herramientas REALES en vivo (Live Test). Se llama muchas veces desde
-//   el navegador, nunca todas dentro de una sola funcion de Vercel.
-// - controlled_question: la MISMA pregunta contra UN proveedor, pero
-//   usando un toolCallLog ya capturado en vez de ejecutar las
-//   herramientas de verdad -- asi los 3 modelos reciben exactamente los
-//   mismos datos y la comparacion mide solo razonamiento, no suerte con
-//   Finnhub/CoinGecko en el momento.
+//   herramientas REALES en vivo (Live Test).
+// - controlled_question: la MISMA pregunta contra UN proveedor, usando un
+//   toolCallLog ya capturado -- cero llamadas reales a Finnhub/CoinGecko/
+//   Supabase, solo al modelo.
+// - prune_conversations: borra turnos de ai_conversations mas viejos que
+//   N dias (default 30). Preparacion para cuando el chat este activo de
+//   verdad -- sin esto, la tabla crece sin limite.
 //
 // Regla que nunca cambia: el modelo NUNCA calcula un numero financiero.
 // Solo interpreta lo que devuelven las tools de lib/aiTools.js.
@@ -23,31 +24,31 @@ import { checkRateLimit, recordFailedAttempt } from "../lib/security.js";
 import { callModel } from "../lib/aiGateway.js";
 import { TOOL_DEFINITIONS, executeTool } from "../lib/aiTools.js";
 import { EVALUATION_SET_V1 } from "../lib/evaluationSet.js";
+import { estimateCostUSD } from "../lib/aiPricing.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const PROMPT_VERSION = "1.1";
+const PROMPT_VERSION = "1.1.1";
 
 const SYSTEM_PROMPT = `Eres Moni AI, el Chief Investment Officer del Family Office digital de tu unico cliente, llamado Moni Capital. (prompt v${PROMPT_VERSION})
 
 Reglas obligatorias:
 - Nunca inventas ni estimas un numero financiero. Todo dato sale de tus herramientas.
-- Cada herramienta devuelve status: "ok" | "not_found" | "error".
+- Cada herramienta devuelve status: "ok" | "partial" | "not_found" | "error".
+  - Si status es "ok": el dato esta completo, interpretalo con normalidad.
+  - Si status es "partial": el dato es real pero incompleto -- algunas posiciones no se pudieron consultar (revisa completeness.missingTickers y completeness.coveragePct). SIEMPRE menciona explícitamente que la información está incompleta antes de dar conclusiones basadas en ese numero. Nunca trates un total parcial como si fuera el total real.
   - Si status es "not_found": el dato genuinamente no existe. Di: "No tengo ese dato registrado todavía."
   - Si status es "error": fallo tecnico consultando el dato. Di: "No pude consultar ese dato en este momento." NUNCA lo disfraces de "no existe".
 - Nunca calculas tu mismo un numero que una herramienta ya calculo -- solo lo interpretas y lo priorizas.
+- Si dos herramientas se contradicen, señala la contradicción explícitamente y prioriza la fuente más específica y reciente sobre un agregado genérico.
 - Voz: CIO. Breve. Directo. Nunca digas "creo que", "podria ser", "tal vez", "te recomiendo que compres". Da observaciones directas ancladas en datos reales.
 - Maximo 3-4 frases por respuesta, salvo que te pidan explicitamente mas detalle.
 - Nunca te presentas como un modelo de lenguaje generico. Eres Moni AI.
 - Si te preguntan algo fuera del portafolio de tu cliente, redirige brevemente a tu proposito: analizar SU patrimonio.`;
 
-// executorFn: (name, input) => Promise<toolResultObject>
-// En Live Test es executeTool real (Capa 1 de verdad). En Controlled Test
-// es un reemplazo que busca en un toolCallLog ya capturado, para que los
-// 3 modelos vean exactamente los mismos datos.
 async function runQuestion(question, history, provider, executorFn) {
   const messages = [...history, { role: "user", content: question }];
   let finalText = null;
@@ -56,6 +57,8 @@ async function runQuestion(question, history, provider, executorFn) {
   const toolCallLog = [];
   const usageTotals = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   let lastMeta = null;
+  let fallbackUsed = false;
+  let originalProvider = null;
   const startedAt = Date.now();
   let errored = null;
 
@@ -70,6 +73,7 @@ async function runQuestion(question, history, provider, executorFn) {
         providerOverride: provider,
       });
       lastMeta = result.usage;
+      if (result.usage?.fallbackUsed) { fallbackUsed = true; originalProvider = result.usage.originalProvider; }
       usageTotals.inputTokens += result.usage.inputTokens || 0;
       usageTotals.outputTokens += result.usage.outputTokens || 0;
       usageTotals.totalTokens += result.usage.totalTokens || 0;
@@ -96,6 +100,7 @@ async function runQuestion(question, history, provider, executorFn) {
     finalText = "No pude terminar de procesar tu pregunta. Intenta de nuevo.";
   }
 
+  const finalProvider = fallbackUsed ? lastMeta?.provider : provider;
   return {
     answer: finalText,
     error: errored,
@@ -103,15 +108,12 @@ async function runQuestion(question, history, provider, executorFn) {
     toolCallLog,
     toolLoopIterations: loopGuard,
     latencyMs: Date.now() - startedAt,
-    usage: { ...usageTotals, model: lastMeta?.model, provider },
+    fallbackUsed,
+    originalProvider,
+    usage: { ...usageTotals, model: lastMeta?.model, provider: finalProvider || provider },
   };
 }
 
-// Reemplazo de executeTool para Controlled Test: busca en el log
-// capturado por nombre de herramienta, en orden (si se llama 2 veces la
-// misma tool, usa la siguiente entrada capturada). Si el modelo pide una
-// herramienta que no esta en el log capturado, se marca error explicito
-// -- nunca se inventa un resultado para esa herramienta.
 function makeControlledExecutor(capturedLog) {
   const remaining = {};
   (capturedLog || []).forEach((entry) => {
@@ -129,6 +131,32 @@ function makeControlledExecutor(capturedLog) {
 
 function liveExecutor(FINNHUB_KEY) {
   return (name, input) => executeTool(name, input, supabase, FINNHUB_KEY);
+}
+
+// Usage durable (revision critica pre-Sprint-1, punto 8): nunca depender
+// solo de logs efimeros de Vercel para investigar costos meses despues.
+async function logUsage({ sessionId, mode, result }) {
+  try {
+    const cost = estimateCostUSD(result.usage?.model, result.usage?.inputTokens, result.usage?.outputTokens);
+    await supabase.from("ai_usage").insert([{
+      session_id: sessionId || null,
+      provider: result.usage?.provider || null,
+      model: result.usage?.model || null,
+      input_tokens: result.usage?.inputTokens ?? null,
+      output_tokens: result.usage?.outputTokens ?? null,
+      total_tokens: result.usage?.totalTokens ?? null,
+      estimated_cost_usd: cost,
+      duration_ms: result.latencyMs ?? null,
+      tools_used: result.toolsUsed || [],
+      tool_loop_iterations: result.toolLoopIterations ?? null,
+      fallback_used: !!result.fallbackUsed,
+      success: !result.error,
+      error_code: result.error || null,
+      mode,
+    }]);
+  } catch (e) {
+    // el logging de uso nunca debe tumbar la respuesta ya generada
+  }
 }
 
 export default async function handler(req, res) {
@@ -168,6 +196,7 @@ export default async function handler(req, res) {
       }
 
       const result = await runQuestion(question, history, null, liveExecutor(FINNHUB_KEY));
+      await logUsage({ sessionId: session_id, mode: "chat", result });
 
       if (session_id && !result.error) {
         try {
@@ -184,25 +213,31 @@ export default async function handler(req, res) {
     if (resource === "benchmark_question") {
       const { provider, questionIndex } = req.body || {};
       if (!provider || questionIndex == null) return res.status(400).json({ error: "missing_fields" });
-      const question = EVALUATION_SET_V1[questionIndex];
-      if (!question) return res.status(400).json({ error: "invalid_question_index" });
+      const questionText = EVALUATION_SET_V1[questionIndex];
+      if (!questionText) return res.status(400).json({ error: "invalid_question_index" });
 
-      const r = await runQuestion(question, [], provider, liveExecutor(FINNHUB_KEY));
-      return res.status(200).json({ mode: "live", provider, question, questionIndex, ...r });
+      const r = await runQuestion(questionText, [], provider, liveExecutor(FINNHUB_KEY));
+      await logUsage({ sessionId: session_id, mode: "benchmark_live", result: r });
+      return res.status(200).json({ mode: "live", provider, question: questionText, questionIndex, ...r });
     }
 
     if (resource === "controlled_question") {
-      // CONTROLLED TEST / ADVERSARIAL TEST: la pregunta viene como texto
-      // directo (no como indice) para poder usar tanto el Evaluation Set
-      // v1 como preguntas adversariales nuevas que no estan en ese set.
-      // NUNCA toca Finnhub/CoinGecko/Supabase -- todo sale de capturedLog.
       const { provider, question: qText, capturedLog } = req.body || {};
       if (!provider || !qText || !Array.isArray(capturedLog)) {
         return res.status(400).json({ error: "missing_fields" });
       }
 
       const r = await runQuestion(qText, [], provider, makeControlledExecutor(capturedLog));
+      await logUsage({ sessionId: session_id, mode: "benchmark_controlled", result: r });
       return res.status(200).json({ mode: "controlled", provider, question: qText, ...r });
+    }
+
+    if (resource === "prune_conversations") {
+      const days = Number(req.body?.days) || 30;
+      const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+      const { data, error } = await supabase.from("ai_conversations").delete().lt("created_at", cutoff).select("id");
+      if (error) throw error;
+      return res.status(200).json({ ok: true, deleted: data?.length || 0, cutoff });
     }
 
     return res.status(400).json({ error: "unknown_resource" });
