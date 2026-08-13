@@ -583,7 +583,7 @@ export default function Dashboard() {
             }}>
               <Plus size={16} /> Agregar activo
             </button>
-            {showAdd && <AddForm onDone={() => { setShowAdd(false); loadAll(); }} />}
+            {showAdd && <AddForm onDone={() => { setShowAdd(false); loadAll(); }} existingPositions={enriched} />}
             <ManageTable rows={enriched} onDeleted={loadAll} />
           </Panel>
         )}
@@ -2773,16 +2773,46 @@ function TickerSearchInput({ value, onChange, onPick, placeholder }) {
   );
 }
 
-function AddForm({ onDone }) {
+function AddForm({ onDone, existingPositions }) {
   const [form, setForm] = useState({ ticker: "", name: "", type: "stock", sector: "", tema: "", strategic_role: "", shares: "", cost_basis: "", coingecko_id: "" });
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [duplicateMatch, setDuplicateMatch] = useState(null); // posicion existente encontrada, en espera de confirmacion
+  const [confirmedMerge, setConfirmedMerge] = useState(false);
 
-  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); }
+  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); setDuplicateMatch(null); setConfirmedMerge(false); }
 
   function pickResult(r) {
     setForm((f) => ({ ...f, ticker: r.ticker, name: r.name, type: r.type, coingecko_id: r.coingeckoId || "" }));
+    setDuplicateMatch(null); setConfirmedMerge(false);
+  }
+
+  async function doSubmit(mergeInto) {
+    setBusy(true);
+    try {
+      if (mergeInto) {
+        // Suma esta compra a la posicion existente -- el servidor hace la
+        // matematica, nunca el navegador (evita el bug de posiciones
+        // duplicadas que ya limpiamos en Supabase).
+        await managePosition({
+          pin, action: "merge_buy", id: mergeInto.id,
+          position: { shares: Number(form.shares), cost_basis: Number(form.cost_basis) },
+        });
+      } else {
+        await managePosition({
+          pin, action: "add",
+          position: {
+            ticker: form.ticker.toUpperCase(), name: form.name, type: form.type,
+            sector: form.sector || null, tema: form.tema || null, strategic_role: form.strategic_role || null,
+            shares: Number(form.shares), cost_basis: Number(form.cost_basis),
+            coingecko_id: form.coingecko_id || null,
+          },
+        });
+      }
+      onDone();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
   }
 
   async function submit(e) {
@@ -2791,22 +2821,62 @@ function AddForm({ onDone }) {
     if (!form.ticker || !form.name || !form.shares || !form.cost_basis) {
       setErr("Faltan campos obligatorios."); return;
     }
-    setBusy(true);
-    try {
-      await managePosition({
-        pin, action: "add",
-        position: {
-          ticker: form.ticker.toUpperCase(), name: form.name, type: form.type,
-          sector: form.sector || null, tema: form.tema || null, strategic_role: form.strategic_role || null,
-          shares: Number(form.shares), cost_basis: Number(form.cost_basis),
-          coingecko_id: form.coingecko_id || null,
-        },
-      });
-      onDone();
-    } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
+    if (!pin) { setErr("Falta tu PIN."); return; }
+
+    // Si ya confirmaste el merge en el paso anterior, procede directo.
+    if (confirmedMerge && duplicateMatch) { doSubmit(duplicateMatch); return; }
+
+    // Primera pasada: ¿ya tienes este ticker? No sometas nada todavia --
+    // muestra la vista previa y pide confirmacion explicita.
+    const match = (existingPositions || []).find((p) => p.ticker.toUpperCase() === form.ticker.toUpperCase() && p.type !== "cash");
+    if (match) { setDuplicateMatch(match); return; }
+
+    doSubmit(null);
   }
+
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  if (duplicateMatch && !confirmedMerge) {
+    const newShares = Number(duplicateMatch.shares) + Number(form.shares);
+    const newCost = Number(duplicateMatch.cost_basis) + Number(form.cost_basis);
+    return (
+      <div style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, borderRadius: 10, padding: 18, marginBottom: 24 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: GOLD, marginBottom: 10 }}>Ya tienes {duplicateMatch.ticker} — ¿es una compra adicional?</div>
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 14 }}>
+          Ya tienes <b style={{ color: TXT }}>{duplicateMatch.shares}</b> unidades con costo de <b style={{ color: TXT }}>{fmt$2(Number(duplicateMatch.cost_basis))}</b>.
+          Con esta compra nueva ({form.shares} unidades, {fmt$2(Number(form.cost_basis))}), quedaría en:
+          <br /><b style={{ color: GOLD }}>{newShares}</b> unidades, costo total <b style={{ color: GOLD }}>{fmt$2(newCost)}</b>.
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button type="button" onClick={() => setConfirmedMerge(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            Sí, sumar a mi posición existente
+          </button>
+          <button type="button" onClick={() => { setDuplicateMatch(null); }} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>
+            No, es un error / cancelar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (confirmedMerge && duplicateMatch) {
+    return (
+      <div style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, borderRadius: 10, padding: 18, marginBottom: 24 }}>
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 12 }}>Confirmado — sumando a tu posición existente de {duplicateMatch.ticker}.</div>
+        <div><label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label><input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} /></div>
+        <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <button onClick={() => doSubmit(duplicateMatch)} disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            {busy ? "Guardando…" : "Confirmar y guardar"}
+          </button>
+          <button type="button" onClick={() => { setConfirmedMerge(false); setDuplicateMatch(null); }} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>
+            Cancelar
+          </button>
+        </div>
+        {err && <div style={{ color: RED, fontSize: 12, marginTop: 10 }}>{err}</div>}
+      </div>
+    );
+  }
+
   return (
     <form onSubmit={submit} style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
       <div>
