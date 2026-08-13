@@ -1071,6 +1071,7 @@ function AskMoniAI({ pin, onPinChange, sessionId }) {
 
   const confidenceColor = answer?.confidence == null ? MUTE : answer.confidence >= 80 ? GREEN : answer.confidence >= 50 ? AMBER : RED;
   const hadPartialOrError = answer?.toolCallLog?.some((t) => t.result?.status === "partial" || t.result?.status === "error");
+  const hasExternalIdeas = answer?.answer?.includes("💡 Idea externa");
 
   return (
     <Panel title="Ask — pregúntale a tu patrimonio">
@@ -1125,6 +1126,12 @@ function AskMoniAI({ pin, onPinChange, sessionId }) {
 
           {hadPartialOrError && (
             <div style={{ fontSize: 11, color: AMBER, marginBottom: 10 }}>⚠️ Esta respuesta se basa en datos parciales o con algún fallo técnico — revisa el detalle abajo.</div>
+          )}
+
+          {hasExternalIdeas && (
+            <div style={{ fontSize: 11, color: "#B39DFF", marginBottom: 10, background: "#1A1530", border: "1px solid #B39DFF", borderRadius: 6, padding: "8px 10px" }}>
+              💡 Esta respuesta incluye ideas fuera de tu sistema — no son datos verificados de Moni Capital, son conocimiento general del modelo. Investígalas en <b>Discover</b> antes de considerarlas.
+            </div>
           )}
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
