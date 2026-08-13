@@ -3,10 +3,14 @@
 // Vercel Hobby rechazo el deployment por pasarse de 12 funciones -- ver
 // api/manage.js para el mismo patron aplicado a las escrituras).
 //
-// 5 acciones:
+// 6 acciones:
 // - chat: una pregunta, corre el tool-calling loop contra el proveedor
 //   activo (con failover automatico si el proveedor primario falla por
 //   transporte), guarda el turno en ai_conversations y el uso en ai_usage.
+// - generate_insight: genera un insight cacheado (hoy solo scope="today",
+//   el Daily Brief). Pide JSON estructurado de 4 secciones, calcula
+//   Confidence Score deterministico, guarda metadata completa, y poda el
+//   historial a los ultimos 30 por scope.
 // - benchmark_question: UNA pregunta contra UN proveedor especifico, con
 //   herramientas REALES en vivo (Live Test).
 // - controlled_question: la MISMA pregunta contra UN proveedor, usando un
@@ -49,7 +53,48 @@ Reglas obligatorias:
 - Nunca te presentas como un modelo de lenguaje generico. Eres Moni AI.
 - Si te preguntan algo fuera del portafolio de tu cliente, redirige brevemente a tu proposito: analizar SU patrimonio.`;
 
-async function runQuestion(question, history, provider, executorFn) {
+// System prompt dedicado para Daily Brief -- pide JSON estructurado en vez
+// de texto libre, porque el frontend necesita renderizar 4 secciones
+// distintas, no un parrafo.
+const DAILY_BRIEF_SYSTEM_PROMPT = `Eres Moni AI generando el Daily Brief de hoy para tu unico cliente en Moni Capital. (prompt v${PROMPT_VERSION})
+
+Usa las herramientas necesarias (get_portfolio_summary, get_strategy_status, get_decision_queue, get_system_health, get_recent_changes) para construir el resumen del dia.
+
+Responde UNICAMENTE con un objeto JSON, sin texto adicional, sin backticks de markdown, exactamente con esta forma:
+{
+  "estado_general": "1-2 frases sobre el estado general del patrimonio hoy",
+  "prioridad_del_dia": "1-2 frases sobre lo mas urgente a atender, o null si no hay nada urgente",
+  "que_cambio": "1-2 frases sobre que cambio desde la ultima visita, o null si no hay dato",
+  "accion_sugerida": "1-2 frases con una accion concreta sugerida, o null si no aplica"
+}
+
+Reglas obligatorias (identicas a Moni AI en cualquier otro contexto):
+- Nunca inventas ni estimas un numero financiero. Todo dato sale de tus herramientas.
+- Cada herramienta devuelve status: "ok" | "partial" | "not_found" | "error". Si es "partial", menciona la incompletitud en el campo correspondiente. Si es "error", di que no pudiste consultar ese dato -- nunca lo disfraces de "no existe".
+- Si dos herramientas se contradicen, señala la contradiccion y prioriza la fuente mas especifica.
+- Voz: CIO. Directo. Nunca "creo que", "podria ser", "te recomiendo que compres".
+- Si un campo no tiene informacion relevante, usa null -- nunca inventes contenido para llenarlo.`;
+
+// Confidence Score del Brief: 100% determinista (Capa 1), nunca se le
+// pregunta al modelo "que tan seguro estas". Se calcula a partir de los
+// status reales que devolvieron las tools durante esta generacion.
+function computeBriefConfidence(toolCallLog) {
+  if (!toolCallLog || toolCallLog.length === 0) return 100;
+  let score = 100;
+  for (const call of toolCallLog) {
+    const status = call.result?.status;
+    if (status === "error") {
+      score -= 20;
+    } else if (status === "partial") {
+      const coverage = call.result?.completeness?.coveragePct ?? 50;
+      score -= Math.round(30 * (1 - coverage / 100));
+    }
+    // "ok" y "not_found" no penalizan: not_found es un hecho real, no incertidumbre.
+  }
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+async function runQuestion(question, history, provider, executorFn, systemPrompt = SYSTEM_PROMPT) {
   const messages = [...history, { role: "user", content: question }];
   let finalText = null;
   let loopGuard = 0;
@@ -66,7 +111,7 @@ async function runQuestion(question, history, provider, executorFn) {
     while (finalText === null && loopGuard < 5) {
       loopGuard++;
       const result = await callModel({
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         messages,
         tools: TOOL_DEFINITIONS,
         authContext: { authenticated: true },
@@ -230,6 +275,62 @@ export default async function handler(req, res) {
       const r = await runQuestion(qText, [], provider, makeControlledExecutor(capturedLog));
       await logUsage({ sessionId: session_id, mode: "benchmark_controlled", result: r });
       return res.status(200).json({ mode: "controlled", provider, question: qText, ...r });
+    }
+
+    if (resource === "generate_insight") {
+      const { scope, hash } = req.body || {};
+      if (scope !== "today") return res.status(400).json({ error: "unsupported_scope" });
+      if (!hash) return res.status(400).json({ error: "missing_hash" });
+
+      const r = await runQuestion(
+        "Genera el Daily Brief de hoy.",
+        [],
+        null,
+        liveExecutor(FINNHUB_KEY),
+        DAILY_BRIEF_SYSTEM_PROMPT
+      );
+
+      let content;
+      try {
+        const cleaned = (r.answer || "").replace(/```json|```/g, "").trim();
+        content = JSON.parse(cleaned);
+      } catch (e) {
+        // Si el modelo no devolvio JSON valido, no inventamos secciones --
+        // se guarda como estado_general con el texto crudo, el resto null.
+        content = { estado_general: r.answer, prioridad_del_dia: null, que_cambio: null, accion_sugerida: null };
+      }
+
+      const confidence = computeBriefConfidence(r.toolCallLog);
+      const cost = estimateCostUSD(r.usage?.model, r.usage?.inputTokens, r.usage?.outputTokens);
+
+      const row = {
+        scope: "today",
+        content,
+        confidence,
+        based_on_hash: hash,
+        generated_at: new Date().toISOString(),
+        provider: r.usage?.provider || null,
+        model: r.usage?.model || null,
+        tools_used: r.toolsUsed || [],
+        input_tokens: r.usage?.inputTokens ?? null,
+        output_tokens: r.usage?.outputTokens ?? null,
+        estimated_cost_usd: cost,
+        duration_ms: r.latencyMs ?? null,
+      };
+
+      const { data: inserted, error: insertErr } = await supabase.from("ai_insights").insert([row]).select();
+      if (insertErr) throw insertErr;
+
+      // Historial de los ultimos 30 Daily Briefs -- se poda el resto.
+      const { data: allForScope } = await supabase.from("ai_insights").select("id").eq("scope", "today").order("generated_at", { ascending: false });
+      if (allForScope && allForScope.length > 30) {
+        const idsToDelete = allForScope.slice(30).map((r) => r.id);
+        await supabase.from("ai_insights").delete().in("id", idsToDelete);
+      }
+
+      await logUsage({ sessionId: session_id, mode: "daily_brief", result: r });
+
+      return res.status(200).json({ ok: true, insight: inserted?.[0] || row, error: r.error });
     }
 
     if (resource === "prune_conversations") {
