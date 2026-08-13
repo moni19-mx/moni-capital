@@ -11,6 +11,7 @@ import {
   get_thesis, get_watchlist, get_journal, get_decision_queue,
   get_portfolio_summary, TOOL_DEFINITIONS,
 } from "../lib/aiTools.js";
+import { ok, partial, notFound, toolError } from "../lib/toolResult.js";
 
 // --- Mock minimo de Supabase: soporta select/eq/order/limit encadenados,
 // y es "thenable" para que `await query` funcione igual que con el cliente real.
@@ -141,6 +142,32 @@ async function run() {
     const allValid = TOOL_DEFINITIONS.every((t) => t.name && t.description && t.input_schema);
     assert(allValid, "TOOL_DEFINITIONS: las 12 tools tienen definicion completa");
     assert(TOOL_DEFINITIONS.length === 12, `TOOL_DEFINITIONS: son 12 herramientas (encontradas: ${TOOL_DEFINITIONS.length})`);
+  }
+
+  // 11. Contrato de 4 estados (Architecture v1.1.1): cada helper produce la forma correcta.
+  // NOTA: get_portfolio_summary en estado "partial" real depende de
+  // fetchMarketForAI (red en vivo) y no se puede probar aqui sin inyeccion
+  // de dependencias -- se prueba la FORMA del contrato directamente contra
+  // los helpers de toolResult.js, que es lo que garantiza que ninguna tool
+  // pueda inventarse un shape distinto.
+  {
+    const okResult = ok({ x: 1 }, "computed");
+    assert(okResult.status === "ok" && okResult.data.x === 1 && okResult.completeness === undefined, "toolResult.ok: forma correcta, sin completeness");
+
+    const partialResult = partial({ x: 1 }, { coveragePct: 80, missingTickers: ["BTC"] }, "computed");
+    assert(partialResult.status === "partial", "toolResult.partial: status correcto");
+    assert(partialResult.completeness.coveragePct === 80, "toolResult.partial: coveragePct presente");
+    assert(partialResult.completeness.missingTickers.includes("BTC"), "toolResult.partial: missingTickers presente");
+    assert(partialResult.data.x === 1, "toolResult.partial: el dato real sigue disponible, no se oculta");
+
+    const notFoundResult = notFound("supabase");
+    assert(notFoundResult.status === "not_found" && notFoundResult.data === null, "toolResult.notFound: forma correcta, data null");
+
+    const errorResult = toolError("provider_timeout", "finnhub");
+    assert(errorResult.status === "error" && errorResult.errorCode === "provider_timeout", "toolResult.toolError: forma correcta, con errorCode");
+
+    const allStatuses = new Set([okResult.status, partialResult.status, notFoundResult.status, errorResult.status]);
+    assert(allStatuses.size === 4, "Contrato: los 4 estados son mutuamente distintos (ok/partial/not_found/error)");
   }
 
   console.log(`\n${passed} pasaron, ${failed} fallaron`);
