@@ -3,10 +3,13 @@
 // Vercel Hobby rechazo el deployment por pasarse de 12 funciones -- ver
 // api/manage.js para el mismo patron aplicado a las escrituras).
 //
-// 6 acciones:
+// 7 acciones:
 // - chat: una pregunta, corre el tool-calling loop contra el proveedor
 //   activo (con failover automatico si el proveedor primario falla por
 //   transporte), guarda el turno en ai_conversations y el uso en ai_usage.
+//   Incluye Confidence Score (mismo calculo que Daily Brief).
+// - save_insight: archiva una respuesta puntual de "Moni AI" (Ask) como
+//   insight persistido, scope="saved" -- distinto de scope="today".
 // - generate_insight: genera un insight cacheado (hoy solo scope="today",
 //   el Daily Brief). Pide JSON estructurado de 4 secciones, calcula
 //   Confidence Score deterministico, guarda metadata completa, y poda el
@@ -241,6 +244,7 @@ export default async function handler(req, res) {
       }
 
       const result = await runQuestion(question, history, null, liveExecutor(FINNHUB_KEY));
+      const confidence = computeBriefConfidence(result.toolCallLog);
       await logUsage({ sessionId: session_id, mode: "chat", result });
 
       if (session_id && !result.error) {
@@ -252,7 +256,43 @@ export default async function handler(req, res) {
         } catch (e) { /* no debe tumbar la respuesta ya generada */ }
       }
 
-      return res.status(200).json(result);
+      return res.status(200).json({ ...result, confidence });
+    }
+
+    if (resource === "save_insight") {
+      // Guarda una respuesta puntual de "Moni AI" (Ask) como insight
+      // persistido -- scope distinto a "today" (Daily Brief) para no
+      // mezclarlas. No corre el tool loop de nuevo, solo archiva lo que
+      // ya se genero y se le mostro al usuario.
+      const { question: qSaved, answer, confidence: savedConfidence, provider, model, toolsUsed, inputTokens, outputTokens, durationMs } = req.body || {};
+      if (!qSaved || !answer) return res.status(400).json({ error: "missing_fields" });
+
+      const cost = estimateCostUSD(model, inputTokens, outputTokens);
+      const row = {
+        scope: "saved",
+        content: { question: qSaved, answer },
+        confidence: savedConfidence ?? null,
+        based_on_hash: null,
+        generated_at: new Date().toISOString(),
+        provider: provider || null,
+        model: model || null,
+        tools_used: toolsUsed || [],
+        input_tokens: inputTokens ?? null,
+        output_tokens: outputTokens ?? null,
+        estimated_cost_usd: cost,
+        duration_ms: durationMs ?? null,
+      };
+
+      const { data: inserted, error: insertErr } = await supabase.from("ai_insights").insert([row]).select();
+      if (insertErr) throw insertErr;
+
+      const { data: allSaved } = await supabase.from("ai_insights").select("id").eq("scope", "saved").order("generated_at", { ascending: false });
+      if (allSaved && allSaved.length > 30) {
+        const idsToDelete = allSaved.slice(30).map((r) => r.id);
+        await supabase.from("ai_insights").delete().in("id", idsToDelete);
+      }
+
+      return res.status(200).json({ ok: true, insight: inserted?.[0] || row });
     }
 
     if (resource === "benchmark_question") {
