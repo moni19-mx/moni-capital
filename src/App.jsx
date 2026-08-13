@@ -95,6 +95,22 @@ async function callAI(resource, payload) {
 }
 
 async function generateInsight(payload) { return callAI("generate_insight", payload); }
+async function saveInsight(payload) { return callAI("save_insight", payload); }
+
+const TOOL_LABELS = {
+  get_portfolio_summary: "Portfolio Summary",
+  get_position: "Detalle de Posición",
+  get_thesis: "Investment Thesis",
+  get_opportunities: "Oportunidades",
+  get_strategy_status: "Estado de Estrategia",
+  get_recent_changes: "Cambios Recientes",
+  get_watchlist: "Watchlist",
+  get_journal: "Investment Journal",
+  get_wealth_summary: "Wealth Summary",
+  get_goal_status: "Estado de Meta",
+  get_system_health: "System Health",
+  get_decision_queue: "Decision Queue",
+};
 
 async function fetchMarketPulse() {
   const res = await fetch("/api/market-pulse");
@@ -122,6 +138,11 @@ export default function Dashboard() {
   const [decisions, setDecisions] = useState([]);
   const [rebalanceTargets, setRebalanceTargets] = useState([]);
   const [aiInsights, setAiInsights] = useState([]);
+  // Un solo desbloqueo por sesion para TODA la experiencia de Moni AI
+  // (Daily Brief + Ask), no por componente -- vive aqui arriba para
+  // sobrevivir cambios de pestaña.
+  const [aiPin, setAiPin] = useState("");
+  const aiSessionIdRef = useRef(typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
@@ -420,7 +441,7 @@ export default function Dashboard() {
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["command", "Command Center"], ["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+          {[["command", "Command Center"], ["moniai", "Moni AI"], ["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -457,14 +478,25 @@ export default function Dashboard() {
           />
         )}
 
+        {tab === "moniai" && (
+          <MoniAITab
+            latestInsight={latestInsight} insightIsFresh={insightIsFresh} hash={dailyBriefHash}
+            history={aiInsights} onGenerated={loadAll}
+            pin={aiPin} onPinChange={setAiPin} sessionId={aiSessionIdRef.current}
+          />
+        )}
+
         {tab === "resumen" && (
           <div style={{ display: "grid", gap: 14 }}>
             <TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} />
 
-            <DailyBriefCard
-              latestInsight={latestInsight} insightIsFresh={insightIsFresh} hash={dailyBriefHash}
-              history={aiInsights} onGenerated={loadAll}
-            />
+            <div style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <div style={{ fontSize: 12 }}>
+                <b style={{ color: GOLD }}>Moni AI</b>{" "}
+                {latestInsight?.content?.estado_general ? latestInsight.content.estado_general : "Tu Daily Brief y consultas en vivo viven en una sola pantalla."}
+              </div>
+              <button onClick={() => setTab("moniai")} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Abrir Moni AI →</button>
+            </div>
 
             <MarketPulseRow pulse={marketPulse} />
 
@@ -859,23 +891,29 @@ function timeAgo(iso) {
   return `hace ${Math.floor(hrs / 24)}d`;
 }
 
-function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenerated }) {
-  const [pin, setPin] = useState("");
+function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenerated, pin, onPinChange }) {
+  const [pinInput, setPinInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showPinInput, setShowPinInput] = useState(false);
 
-  async function handleGenerate() {
-    if (!pin) return;
+  async function handleGenerate(pinToUse) {
     setBusy(true); setErr(null);
     try {
-      await generateInsight({ pin, scope: "today", hash });
+      await generateInsight({ pin: pinToUse, scope: "today", hash });
+      onPinChange(pinToUse); // desbloqueo unico por sesion -- se reusa en Ask y en la proxima vez
       setShowPinInput(false);
-      setPin("");
-      onGenerated(); // async, no bloquea el resto de TODAY -- solo esta tarjeta muestra su propio spinner
-    } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
+      onGenerated(); // async, no bloquea el resto de la pantalla -- solo esta tarjeta muestra su propio spinner
+    } catch (e) {
+      setErr(e.message);
+      if (e.message === "PIN incorrecto") onPinChange("");
+    } finally { setBusy(false); }
+  }
+
+  function handleClick() {
+    if (pin) { handleGenerate(pin); return; }
+    setShowPinInput(true);
   }
 
   const content = latestInsight?.content || null;
@@ -886,7 +924,7 @@ function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenera
     <div style={{ background: "#151129", border: `1px solid ${GOLD}`, borderRadius: 12, padding: "16px 20px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10, marginBottom: content ? 12 : 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 10, color: GOLD, letterSpacing: 1, fontWeight: 700 }}>MONI AI — DAILY BRIEF</span>
+          <span style={{ fontSize: 10, color: GOLD, letterSpacing: 1, fontWeight: 700 }}>DAILY BRIEF</span>
           {content && <span style={{ fontSize: 10, color: MUTE }}>{timeAgo(latestInsight.generated_at)}</span>}
         </div>
         {confidence != null && content && (
@@ -913,20 +951,20 @@ function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenera
 
       {showPinInput ? (
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          <input type="password" placeholder="Tu PIN" value={pin} onChange={(e) => setPin(e.target.value)}
+          <input type="password" placeholder="Tu PIN" value={pinInput} onChange={(e) => setPinInput(e.target.value)}
             style={{ background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 10px", fontSize: 12, width: 120 }} />
-          <button onClick={handleGenerate} disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+          <button onClick={() => handleGenerate(pinInput)} disabled={busy || !pinInput} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
             {busy ? "Generando…" : "Confirmar"}
           </button>
           <button onClick={() => setShowPinInput(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Cancelar</button>
         </div>
       ) : (
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
-          <button onClick={() => setShowPinInput(true)} style={{
+          <button onClick={handleClick} disabled={busy} style={{
             background: content ? "none" : GOLD, color: content ? GOLD : "#1A1305", border: `1px solid ${GOLD}`,
             borderRadius: 6, padding: "8px 16px", fontWeight: 700, fontSize: 12, cursor: "pointer",
           }}>
-            {content ? "Actualizar" : "Generar Daily Brief"}
+            {busy ? "Generando…" : content ? "Actualizar" : "Generar Daily Brief"}
           </button>
           {history.length > 1 && (
             <button onClick={() => setShowHistory((s) => !s)} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>
@@ -949,6 +987,173 @@ function DailyBriefCard({ latestInsight, insightIsFresh, hash, history, onGenera
         </div>
       )}
     </div>
+  );
+}
+
+// La experiencia completa de Moni AI: Daily Brief arriba (apertura) +
+// Ask abajo (consulta) -- un solo punto de entrada, un solo desbloqueo.
+function MoniAITab({ latestInsight, insightIsFresh, hash, history, onGenerated, pin, onPinChange, sessionId }) {
+  return (
+    <div style={{ display: "grid", gap: 20 }}>
+      <DailyBriefCard
+        latestInsight={latestInsight} insightIsFresh={insightIsFresh} hash={hash}
+        history={history} onGenerated={onGenerated} pin={pin} onPinChange={onPinChange}
+      />
+      <AskMoniAI pin={pin} onPinChange={onPinChange} sessionId={sessionId} />
+    </div>
+  );
+}
+
+const QUICK_ACTIONS = [
+  { icon: "📊", label: "Resumen rápido", question: "Dame un resumen rápido de mi patrimonio." },
+  { icon: "⚠️", label: "Mi mayor riesgo", question: "¿Cuál es mi mayor riesgo ahora mismo?" },
+  { icon: "✅", label: "Decisiones pendientes", question: "¿Qué decisiones tengo pendientes?" },
+  { icon: "💡", label: "Oportunidades", question: "¿Qué oportunidades existen dentro de mi cartera?" },
+];
+
+const SUGGESTED_QUESTIONS = [
+  "¿Cómo voy contra mi meta principal?",
+  "¿Qué cambió desde mi última visita?",
+  "¿Por qué compré Oracle?",
+  "¿Qué posiciones tienen tesis desactualizada?",
+];
+
+function AskMoniAI({ pin, onPinChange, sessionId }) {
+  const [pinInput, setPinInput] = useState("");
+  const [showPinInput, setShowPinInput] = useState(false);
+  const [question, setQuestion] = useState("");
+  const [pendingQuestion, setPendingQuestion] = useState(null);
+  const [answer, setAnswer] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [saveStatus, setSaveStatus] = useState(null); // null | "saving" | "saved"
+
+  async function ask(q, pinToUse) {
+    setBusy(true); setErr(null); setSaveStatus(null);
+    try {
+      const result = await callAI("chat", { pin: pinToUse, question: q, session_id: sessionId });
+      onPinChange(pinToUse);
+      setAnswer({ question: q, ...result });
+      setShowPinInput(false);
+    } catch (e) {
+      setErr(e.message);
+      if (e.message === "PIN incorrecto") onPinChange("");
+    } finally {
+      setBusy(false);
+      setPendingQuestion(null);
+    }
+  }
+
+  function trigger(q) {
+    setQuestion(q);
+    if (pin) { ask(q, pin); return; }
+    setPendingQuestion(q);
+    setShowPinInput(true);
+  }
+
+  function submitPin() {
+    if (!pinInput) return;
+    ask(pendingQuestion || question, pinInput);
+  }
+
+  async function handleSave() {
+    if (!answer) return;
+    setSaveStatus("saving");
+    try {
+      await saveInsight({
+        pin, question: answer.question, answer: answer.answer, confidence: answer.confidence,
+        provider: answer.usage?.provider, model: answer.usage?.model, toolsUsed: answer.toolsUsed,
+        inputTokens: answer.usage?.inputTokens, outputTokens: answer.usage?.outputTokens, durationMs: answer.latencyMs,
+      });
+      setSaveStatus("saved");
+    } catch (e) { setSaveStatus(null); setErr(e.message); }
+  }
+
+  const confidenceColor = answer?.confidence == null ? MUTE : answer.confidence >= 80 ? GREEN : answer.confidence >= 50 ? AMBER : RED;
+  const hadPartialOrError = answer?.toolCallLog?.some((t) => t.result?.status === "partial" || t.result?.status === "error");
+
+  return (
+    <Panel title="Ask — pregúntale a tu patrimonio">
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 10, color: MUTE, marginBottom: 8, letterSpacing: 0.5 }}>QUICK ACTIONS</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {QUICK_ACTIONS.map((qa) => (
+            <button key={qa.label} onClick={() => trigger(qa.question)} disabled={busy} style={{
+              background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "8px 14px",
+              fontSize: 12, fontWeight: 700, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+            }}>{qa.icon} {qa.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 10, color: MUTE, marginBottom: 8, letterSpacing: 0.5 }}>PREGUNTAS SUGERIDAS</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {SUGGESTED_QUESTIONS.map((q) => (
+            <button key={q} onClick={() => setQuestion(q)} disabled={busy} style={{
+              background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "8px 12px", fontSize: 12, cursor: "pointer",
+            }}>{q}</button>
+          ))}
+        </div>
+      </div>
+
+      <form onSubmit={(e) => { e.preventDefault(); if (question.trim()) trigger(question.trim()); }} style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Escribe tu pregunta…" disabled={busy}
+          style={{ flex: 1, background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 8, padding: "10px 12px", fontSize: 13 }} />
+        <button type="submit" disabled={busy || !question.trim()} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          {busy ? "Preguntando…" : "Preguntar"}
+        </button>
+      </form>
+
+      {showPinInput && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 16, background: NAVY_BG, border: `1px solid ${GOLD}`, borderRadius: 8, padding: 12 }}>
+          <span style={{ fontSize: 12, color: MUTE }}>Desbloquea Moni AI (una vez por sesión):</span>
+          <input type="password" placeholder="Tu PIN" value={pinInput} onChange={(e) => setPinInput(e.target.value)}
+            style={{ background: PANEL, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "6px 10px", fontSize: 12, width: 120 }} />
+          <button onClick={submitPin} disabled={busy || !pinInput} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "6px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            {busy ? "…" : "Confirmar"}
+          </button>
+        </div>
+      )}
+
+      {err && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{err}</div>}
+
+      {answer && (
+        <div style={{ background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 16 }}>
+          <div style={{ fontSize: 11, color: MUTE, marginBottom: 8 }}>{answer.question}</div>
+          <div style={{ fontSize: 14, marginBottom: 12 }}>{answer.answer}</div>
+
+          {hadPartialOrError && (
+            <div style={{ fontSize: 11, color: AMBER, marginBottom: 10 }}>⚠️ Esta respuesta se basa en datos parciales o con algún fallo técnico — revisa el detalle abajo.</div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {(answer.toolsUsed || []).map((t, i) => (
+                <span key={i} style={{ fontSize: 9, color: MUTE, border: `1px solid ${LINE}`, borderRadius: 4, padding: "2px 6px" }}>
+                  {TOOL_LABELS[t] || t}
+                </span>
+              ))}
+            </div>
+            {answer.confidence != null && (
+              <span style={{ fontSize: 10, color: confidenceColor, border: `1px solid ${confidenceColor}`, borderRadius: 4, padding: "2px 8px" }}>
+                Confidence {answer.confidence}%
+              </span>
+            )}
+          </div>
+
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${LINE}` }}>
+            {saveStatus === "saved" ? (
+              <span style={{ fontSize: 11, color: GREEN }}>✓ Guardado como Insight</span>
+            ) : (
+              <button onClick={handleSave} disabled={saveStatus === "saving"} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer" }}>
+                {saveStatus === "saving" ? "Guardando…" : "Guardar como Insight"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </Panel>
   );
 }
 
