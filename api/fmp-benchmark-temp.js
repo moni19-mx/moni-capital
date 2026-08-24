@@ -142,14 +142,16 @@ function pctDiff(a, b) {
 
 const CONFLICT_THRESHOLDS = { price: 2, marketCap: 15, pe: 15 };
 
+export const config = { maxDuration: 60 };
+
 export default async function handler(req, res) {
-  const { pin, ticker, assetType } = req.query || {};
+  const { pin, tickers, cryptoTickers } = req.query || {};
 
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
   }
-  if (!ticker || !assetType || !["stock", "crypto"].includes(assetType)) {
-    return res.status(400).json({ error: "missing_or_invalid_params", detail: "usa ?ticker=X&assetType=stock|crypto" });
+  if (!tickers && !cryptoTickers) {
+    return res.status(400).json({ error: "missing_params", detail: "usa ?tickers=MSFT,AMZN,...&cryptoTickers=BTCUSD,ETHUSD,..." });
   }
 
   const FMP_KEY = process.env.FMP_API_KEY;
@@ -157,6 +159,23 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "missing_fmp_key_in_vercel_env" });
   }
 
+  const stockList = tickers ? tickers.split(",").map((t) => t.trim()).filter(Boolean) : [];
+  const cryptoList = cryptoTickers ? cryptoTickers.split(",").map((t) => t.trim()).filter(Boolean) : [];
+  const summary = [];
+
+  for (const ticker of stockList) {
+    const result = await runOneTicker(FMP_KEY, ticker, "stock");
+    summary.push(result);
+  }
+  for (const ticker of cryptoList) {
+    const result = await runOneTicker(FMP_KEY, ticker, "crypto");
+    summary.push(result);
+  }
+
+  return res.status(200).json({ ok: true, processed: summary.length, summary });
+}
+
+async function runOneTicker(FMP_KEY, ticker, assetType) {
   const endpoints = assetType === "stock" ? STOCK_ENDPOINTS : CRYPTO_ENDPOINTS;
   const rows = [];
 
@@ -183,19 +202,15 @@ export default async function handler(req, res) {
 
   const { error: insertErr } = await supabase.from("fmp_benchmark_results").insert(rows);
   if (insertErr) {
-    return res.status(500).json({ error: "supabase_insert_failed", detail: insertErr.message });
+    return { ticker, asset_type: assetType, ok: false, error: insertErr.message };
   }
 
-  // Cross-check con Finnhub solo para stocks (Finnhub no cubre nuestros
-  // simbolos crypto con FMP-style BTCUSD).
   let conflictCount = 0;
   if (assetType === "stock") {
     const quoteRow = rows.find((r) => r.endpoint_name === "quote");
     if (quoteRow && quoteRow.classification === "AVAILABLE") {
       const fh = await crossCheckFinnhub(ticker);
       if (fh) {
-        // Necesitamos el valor real de FMP, no solo su clasificacion --
-        // hacemos una segunda lectura ligera del quote ya confirmado.
         const fmpResp = await fetch(`${FMP_BASE}/quote?symbol=${ticker}&apikey=${FMP_KEY}`);
         const fmpData = await fmpResp.json();
         const fmpQuote = Array.isArray(fmpData) ? fmpData[0] : fmpData;
@@ -228,11 +243,5 @@ export default async function handler(req, res) {
     }
   }
 
-  return res.status(200).json({
-    ok: true,
-    ticker,
-    asset_type: assetType,
-    rows_inserted: rows.length,
-    conflicts_found: conflictCount,
-  });
+  return { ticker, asset_type: assetType, ok: true, rows_inserted: rows.length, conflicts_found: conflictCount };
 }
