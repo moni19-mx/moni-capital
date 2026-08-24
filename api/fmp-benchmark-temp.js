@@ -79,8 +79,8 @@ async function testEndpoint(FMP_KEY, ticker, assetType, endpointDef) {
 
   const latencyMs = Date.now() - startedAt;
 
-  if (resp.status === 401 || resp.status === 403) {
-    return { classification: "PLAN_BLOCKED", httpStatus: resp.status, recordCount: 0, latestDate: null, latencyMs, note: "http_401_403" };
+  if (resp.status === 401 || resp.status === 403 || resp.status === 402) {
+    return { classification: "PLAN_BLOCKED", httpStatus: resp.status, recordCount: 0, latestDate: null, latencyMs, note: `http_${resp.status}` };
   }
   if (resp.status === 429) {
     return { classification: "ERROR", httpStatus: 429, recordCount: null, latestDate: null, latencyMs, note: "rate_limited" };
