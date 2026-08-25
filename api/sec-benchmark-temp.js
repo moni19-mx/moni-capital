@@ -83,7 +83,8 @@ function extractAnnualSeries(conceptJson) {
   const units = conceptJson?.units || {};
   const unitKey = Object.keys(units)[0]; // USD, USD/shares, etc.
   if (!unitKey) return [];
-  const entries = units[unitKey] || [];
+  const entries = units[unitKey];
+  if (!Array.isArray(entries)) return []; // forma inesperada -- no inventamos datos, devolvemos vacio
   const annual = entries.filter((e) => e.form === "10-K" && e.fp === "FY");
   const source = annual.length > 0 ? annual : entries;
 
@@ -181,13 +182,19 @@ export default async function handler(req, res) {
         summary.push({ ticker, ok: false, error: "cik_not_found" });
         continue;
       }
-      const rows = await processTicker(ticker, cikPadded);
-      const { error: insertErr } = await supabase.from("sec_financials").insert(rows);
-      if (insertErr) {
-        summary.push({ ticker, ok: false, error: insertErr.message });
-        continue;
+      try {
+        const rows = await processTicker(ticker, cikPadded);
+        const { error: insertErr } = await supabase.from("sec_financials").insert(rows);
+        if (insertErr) {
+          summary.push({ ticker, ok: false, error: insertErr.message });
+          continue;
+        }
+        summary.push({ ticker, ok: true, cik: cikPadded, rows_inserted: rows.length });
+      } catch (tickerErr) {
+        // Un fallo en un ticker no debe tumbar el resto del batch --
+        // los resultados de los tickers anteriores ya se guardaron.
+        summary.push({ ticker, ok: false, error: String(tickerErr.message || tickerErr) });
       }
-      summary.push({ ticker, ok: true, cik: cikPadded, rows_inserted: rows.length });
     }
 
     return res.status(200).json({ ok: true, processed: summary.length, summary });
