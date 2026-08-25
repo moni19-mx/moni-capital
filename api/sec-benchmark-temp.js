@@ -4,27 +4,19 @@
 // Capital. No lo importa ningun otro archivo. Se borra de este repo
 // cuando terminemos de decidir arquitectura de datos.
 //
-// A diferencia de FMP/Finnhub, SEC EDGAR es 100% publico y no requiere
-// ninguna API key -- solo un User-Agent con contacto real, que es un
-// requisito de identificacion, no un secreto.
+// V2: capa de normalizacion Raw XBRL Tag -> Canonical Financial Concept.
+// NO hace keyword-matching libre sobre nombres de tags -- usa una lista
+// priorizada y curada de tags XBRL conocidos y semanticamente validos
+// por concepto. Cuando varios tags candidatos tienen datos, se elige
+// por recencia + cobertura + continuidad (nunca por prioridad ciega),
+// porque el problema real (confirmado en el benchmark V1) es que
+// compañias distintas migran de tag con el tiempo -- el tag "preferido"
+// en teoria puede estar obsoleto en la practica para un emisor dado.
 //
-// Uso: GET /api/sec-benchmark-temp?pin=TU_PIN&tickers=ANET,VRT,ALAB,...
-//   Los tickers van separados por coma. Cada uno necesita su CIK -- se
-//   resuelven automaticamente contra el mapa oficial de SEC.
-//
-// Extrae 6 conceptos XBRL por ticker (los mas confiables entre distintas
-// empresas, con nombres de tag alternativos por si una compania usa una
-// variante distinta):
-//   - Revenue (Revenues / RevenueFromContractWithCustomerExcludingAssessedTax)
-//   - EPS diluido (EarningsPerShareDiluted)
-//   - Net income (NetIncomeLoss)
-//   - Operating income (OperatingIncomeLoss)
-//   - Cash flow operativo (NetCashProvidedByUsedInOperatingActivities)
-//   - CapEx (PaymentsToAcquirePropertyPlantAndEquipment)
-//
-// Con Revenue + NetIncome + OperatingIncome se puede derivar net/operating
-// margin (division simple, Capa 1 -- no es interpretacion de IA). Con
-// CashFlowOperativo - CapEx se deriva Free Cash Flow.
+// Si ningun candidato tiene datos utilizables: DATA_UNAVAILABLE. Si dos
+// candidatos tienen datos recientes pero con valores materialmente
+// distintos para el mismo periodo: se guarda con confidence LOW y se
+// registra la ambiguedad explicitamente -- nunca se elige en silencio.
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -37,19 +29,47 @@ const SEC_HEADERS = {
   "User-Agent": "MoniCapital-Diagnostic contacto@moni-capital-diagnostic.local",
 };
 
-const REQUEST_DELAY_MS = 150; // SEC permite hasta 10 req/s; nos quedamos bien debajo
+const REQUEST_DELAY_MS = 120;
+const MAX_POINTS_STORED = 5;
+const FRESH_DAYS_HIGH = 550;   // ~18 meses -- cubre el rezago normal entre fiscal year-end y 10-K
+const FRESH_DAYS_MEDIUM = 730; // ~24 meses
+const AMBIGUITY_THRESHOLD_PCT = 5; // % de diferencia entre tags candidatos en el mismo periodo
 
-const CONCEPTS = [
-  { tag: "Revenues", altTag: "RevenueFromContractWithCustomerExcludingAssessedTax", label: "revenue" },
-  { tag: "EarningsPerShareDiluted", altTag: null, label: "eps_diluted" },
-  { tag: "NetIncomeLoss", altTag: null, label: "net_income" },
-  { tag: "OperatingIncomeLoss", altTag: null, label: "operating_income" },
-  { tag: "NetCashProvidedByUsedInOperatingActivities", altTag: null, label: "operating_cash_flow" },
-  { tag: "PaymentsToAcquirePropertyPlantAndEquipment", altTag: null, label: "capex" },
-];
+// Listas priorizadas de tags XBRL conocidos y semanticamente validos por
+// concepto canonico. El orden es una preferencia inicial, NO una regla
+// ciega -- el resolver puede elegir un tag de menor prioridad si tiene
+// mejor recencia/cobertura real para ese emisor especifico.
+const CANDIDATE_TAGS = {
+  REVENUE: [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+  ],
+  NET_INCOME: ["NetIncomeLoss", "ProfitLoss"],
+  OPERATING_INCOME: ["OperatingIncomeLoss"],
+  OPERATING_CASH_FLOW: [
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+  ],
+  CAPEX: [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsForCapitalImprovements",
+    "PaymentsToAcquireProductiveAssets",
+  ],
+};
+
+// FREE_CASH_FLOW no tiene tags candidatos -- se calcula siempre como
+// OPERATING_CASH_FLOW - CAPEX, nunca se busca un tag "FreeCashFlow".
+const CANONICAL_CONCEPTS = Object.keys(CANDIDATE_TAGS);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function daysBetween(a, b) {
+  if (!a || !b) return null;
+  return Math.round((new Date(b) - new Date(a)) / 86400000);
 }
 
 async function getCikMap() {
@@ -76,29 +96,18 @@ async function fetchConcept(cikPadded, tag) {
   }
 }
 
-// Nos quedamos con el valor mas reciente de tipo 10-K anual (FY), que es
-// el mas comparable entre companias. Si no hay 10-K, tomamos el ultimo
-// valor disponible de cualquier forma.
-function daysBetween(startStr, endStr) {
-  if (!startStr || !endStr) return null;
-  const start = new Date(startStr);
-  const end = new Date(endStr);
-  return Math.round((end - start) / 86400000);
-}
-
-function extractAnnualSeries(conceptJson) {
+// Extrae la serie anual real de un tag (deteccion por duracion del
+// periodo ~365 dias, no por el campo `fp` -- resulto no ser confiable
+// entre distintos emisores en el benchmark V1). Devuelve TODOS los
+// puntos anuales encontrados (no solo 5), para poder evaluar cobertura
+// y continuidad reales antes de decidir si este tag es el ganador.
+function extractAnnualPoints(conceptJson) {
   const units = conceptJson?.units || {};
-  const unitKey = Object.keys(units)[0]; // USD, USD/shares, etc.
-  if (!unitKey) return { points: [], reason: "no_units_in_response" };
+  const unitKey = Object.keys(units)[0];
+  if (!unitKey) return [];
   const entries = units[unitKey];
-  if (!Array.isArray(entries)) return { points: [], reason: "unexpected_units_shape" };
-  if (entries.length === 0) return { points: [], reason: "empty_entries_array" };
+  if (!Array.isArray(entries) || entries.length === 0) return [];
 
-  // Deteccion de periodo anual por DURACION real (start a end ~365 dias),
-  // en vez de confiar en el campo `fp` -- resulto no ser consistente
-  // entre emisores (algunas companias no lo taguean como "FY" aunque el
-  // reporte si sea anual). Instant values (EPS, algunos totales) no
-  // tienen `start`, asi que para esos usamos form === "10-K" como filtro.
   const annual = entries.filter((e) => {
     if (e.start && e.end) {
       const dur = daysBetween(e.start, e.end);
@@ -106,17 +115,15 @@ function extractAnnualSeries(conceptJson) {
     }
     return e.form === "10-K";
   });
-  const source = annual.length > 0 ? annual : entries;
-  const usedFallback = annual.length === 0;
+  if (annual.length === 0) return [];
 
   const byEnd = {};
-  source.forEach((e) => {
+  annual.forEach((e) => {
     if (!byEnd[e.end] || e.filed > byEnd[e.end].filed) byEnd[e.end] = e;
   });
 
-  const points = Object.values(byEnd)
+  return Object.values(byEnd)
     .sort((a, b) => (a.end < b.end ? 1 : -1))
-    .slice(0, 5)
     .map((e) => ({
       value: e.val,
       unit: unitKey,
@@ -124,83 +131,200 @@ function extractAnnualSeries(conceptJson) {
       filed_date: e.filed,
       period_end: e.end,
       fiscal_year: e.fy,
-      fiscal_period: e.fp,
+      accession_number: e.accn || null,
     }));
+}
 
-  return { points, reason: usedFallback ? "no_clean_annual_period_found_used_fallback" : null };
+// Evalua un candidato: recencia del punto mas reciente, cobertura
+// (cuantos puntos anuales tiene), continuidad (cuantos de esos puntos
+// son años consecutivos reales, no con huecos grandes).
+function scoreCandidate(points) {
+  if (points.length === 0) return null;
+  const mostRecent = points[0];
+  const recencyDays = daysBetween(mostRecent.period_end, new Date().toISOString().slice(0, 10));
+  let continuity = 1;
+  for (let i = 0; i < points.length - 1; i++) {
+    const gap = daysBetween(points[i + 1].period_end, points[i].period_end);
+    if (gap != null && gap >= 330 && gap <= 400) continuity++;
+    else break;
+  }
+  const form10K = points.filter((p) => p.form === "10-K").length;
+  return { recencyDays, coverage: points.length, continuity, form10K, mostRecent };
+}
+
+function computeConfidence(score) {
+  if (!score) return null;
+  if (score.recencyDays <= FRESH_DAYS_HIGH && score.coverage >= 3 && score.continuity >= 3 && score.form10K >= score.coverage - 1) {
+    return "HIGH";
+  }
+  if (score.recencyDays <= FRESH_DAYS_MEDIUM && score.coverage >= 2) {
+    return "MEDIUM";
+  }
+  return "LOW";
+}
+
+// Resuelve un concepto canonico para un ticker: prueba todos los tags
+// candidatos, evalua cada uno, y selecciona por recencia+cobertura+
+// continuidad -- nunca por prioridad ciega. Detecta ambiguedad cuando
+// dos tags tienen valores materialmente distintos en el mismo periodo.
+async function resolveConcept(cikPadded, canonicalConcept) {
+  const tags = CANDIDATE_TAGS[canonicalConcept];
+  const candidates = [];
+
+  for (const tag of tags) {
+    const result = await fetchConcept(cikPadded, tag);
+    await sleep(REQUEST_DELAY_MS);
+    if (result.data) {
+      const points = extractAnnualPoints(result.data);
+      if (points.length > 0) {
+        candidates.push({ tag, points, score: scoreCandidate(points) });
+      }
+    }
+  }
+
+  if (candidates.length === 0) {
+    return { status: "DATA_UNAVAILABLE", reason: "no_candidate_tag_had_usable_annual_data" };
+  }
+
+  // Ranking: recencia primero (freshest wins), luego cobertura, luego
+  // el orden de la lista priorizada como desempate final.
+  candidates.sort((a, b) => {
+    if (a.score.recencyDays !== b.score.recencyDays) return a.score.recencyDays - b.score.recencyDays;
+    if (a.score.coverage !== b.score.coverage) return b.score.coverage - a.score.coverage;
+    return tags.indexOf(a.tag) - tags.indexOf(b.tag);
+  });
+
+  const winner = candidates[0];
+  const confidence = computeConfidence(winner.score);
+
+  // Deteccion de ambiguedad: algun otro candidato tiene un valor para
+  // el MISMO period_end mas reciente, con diferencia material.
+  let ambiguityNote = null;
+  const winnerLatest = winner.points[0];
+  for (const other of candidates.slice(1)) {
+    const match = other.points.find((p) => p.period_end === winnerLatest.period_end);
+    if (match && winnerLatest.value) {
+      const diffPct = Math.abs((match.value - winnerLatest.value) / winnerLatest.value) * 100;
+      if (diffPct > AMBIGUITY_THRESHOLD_PCT) {
+        ambiguityNote = `tag alterno "${other.tag}" reporta ${match.value} para el mismo periodo (${winnerLatest.period_end}) vs ${winnerLatest.value} del tag elegido -- diferencia ${diffPct.toFixed(1)}%`;
+        break;
+      }
+    }
+  }
+
+  return {
+    status: "OK",
+    tag: winner.tag,
+    points: winner.points.slice(0, MAX_POINTS_STORED),
+    confidence: ambiguityNote ? "LOW" : confidence,
+    ambiguityNote,
+  };
+}
+
+function confidenceRank(c) {
+  return { HIGH: 3, MEDIUM: 2, LOW: 1 }[c] || 0;
 }
 
 async function processTicker(ticker, cikPadded) {
   const rows = [];
-  for (const concept of CONCEPTS) {
-    let result = await fetchConcept(cikPadded, concept.tag);
-    let usedTag = concept.tag;
-    if (result.notFound && concept.altTag) {
-      await sleep(REQUEST_DELAY_MS);
-      result = await fetchConcept(cikPadded, concept.altTag);
-      usedTag = concept.altTag;
-    }
+  const resolved = {}; // canonicalConcept -> resolveConcept result, para poder calcular FCF despues
 
-    if (result.data) {
-      const { points, reason } = extractAnnualSeries(result.data);
-      if (points.length > 0) {
-        points.forEach((point) => {
-          rows.push({
-            ticker,
-            cik: cikPadded,
-            concept: `${concept.label}(${usedTag})`,
-            fiscal_year: point.fiscal_year,
-            fiscal_period: point.fiscal_period,
-            value: point.value,
-            unit: point.unit,
-            form: point.form,
-            filed_date: point.filed_date,
-            period_end: point.period_end,
-            source: "sec_edgar",
-            source_url: reason
-              ? `https://data.sec.gov/api/xbrl/companyconcept/CIK${cikPadded}/us-gaap/${usedTag}.json (nota: ${reason})`
-              : `https://data.sec.gov/api/xbrl/companyconcept/CIK${cikPadded}/us-gaap/${usedTag}.json`,
-          });
-        });
-      } else {
-        // La API SI respondio con datos, pero no se pudo extraer ningun
-        // punto anual valido -- se registra explicitamente, nunca se
-        // omite en silencio.
-        rows.push({
-          ticker,
-          cik: cikPadded,
-          concept: `${concept.label}(${usedTag})`,
-          fiscal_year: null,
-          fiscal_period: null,
-          value: null,
-          unit: null,
-          form: null,
-          filed_date: null,
-          period_end: null,
-          source: "sec_edgar",
-          source_url: `data_existed_but_no_annual_points: ${reason}`,
-        });
-      }
-    } else {
-      // Se registra la ausencia real -- ni el tag principal ni el
-      // alterno tuvieron datos, o hubo un error de red/HTTP.
+  for (const concept of CANONICAL_CONCEPTS) {
+    const result = await resolveConcept(cikPadded, concept);
+    resolved[concept] = result;
+
+    if (result.status === "DATA_UNAVAILABLE") {
       rows.push({
         ticker,
         cik: cikPadded,
-        concept: `${concept.label}(${usedTag})`,
-        fiscal_year: null,
-        fiscal_period: null,
+        canonical_concept: concept,
         value: null,
-        unit: null,
-        form: null,
-        filed_date: null,
+        fiscal_year: null,
         period_end: null,
+        form: null,
+        filing_date: null,
+        accession_number: null,
+        raw_xbrl_tag: null,
+        unit: null,
         source: "sec_edgar",
-        source_url: result.error ? `error:${result.error}` : "not_found",
+        normalization_method: "priority_list_recency_ranked",
+        normalization_confidence: "DATA_UNAVAILABLE",
+        ambiguity_note: result.reason,
       });
+      continue;
     }
-    await sleep(REQUEST_DELAY_MS);
+
+    result.points.forEach((point) => {
+      rows.push({
+        ticker,
+        cik: cikPadded,
+        canonical_concept: concept,
+        value: point.value,
+        fiscal_year: point.fiscal_year,
+        period_end: point.period_end,
+        form: point.form,
+        filing_date: point.filed_date,
+        accession_number: point.accession_number,
+        raw_xbrl_tag: result.tag,
+        unit: point.unit,
+        source: "sec_edgar",
+        normalization_method: "priority_list_recency_ranked",
+        normalization_confidence: result.confidence,
+        ambiguity_note: result.ambiguityNote,
+      });
+    });
   }
+
+  // FREE_CASH_FLOW = OPERATING_CASH_FLOW - CAPEX, calculado de forma
+  // deterministica solo para periodos donde AMBOS insumos se resolvieron
+  // (no DATA_UNAVAILABLE). Confidence = la mas debil de las dos entradas.
+  const ocf = resolved.OPERATING_CASH_FLOW;
+  const capex = resolved.CAPEX;
+  if (ocf.status === "OK" && capex.status === "OK") {
+    ocf.points.forEach((ocfPoint) => {
+      const capexPoint = capex.points.find((p) => p.period_end === ocfPoint.period_end);
+      if (capexPoint) {
+        const fcfConfidence =
+          confidenceRank(ocf.confidence) <= confidenceRank(capex.confidence) ? ocf.confidence : capex.confidence;
+        rows.push({
+          ticker,
+          cik: cikPadded,
+          canonical_concept: "FREE_CASH_FLOW",
+          value: ocfPoint.value - capexPoint.value,
+          fiscal_year: ocfPoint.fiscal_year,
+          period_end: ocfPoint.period_end,
+          form: null,
+          filing_date: null,
+          accession_number: null,
+          raw_xbrl_tag: `CALCULATED(${ocf.tag} - ${capex.tag})`,
+          unit: ocfPoint.unit,
+          source: "sec_edgar",
+          normalization_method: "derived_subtraction",
+          normalization_confidence: fcfConfidence,
+          ambiguity_note: null,
+        });
+      }
+    });
+  } else {
+    rows.push({
+      ticker,
+      cik: cikPadded,
+      canonical_concept: "FREE_CASH_FLOW",
+      value: null,
+      fiscal_year: null,
+      period_end: null,
+      form: null,
+      filing_date: null,
+      accession_number: null,
+      raw_xbrl_tag: null,
+      unit: null,
+      source: "sec_edgar",
+      normalization_method: "derived_subtraction",
+      normalization_confidence: "DATA_UNAVAILABLE",
+      ambiguity_note: "requiere OPERATING_CASH_FLOW y CAPEX resueltos; al menos uno quedo DATA_UNAVAILABLE",
+    });
+  }
+
   return rows;
 }
 
@@ -229,15 +353,13 @@ export default async function handler(req, res) {
       }
       try {
         const rows = await processTicker(ticker, cikPadded);
-        const { error: insertErr } = await supabase.from("sec_financials").insert(rows);
+        const { error: insertErr } = await supabase.from("sec_financials_normalized").insert(rows);
         if (insertErr) {
           summary.push({ ticker, ok: false, error: insertErr.message });
           continue;
         }
         summary.push({ ticker, ok: true, cik: cikPadded, rows_inserted: rows.length });
       } catch (tickerErr) {
-        // Un fallo en un ticker no debe tumbar el resto del batch --
-        // los resultados de los tickers anteriores ya se guardaron.
         summary.push({ ticker, ok: false, error: String(tickerErr.message || tickerErr) });
       }
     }
