@@ -79,21 +79,42 @@ async function fetchConcept(cikPadded, tag) {
 // Nos quedamos con el valor mas reciente de tipo 10-K anual (FY), que es
 // el mas comparable entre companias. Si no hay 10-K, tomamos el ultimo
 // valor disponible de cualquier forma.
+function daysBetween(startStr, endStr) {
+  if (!startStr || !endStr) return null;
+  const start = new Date(startStr);
+  const end = new Date(endStr);
+  return Math.round((end - start) / 86400000);
+}
+
 function extractAnnualSeries(conceptJson) {
   const units = conceptJson?.units || {};
   const unitKey = Object.keys(units)[0]; // USD, USD/shares, etc.
-  if (!unitKey) return [];
+  if (!unitKey) return { points: [], reason: "no_units_in_response" };
   const entries = units[unitKey];
-  if (!Array.isArray(entries)) return []; // forma inesperada -- no inventamos datos, devolvemos vacio
-  const annual = entries.filter((e) => e.form === "10-K" && e.fp === "FY");
+  if (!Array.isArray(entries)) return { points: [], reason: "unexpected_units_shape" };
+  if (entries.length === 0) return { points: [], reason: "empty_entries_array" };
+
+  // Deteccion de periodo anual por DURACION real (start a end ~365 dias),
+  // en vez de confiar en el campo `fp` -- resulto no ser consistente
+  // entre emisores (algunas companias no lo taguean como "FY" aunque el
+  // reporte si sea anual). Instant values (EPS, algunos totales) no
+  // tienen `start`, asi que para esos usamos form === "10-K" como filtro.
+  const annual = entries.filter((e) => {
+    if (e.start && e.end) {
+      const dur = daysBetween(e.start, e.end);
+      return dur != null && dur >= 330 && dur <= 400;
+    }
+    return e.form === "10-K";
+  });
   const source = annual.length > 0 ? annual : entries;
+  const usedFallback = annual.length === 0;
 
   const byEnd = {};
   source.forEach((e) => {
     if (!byEnd[e.end] || e.filed > byEnd[e.end].filed) byEnd[e.end] = e;
   });
 
-  return Object.values(byEnd)
+  const points = Object.values(byEnd)
     .sort((a, b) => (a.end < b.end ? 1 : -1))
     .slice(0, 5)
     .map((e) => ({
@@ -105,6 +126,8 @@ function extractAnnualSeries(conceptJson) {
       fiscal_year: e.fy,
       fiscal_period: e.fp,
     }));
+
+  return { points, reason: usedFallback ? "no_clean_annual_period_found_used_fallback" : null };
 }
 
 async function processTicker(ticker, cikPadded) {
@@ -119,23 +142,45 @@ async function processTicker(ticker, cikPadded) {
     }
 
     if (result.data) {
-      const series = extractAnnualSeries(result.data);
-      series.forEach((point) => {
+      const { points, reason } = extractAnnualSeries(result.data);
+      if (points.length > 0) {
+        points.forEach((point) => {
+          rows.push({
+            ticker,
+            cik: cikPadded,
+            concept: `${concept.label}(${usedTag})`,
+            fiscal_year: point.fiscal_year,
+            fiscal_period: point.fiscal_period,
+            value: point.value,
+            unit: point.unit,
+            form: point.form,
+            filed_date: point.filed_date,
+            period_end: point.period_end,
+            source: "sec_edgar",
+            source_url: reason
+              ? `https://data.sec.gov/api/xbrl/companyconcept/CIK${cikPadded}/us-gaap/${usedTag}.json (nota: ${reason})`
+              : `https://data.sec.gov/api/xbrl/companyconcept/CIK${cikPadded}/us-gaap/${usedTag}.json`,
+          });
+        });
+      } else {
+        // La API SI respondio con datos, pero no se pudo extraer ningun
+        // punto anual valido -- se registra explicitamente, nunca se
+        // omite en silencio.
         rows.push({
           ticker,
           cik: cikPadded,
           concept: `${concept.label}(${usedTag})`,
-          fiscal_year: point.fiscal_year,
-          fiscal_period: point.fiscal_period,
-          value: point.value,
-          unit: point.unit,
-          form: point.form,
-          filed_date: point.filed_date,
-          period_end: point.period_end,
+          fiscal_year: null,
+          fiscal_period: null,
+          value: null,
+          unit: null,
+          form: null,
+          filed_date: null,
+          period_end: null,
           source: "sec_edgar",
-          source_url: `https://data.sec.gov/api/xbrl/companyconcept/CIK${cikPadded}/us-gaap/${usedTag}.json`,
+          source_url: `data_existed_but_no_annual_points: ${reason}`,
         });
-      });
+      }
     } else {
       // Se registra la ausencia real -- ni el tag principal ni el
       // alterno tuvieron datos, o hubo un error de red/HTTP.
