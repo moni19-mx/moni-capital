@@ -101,6 +101,19 @@ async function fetchConcept(cikPadded, tag) {
 // entre distintos emisores en el benchmark V1). Devuelve TODOS los
 // puntos anuales encontrados (no solo 5), para poder evaluar cobertura
 // y continuidad reales antes de decidir si este tag es el ganador.
+// Formas de filing confiables para datos anuales -- un 10-K/A (enmienda)
+// se trata igual que un 10-K para efectos de confianza, nunca baja
+// confidence solo por ser una enmienda. Cualquier otra forma (DEF 14A,
+// 8-K, S-1, etc.) NUNCA participa en la deteccion de periodo anual,
+// aunque su duracion coincida con ~365 dias -- este fue el mecanismo
+// real detras del bug de NET_INCOME de ANET (un filing no-anual gano el
+// desempate por "filed mas reciente" sobre el 10-K correcto).
+const TRUSTED_ANNUAL_FORMS = ["10-K", "10-K/A", "10-KT", "10-KT/A"];
+
+function formRank(form) {
+  return TRUSTED_ANNUAL_FORMS.includes(form) ? 1 : 0;
+}
+
 function extractAnnualPoints(conceptJson) {
   const units = conceptJson?.units || {};
   const unitKey = Object.keys(units)[0];
@@ -109,17 +122,23 @@ function extractAnnualPoints(conceptJson) {
   if (!Array.isArray(entries) || entries.length === 0) return [];
 
   const annual = entries.filter((e) => {
+    if (!TRUSTED_ANNUAL_FORMS.includes(e.form)) return false;
     if (e.start && e.end) {
       const dur = daysBetween(e.start, e.end);
       return dur != null && dur >= 330 && dur <= 400;
     }
-    return e.form === "10-K";
+    return true; // valor instantaneo (sin start) en una forma ya confiable
   });
   if (annual.length === 0) return [];
 
+  // Desempate: entre 10-K y 10-K/A del MISMO periodo, gana el mas
+  // reciente filed (la enmienda corrige al original, como pediste en el
+  // punto 4). Nunca hay riesgo de que una forma no confiable participe
+  // porque ya se filtraron arriba.
   const byEnd = {};
   annual.forEach((e) => {
-    if (!byEnd[e.end] || e.filed > byEnd[e.end].filed) byEnd[e.end] = e;
+    const current = byEnd[e.end];
+    if (!current || e.filed > current.filed) byEnd[e.end] = e;
   });
 
   return Object.values(byEnd)
@@ -148,8 +167,8 @@ function scoreCandidate(points) {
     if (gap != null && gap >= 330 && gap <= 400) continuity++;
     else break;
   }
-  const form10K = points.filter((p) => p.form === "10-K").length;
-  return { recencyDays, coverage: points.length, continuity, form10K, mostRecent };
+  const trustedFormCount = points.filter((p) => TRUSTED_ANNUAL_FORMS.includes(p.form)).length;
+  return { recencyDays, coverage: points.length, continuity, form10K: trustedFormCount, mostRecent };
 }
 
 function computeConfidence(score) {
