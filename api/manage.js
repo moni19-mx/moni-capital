@@ -8,7 +8,14 @@
 // Consolidar aqui es la arquitectura correcta, no un parche: mismo
 // comportamiento exacto, un solo archivo. El frontend ahora manda
 // { resource: "positions"|"watchlist"|"thesis"|"cash"|"goal"|"journal"|
-//   "decisions"|"rebalance", ...resto del payload de siempre }.
+//   "decisions"|"rebalance"|"assets", ...resto del payload de siempre }.
+//
+// Asset Master (Fase 0, Paso 6 -- revision critica): ningun write path
+// crea un asset nuevo como efecto secundario. positions/watchlist/thesis
+// SIEMPRE resuelven contra `assets` primero -- si el ticker no existe,
+// devuelven UNKNOWN_ASSET y detienen la escritura. La creacion de un
+// asset nuevo es una accion explicita separada (resource: "assets",
+// action: "create"), nunca implicita.
 
 import { createClient } from "@supabase/supabase-js";
 import { checkRateLimit, recordFailedAttempt } from "../lib/security.js";
@@ -34,18 +41,110 @@ async function requirePin(res, pin) {
   return true;
 }
 
+// ==================================================
+// ASSET MASTER -- resolveAsset / createAsset
+// ==================================================
+// Normalizacion minima y segura: trim + uppercase. No se inventan
+// equivalencias (no se mapea "Apple" -> "AAPL" aqui, eso requeriria una
+// fuente de verdad de nombres que no tenemos todavia -- fuera de alcance
+// de V1).
+function normalizeTicker(input) {
+  if (input == null) return null;
+  const t = String(input).trim().toUpperCase();
+  return t.length > 0 ? t : null;
+}
+
+// Solo LEE. Nunca crea. Devuelve el asset existente, "unknown" (no
+// existe, puede crearse explicitamente), o "ambiguous" (mas de un
+// candidato -- no debería pasar dado el UNIQUE(ticker) actual, pero se
+// deja preparado para cuando el criterio de unicidad cambie).
+async function resolveAsset(rawTicker) {
+  const ticker = normalizeTicker(rawTicker);
+  if (!ticker) return { status: "error", error: "missing_ticker" };
+
+  const { data, error } = await supabase.from("assets").select("*").eq("ticker", ticker);
+  if (error) throw error;
+
+  if (!data || data.length === 0) {
+    return { status: "unknown", ticker };
+  }
+  if (data.length > 1) {
+    return { status: "ambiguous", ticker, candidates: data };
+  }
+  return { status: "ok", asset: data[0] };
+}
+
+// Accion EXPLICITA. Requiere que el llamador ya haya decidido crear el
+// asset (el usuario confirmo en el modal, o un flujo futuro de Smart
+// Import lo solicito explicitamente con el created_source correcto).
+// Vuelve a chequear colision antes de insertar (protege contra doble
+// click / requests concurrentes).
+async function createAsset({ ticker, name, asset_type, exchange, currency, provider_symbols, created_source }) {
+  const normalizedTicker = normalizeTicker(ticker);
+  if (!normalizedTicker) return { status: "error", error: "missing_ticker" };
+
+  const { data: existing, error: findErr } = await supabase.from("assets").select("*").eq("ticker", normalizedTicker);
+  if (findErr) throw findErr;
+  if (existing && existing.length === 1) {
+    return { status: "ok", asset: existing[0], already_existed: true };
+  }
+  if (existing && existing.length > 1) {
+    return { status: "ambiguous", ticker: normalizedTicker, candidates: existing };
+  }
+
+  const payload = {
+    ticker: normalizedTicker,
+    name: name || null,
+    asset_type: asset_type || null,
+    exchange: exchange || null,
+    currency: currency || "USD",
+    provider_symbols: provider_symbols || {},
+    is_active: true,
+    created_source: created_source || "MANUAL",
+  };
+  const { data, error } = await supabase.from("assets").insert([payload]).select();
+  if (error) throw error;
+  return { status: "ok", asset: data[0], already_existed: false };
+}
+
+async function handleAssets(req, res, body) {
+  const { pin, action, ticker } = body;
+  if (action === "resolve") {
+    // Solo lectura -- no requiere PIN, igual que las lecturas de otras
+    // tools de Moni AI. Ajustar si se prefiere requerir PIN tambien aqui.
+    const result = await resolveAsset(ticker);
+    return res.status(200).json(result);
+  }
+  if (action === "create") {
+    if (!(await requirePin(res, pin))) return;
+    const { name, asset_type, exchange, currency, provider_symbols, created_source } = body;
+    const result = await createAsset({ ticker, name, asset_type, exchange, currency, provider_symbols, created_source });
+    return res.status(200).json(result);
+  }
+  return res.status(400).json({ error: "unknown_action" });
+}
+
 async function handlePositions(req, res, body) {
   const { pin, action, position, id } = body;
   if (!(await requirePin(res, pin))) return;
   if (action === "add") {
     if (!position || !position.ticker || !position.type) return res.status(400).json({ error: "missing_fields" });
-    const { data, error } = await supabase.from("positions").insert([position]).select();
+    const resolved = await resolveAsset(position.ticker);
+    if (resolved.status === "unknown") {
+      return res.status(409).json({ error: "UNKNOWN_ASSET", ticker: resolved.ticker, can_create: true });
+    }
+    if (resolved.status === "ambiguous") {
+      return res.status(409).json({ error: "ASSET_AMBIGUOUS", ticker: resolved.ticker, candidates: resolved.candidates });
+    }
+    const payload = { ...position, asset_id: resolved.asset.asset_id };
+    const { data, error } = await supabase.from("positions").insert([payload]).select();
     if (error) throw error;
     if (position.type !== "cash") {
       try {
         await supabase.from("transactions").insert([{
-          date: new Date().toISOString().slice(0, 10), ticker: position.ticker, type: "compra",
-          amount: -Math.abs(Number(position.cost_basis)), quantity: Number(position.shares), notes: "Agregado desde Gestionar",
+          date: new Date().toISOString().slice(0, 10), ticker: position.ticker, asset_id: resolved.asset.asset_id,
+          type: "compra", amount: -Math.abs(Number(position.cost_basis)), quantity: Number(position.shares),
+          notes: "Agregado desde Gestionar",
         }]);
       } catch (e) { /* no debe tumbar el guardado de la posicion */ }
     }
@@ -62,6 +161,8 @@ async function handlePositions(req, res, body) {
     // fila duplicada por el mismo ticker (el bug que causo BTC/MSFT/ORCL
     // duplicados). El servidor hace la suma, nunca el navegador, para que
     // no haya dos calculos distintos si dos pestañas mandan la misma compra.
+    // No hay que resolver asset_id aqui -- `existing` ya tiene el correcto,
+    // la posicion ya paso por el guard de identidad cuando se creo.
     if (!id || !position || position.shares == null || position.cost_basis == null) {
       return res.status(400).json({ error: "missing_fields" });
     }
@@ -77,8 +178,8 @@ async function handlePositions(req, res, body) {
     if (existing.type !== "cash") {
       try {
         await supabase.from("transactions").insert([{
-          date: new Date().toISOString().slice(0, 10), ticker: existing.ticker, type: "compra",
-          amount: -Math.abs(Number(position.cost_basis)), quantity: Number(position.shares),
+          date: new Date().toISOString().slice(0, 10), ticker: existing.ticker, asset_id: existing.asset_id,
+          type: "compra", amount: -Math.abs(Number(position.cost_basis)), quantity: Number(position.shares),
           notes: "Compra adicional sumada a posición existente desde Gestionar",
         }]);
       } catch (e) { /* no debe tumbar el guardado */ }
@@ -99,7 +200,14 @@ async function handleWatchlist(req, res, body) {
   if (!(await requirePin(res, pin))) return;
   if (action === "add") {
     if (!item || !item.ticker || !item.type) return res.status(400).json({ error: "missing_fields" });
-    const payload = { status: "investigando", ...item };
+    const resolved = await resolveAsset(item.ticker);
+    if (resolved.status === "unknown") {
+      return res.status(409).json({ error: "UNKNOWN_ASSET", ticker: resolved.ticker, can_create: true });
+    }
+    if (resolved.status === "ambiguous") {
+      return res.status(409).json({ error: "ASSET_AMBIGUOUS", ticker: resolved.ticker, candidates: resolved.candidates });
+    }
+    const payload = { status: "investigando", ...item, asset_id: resolved.asset.asset_id };
     const { data, error } = await supabase.from("watchlist").insert([payload]).select();
     if (error) throw error;
     return res.status(200).json({ ok: true, data });
@@ -123,7 +231,16 @@ async function handleThesis(req, res, body) {
   const { pin, ticker, fields } = body;
   if (!(await requirePin(res, pin))) return;
   if (!ticker) return res.status(400).json({ error: "missing_ticker" });
-  const payload = { ticker, ...(fields || {}), updated_at: new Date().toISOString() };
+
+  const resolved = await resolveAsset(ticker);
+  if (resolved.status === "unknown") {
+    return res.status(409).json({ error: "UNKNOWN_ASSET", ticker: resolved.ticker, can_create: true });
+  }
+  if (resolved.status === "ambiguous") {
+    return res.status(409).json({ error: "ASSET_AMBIGUOUS", ticker: resolved.ticker, candidates: resolved.candidates });
+  }
+
+  const payload = { ticker, asset_id: resolved.asset.asset_id, ...(fields || {}), updated_at: new Date().toISOString() };
   const { data: existing, error: findErr } = await supabase.from("thesis").select("id").eq("ticker", ticker).maybeSingle();
   if (findErr) throw findErr;
   if (existing) {
@@ -275,6 +392,7 @@ async function handleRebalance(req, res, body) {
 }
 
 const HANDLERS = {
+  assets: handleAssets,
   positions: handlePositions,
   watchlist: handleWatchlist,
   thesis: handleThesis,
