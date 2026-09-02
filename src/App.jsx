@@ -84,6 +84,7 @@ async function manageGoal(payload) { return callManage("goal", payload); }
 async function manageDecisions(payload) { return callManage("decisions", payload); }
 async function manageRebalance(payload) { return callManage("rebalance", payload); }
 async function manageJournal(payload) { return callManage("journal", payload); }
+async function manageAssets(payload) { return callManage("assets", payload); }
 
 // Debe coincidir con PROMPT_VERSION en api/ai.js -- si sube, el hash del
 // Daily Brief cambia solo y el frontend sabe que hay que regenerar.
