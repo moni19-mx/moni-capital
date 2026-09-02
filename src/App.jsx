@@ -68,7 +68,11 @@ async function callManage(resource, payload) {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ resource, ...payload }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+  if (!res.ok) {
+    const err = new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.detail || data.error || "Error"));
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
