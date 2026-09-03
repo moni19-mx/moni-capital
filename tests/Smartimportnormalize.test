@@ -1,0 +1,178 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  normalizeStatus, normalizeCurrency, computeTotal, checkDocumentTypeConflict,
+  computeOverallConfidence, matchAccount, buildNormalizedExtraction,
+} from "../lib/smartImportNormalize.js";
+
+function fv(value, confidence = "HIGH", evidence_text = null) {
+  return { value, confidence, evidence_text };
+}
+
+function gevRawExtraction(overrides = {}) {
+  return {
+    document_type: "PURCHASE_CONFIRMATION",
+    sensitive_content_detected: false,
+    source: { provider: fv("ARQ"), account_name: fv(null, "LOW", null) },
+    transaction: {
+      ticker: fv("GEV"), asset_name: fv("GE Vernova"), type: fv("BUY"),
+      status_text_raw: fv("Pendiente"), status_model_guess: fv("PENDING"),
+      quantity: fv(1.973098215), price: fv(886.93), total: fv(1750),
+      currency: fv("USDC"), fee: fv(null, "LOW", null),
+      transaction_date: fv("2026-09-03"), transaction_time: fv(null, "LOW", null),
+      provider_transaction_id: fv(null, "LOW", null), order_id: fv(null, "LOW", null),
+      ...overrides.transaction,
+    },
+    warnings: [],
+    ...overrides.top,
+  };
+}
+
+const MATCHED_GEV = { status: "MATCHED_ASSET", ticker_normalized: "GEV", asset_id: 14 };
+const NO_ACCOUNT_MATCH = { status: "UNKNOWN_ACCOUNT", account_id: null };
+const ARQ_ACCOUNTS = [
+  { id: 1, name: "ARQ", provider: "ARQ" },
+  { id: 2, name: "Binance Spot", provider: "Binance" },
+  { id: 3, name: "Binance USD-M", provider: "Binance" },
+  { id: 4, name: "Binance COIN-M", provider: "Binance" },
+  { id: 5, name: "Ledger", provider: "Ledger" },
+];
+
+// ================== A. Compra PENDING valida (GEV real) ==================
+test("A - GEV PENDING valido: status PENDING, total EXTRACTED, sin warnings criticos, overall HIGH", () => {
+  const raw = gevRawExtraction();
+  const accountMatch = matchAccount({ accountNameRaw: null, providerRaw: "ARQ" }, ARQ_ACCOUNTS);
+  const n = buildNormalizedExtraction({ raw, assetResolution: MATCHED_GEV, accountMatch });
+  assert.equal(n.status.value, "PENDING");
+  assert.equal(n.total.source_type, "EXTRACTED");
+  assert.equal(n.overall_import_confidence, "HIGH");
+  assert.equal(n.account.match_status, "MATCHED_ACCOUNT");
+  assert.equal(n.account.account_id, 1);
+  assert.deepEqual(n.warnings, []);
+});
+
+// ================== E. Unknown asset ==================
+test("E - ticker desconocido: warning UNKNOWN_ASSET, overall AMBIGUOUS", () => {
+  const raw = gevRawExtraction();
+  const unknownAsset = { status: "UNKNOWN_ASSET", ticker_normalized: "GEV", asset_id: null };
+  const n = buildNormalizedExtraction({ raw, assetResolution: unknownAsset, accountMatch: NO_ACCOUNT_MATCH });
+  assert.equal(n.overall_import_confidence, "AMBIGUOUS");
+  assert.ok(n.warnings.includes("UNKNOWN_ASSET"));
+});
+
+// ================== F. Unknown account (no bloquea, no inventa account_id) ==================
+test("F - cuenta no reconocida: warning UNKNOWN_ACCOUNT, account_id null, NO bloquea overall por si sola", () => {
+  const raw = gevRawExtraction({ top: {} });
+  const n = buildNormalizedExtraction({ raw, assetResolution: MATCHED_GEV, accountMatch: { status: "UNKNOWN_ACCOUNT", account_id: null } });
+  assert.equal(n.account.account_id, null);
+  assert.ok(n.warnings.includes("UNKNOWN_ACCOUNT"));
+  assert.equal(n.overall_import_confidence, "HIGH"); // cuenta desconocida no es un campo critico
+});
+
+test("matchAccount: 'Binance' solo (provider) es AMBIGUO entre 3 cuentas -> UNKNOWN_ACCOUNT, nunca adivina", () => {
+  const r = matchAccount({ accountNameRaw: null, providerRaw: "Binance" }, ARQ_ACCOUNTS);
+  assert.equal(r.status, "UNKNOWN_ACCOUNT");
+  assert.equal(r.account_id, null);
+});
+
+test("matchAccount: 'Binance Spot' (account_name exacto) SI resuelve, aunque provider sea ambiguo", () => {
+  const r = matchAccount({ accountNameRaw: "Binance Spot", providerRaw: "Binance" }, ARQ_ACCOUNTS);
+  assert.equal(r.status, "MATCHED_ACCOUNT");
+  assert.equal(r.account_id, 2);
+});
+
+// ================== G. Currency ambiguous ==================
+test("G - '$500' sin codigo de moneda explicito: currency null, warning CURRENCY_AMBIGUOUS", () => {
+  const raw = gevRawExtraction({ transaction: { currency: fv(null, "LOW", "$500") } });
+  const n = buildNormalizedExtraction({ raw, assetResolution: MATCHED_GEV, accountMatch: NO_ACCOUNT_MATCH });
+  assert.equal(n.currency, null);
+  assert.ok(n.warnings.includes("CURRENCY_AMBIGUOUS"));
+});
+
+test("normalizeCurrency: codigo reconocible en minusculas se normaliza a mayusculas", () => {
+  const r = normalizeCurrency({ currency: fv("usdc") });
+  assert.equal(r.value, "USDC");
+  assert.equal(r.warning, null);
+});
+
+// ================== H. Arithmetic mismatch ==================
+test("H - quantity x price no cuadra con total (>2%): warning + overall tope MEDIUM", () => {
+  const raw = gevRawExtraction({ transaction: { quantity: fv(2), price: fv(500), total: fv(1200) } }); // esperado 1000, real 1200 = 20% diff
+  const n = buildNormalizedExtraction({ raw, assetResolution: MATCHED_GEV, accountMatch: NO_ACCOUNT_MATCH });
+  assert.ok(n.warnings.includes("PRICE_QUANTITY_TOTAL_MISMATCH"));
+  assert.equal(n.overall_import_confidence, "MEDIUM"); // nunca HIGH con este warning presente
+});
+
+test("computeTotal: dentro de tolerancia (2%) no genera warning", () => {
+  const r = computeTotal({ quantityValue: 2, priceValue: 500, totalRaw: { value: 1005 } }); // 0.5% diff
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.source_type, "EXTRACTED");
+});
+
+test("computeTotal: sin total pero con quantity+price -> DERIVED, nunca EXTRACTED", () => {
+  const r = computeTotal({ quantityValue: 2, priceValue: 500, totalRaw: { value: null } });
+  assert.equal(r.value, 1000);
+  assert.equal(r.source_type, "DERIVED");
+});
+
+test("computeTotal: falta price -> UNAVAILABLE, nunca 0", () => {
+  const r = computeTotal({ quantityValue: 2, priceValue: null, totalRaw: { value: null } });
+  assert.equal(r.value, null);
+  assert.equal(r.source_type, "UNAVAILABLE");
+});
+
+// ================== Status mapping + confidence heredada ==================
+test("normalizeStatus: 'Pendiente' con confidence LOW en RAW -> normalized hereda LOW, nunca sube a HIGH", () => {
+  const r = normalizeStatus({ status_text_raw: fv("Pendiente", "LOW"), status_model_guess: fv("PENDING", "HIGH") });
+  assert.equal(r.value, "PENDING");
+  assert.equal(r.source_type, "EXTRACTED_MAPPED");
+  assert.equal(r.confidence, "LOW"); // hereda de status_text_raw, no del guess ni HIGH artificial
+});
+
+test("normalizeStatus: sin match en tabla, cae a model_guess", () => {
+  const r = normalizeStatus({ status_text_raw: fv("texto raro no mapeado", "MEDIUM"), status_model_guess: fv("EXECUTED", "MEDIUM") });
+  assert.equal(r.value, "EXECUTED");
+  assert.equal(r.source_type, "MODEL_GUESS");
+});
+
+test("normalizeStatus: sin texto ni guess -> UNKNOWN", () => {
+  const r = normalizeStatus({ status_text_raw: fv(null, "LOW", null), status_model_guess: fv(null, "LOW", null) });
+  assert.equal(r.value, "UNKNOWN");
+});
+
+// ================== Document type conflict ==================
+test("checkDocumentTypeConflict: PURCHASE_CONFIRMATION + SELL -> true", () => {
+  assert.equal(checkDocumentTypeConflict("PURCHASE_CONFIRMATION", "SELL"), true);
+});
+test("checkDocumentTypeConflict: SALE_CONFIRMATION + BUY -> true", () => {
+  assert.equal(checkDocumentTypeConflict("SALE_CONFIRMATION", "BUY"), true);
+});
+test("checkDocumentTypeConflict: PURCHASE_CONFIRMATION + BUY -> false (consistente)", () => {
+  assert.equal(checkDocumentTypeConflict("PURCHASE_CONFIRMATION", "BUY"), false);
+});
+
+test("I - conflicto document/type produce warning y overall AMBIGUOUS", () => {
+  const raw = gevRawExtraction({ transaction: { type: fv("SELL") } }); // PURCHASE_CONFIRMATION + SELL
+  const n = buildNormalizedExtraction({ raw, assetResolution: MATCHED_GEV, accountMatch: NO_ACCOUNT_MATCH });
+  assert.ok(n.warnings.includes("DOCUMENT_TYPE_TRANSACTION_TYPE_CONFLICT"));
+  assert.equal(n.overall_import_confidence, "AMBIGUOUS");
+});
+
+// ================== overall confidence: precedencia AMBIGUOUS > LOW ==================
+test("computeOverallConfidence: AMBIGUOUS gana aunque tambien haya campos LOW", () => {
+  const r = computeOverallConfidence({
+    assetMatchStatus: "UNKNOWN_ASSET", statusValue: "PENDING", typeValue: "BUY",
+    sensitiveDetected: false, documentTypeConflict: false,
+    criticalFieldsConfidence: ["LOW", "LOW"], hasMismatchWarning: false,
+  });
+  assert.equal(r, "AMBIGUOUS");
+});
+
+test("computeOverallConfidence: todo bien identificado pero quantity/price LOW -> LOW, no AMBIGUOUS", () => {
+  const r = computeOverallConfidence({
+    assetMatchStatus: "MATCHED_ASSET", statusValue: "PENDING", typeValue: "BUY",
+    sensitiveDetected: false, documentTypeConflict: false,
+    criticalFieldsConfidence: ["HIGH", "LOW"], hasMismatchWarning: false,
+  });
+  assert.equal(r, "LOW");
+});
