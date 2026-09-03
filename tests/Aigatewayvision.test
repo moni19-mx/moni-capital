@@ -1,0 +1,195 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  shouldFailover, validateImageInput, parseModelJsonOutput, buildSafeLogEntry,
+  SMART_IMPORT_PROMPT_VERSION, SMART_IMPORT_SCHEMA_VERSION,
+} from "../lib/aiGateway.js";
+
+// El schema COMPLETO ya aprobado para SmartImportRawExtraction -- no un
+// schema de juguete. Copiado tal cual del contrato congelado.
+const SmartImportRawExtractionSchema = {
+  definitions: {
+    FieldValueString: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
+      properties: { value: { type: ["string", "null"] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
+    FieldValueNumber: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
+      properties: { value: { type: ["number", "null"] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
+    FieldValueTradeType: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
+      properties: { value: { enum: ["BUY", "SELL", null] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
+    FieldValueStatusGuess: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
+      properties: { value: { enum: ["PROPOSED", "PENDING", "EXECUTED", "CANCELLED", "REJECTED", null] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
+  },
+  type: "object",
+  additionalProperties: false,
+  required: ["document_type", "sensitive_content_detected", "source", "transaction", "warnings"],
+  properties: {
+    document_type: { enum: ["PURCHASE_CONFIRMATION", "SALE_CONFIRMATION", "UNKNOWN"] },
+    sensitive_content_detected: { type: "boolean" },
+    source: {
+      type: "object", additionalProperties: false, required: ["provider", "account_name"],
+      properties: {
+        provider: { $ref: "#/definitions/FieldValueString" },
+        account_name: { $ref: "#/definitions/FieldValueString" },
+      },
+    },
+    transaction: {
+      type: "object", additionalProperties: false,
+      required: ["ticker", "asset_name", "type", "status_text_raw", "status_model_guess", "quantity", "price", "total", "currency", "fee", "transaction_date", "transaction_time", "provider_transaction_id", "order_id"],
+      properties: {
+        ticker: { $ref: "#/definitions/FieldValueString" },
+        asset_name: { $ref: "#/definitions/FieldValueString" },
+        type: { $ref: "#/definitions/FieldValueTradeType" },
+        status_text_raw: { $ref: "#/definitions/FieldValueString" },
+        status_model_guess: { $ref: "#/definitions/FieldValueStatusGuess" },
+        quantity: { $ref: "#/definitions/FieldValueNumber" },
+        price: { $ref: "#/definitions/FieldValueNumber" },
+        total: { $ref: "#/definitions/FieldValueNumber" },
+        currency: { $ref: "#/definitions/FieldValueString" },
+        fee: { $ref: "#/definitions/FieldValueNumber" },
+        transaction_date: { $ref: "#/definitions/FieldValueString" },
+        transaction_time: { $ref: "#/definitions/FieldValueString" },
+        provider_transaction_id: { $ref: "#/definitions/FieldValueString" },
+        order_id: { $ref: "#/definitions/FieldValueString" },
+      },
+    },
+    warnings: { type: "array", items: { type: "string" } },
+  },
+};
+
+function fv(value, confidence = "HIGH", evidence_text = null) {
+  return { value, confidence, evidence_text };
+}
+
+function validGevExtraction() {
+  return {
+    document_type: "PURCHASE_CONFIRMATION",
+    sensitive_content_detected: false,
+    source: { provider: fv("ARQ"), account_name: fv(null, "LOW", null) },
+    transaction: {
+      ticker: fv("GEV"), asset_name: fv("GE Vernova"), type: fv("BUY"),
+      status_text_raw: fv("Pendiente"), status_model_guess: fv("PENDING"),
+      quantity: fv(1.973098215), price: fv(886.93), total: fv(1750),
+      currency: fv("USDC"), fee: fv(null, "LOW", null),
+      transaction_date: fv("2026-09-03"), transaction_time: fv(null, "LOW", null),
+      provider_transaction_id: fv(null, "LOW", null), order_id: fv(null, "LOW", null),
+    },
+    warnings: [],
+  };
+}
+
+// ================== Test C — shouldFailover (politica anti fallback de vision) ==================
+test("C - allowFallback=false: NUNCA hace failover aunque el error sea retryable", () => {
+  const result = shouldFailover({ allowFallback: false, isExplicitOverride: false, errorRetryable: true, providerName: "anthropic", fallbackProvider: "gpt-5.6-terra" });
+  assert.equal(result, false);
+});
+
+test("shouldFailover: comportamiento PRE-existente (chat/tools) se mantiene exacto con allowFallback=true (default)", () => {
+  const result = shouldFailover({ allowFallback: true, isExplicitOverride: false, errorRetryable: true, providerName: "anthropic", fallbackProvider: "gpt-5.6-terra" });
+  assert.equal(result, true); // exactamente el comportamiento que ya existia antes de este cambio
+});
+
+test("shouldFailover: providerOverride explicito nunca hace failover, con o sin allowFallback", () => {
+  assert.equal(shouldFailover({ allowFallback: true, isExplicitOverride: true, errorRetryable: true, providerName: "anthropic", fallbackProvider: "gpt-5.6-terra" }), false);
+});
+
+test("shouldFailover: error no retryable nunca hace failover", () => {
+  assert.equal(shouldFailover({ allowFallback: true, isExplicitOverride: false, errorRetryable: false, providerName: "anthropic", fallbackProvider: "gpt-5.6-terra" }), false);
+});
+
+// ================== Test D — MIME invalido ==================
+test("D - MIME invalido (application/pdf): rechazado antes de llamar al proveedor", () => {
+  const r = validateImageInput({ mimeType: "application/pdf", sizeBytes: 1000 });
+  assert.equal(r.valid, false);
+  assert.equal(r.error, "INVALID_IMAGE_MIME_TYPE");
+});
+
+test("validateImageInput: SVG explicitamente rechazado", () => {
+  const r = validateImageInput({ mimeType: "image/svg+xml", sizeBytes: 1000 });
+  assert.equal(r.valid, false);
+  assert.equal(r.error, "INVALID_IMAGE_MIME_TYPE");
+});
+
+test("validateImageInput: los 3 MIME permitidos pasan", () => {
+  for (const mimeType of ["image/jpeg", "image/png", "image/webp"]) {
+    const r = validateImageInput({ mimeType, sizeBytes: 500000 });
+    assert.equal(r.valid, true);
+  }
+});
+
+// ================== Test E — imagen sobredimensionada ==================
+test("E - imagen de 11MB (excede el limite de 10MB del bucket): rechazada antes del proveedor", () => {
+  const r = validateImageInput({ mimeType: "image/jpeg", sizeBytes: 11 * 1024 * 1024 });
+  assert.equal(r.valid, false);
+  assert.equal(r.error, "IMAGE_TOO_LARGE");
+});
+
+test("validateImageInput: exactamente 10MB (limite) pasa, 10MB+1byte no", () => {
+  assert.equal(validateImageInput({ mimeType: "image/png", sizeBytes: 10 * 1024 * 1024 }).valid, true);
+  assert.equal(validateImageInput({ mimeType: "image/png", sizeBytes: 10 * 1024 * 1024 + 1 }).valid, false);
+});
+
+// ================== Test F — respuesta del modelo invalida contra schema ==================
+test("F - respuesta valida del modelo (fixture GEV real) pasa la validacion completa", () => {
+  const rawText = JSON.stringify(validGevExtraction());
+  const r = parseModelJsonOutput(rawText, SmartImportRawExtractionSchema);
+  assert.equal(r.valid, true);
+  assert.equal(r.data.transaction.ticker.value, "GEV");
+});
+
+test("F - JSON invalido (texto roto) -> SCHEMA_VALIDATION_FAILED", () => {
+  const r = parseModelJsonOutput("esto no es json {", SmartImportRawExtractionSchema);
+  assert.equal(r.valid, false);
+  assert.equal(r.error, "SCHEMA_VALIDATION_FAILED");
+});
+
+test("F - JSON valido pero le falta un campo requerido -> SCHEMA_VALIDATION_FAILED", () => {
+  const broken = validGevExtraction();
+  delete broken.transaction.quantity; // falta un campo requerido
+  const r = parseModelJsonOutput(JSON.stringify(broken), SmartImportRawExtractionSchema);
+  assert.equal(r.valid, false);
+  assert.equal(r.error, "SCHEMA_VALIDATION_FAILED");
+  assert.ok(r.detail.includes("quantity"));
+});
+
+test("F - valor fuera de enum (status_model_guess invalido) -> SCHEMA_VALIDATION_FAILED", () => {
+  const broken = validGevExtraction();
+  broken.transaction.status_model_guess = fv("EN_PROCESO"); // no esta en el enum
+  const r = parseModelJsonOutput(JSON.stringify(broken), SmartImportRawExtractionSchema);
+  assert.equal(r.valid, false);
+});
+
+test("F - propiedad extra no permitida (additionalProperties:false) -> SCHEMA_VALIDATION_FAILED", () => {
+  const broken = validGevExtraction();
+  broken.transaction.campo_inventado = "algo";
+  const r = parseModelJsonOutput(JSON.stringify(broken), SmartImportRawExtractionSchema);
+  assert.equal(r.valid, false);
+});
+
+test("F - envuelto en backticks de markdown (```json ... ```) se limpia antes de parsear", () => {
+  const rawText = "```json\n" + JSON.stringify(validGevExtraction()) + "\n```";
+  const r = parseModelJsonOutput(rawText, SmartImportRawExtractionSchema);
+  assert.equal(r.valid, true);
+});
+
+// ================== Test H — imagen/base64 nunca en logs ==================
+test("H - buildSafeLogEntry excluye base64/raw_extraction aunque vengan en el objeto de entrada", () => {
+  const dirty = {
+    import_id: 42, model_provider: "anthropic", model_name: "claude-sonnet-5",
+    latency_ms: 1200, status: "ok", error_code: null,
+    schema_version: SMART_IMPORT_SCHEMA_VERSION, prompt_version: SMART_IMPORT_PROMPT_VERSION,
+    image_base64: "iVBORw0KGgoAAAANSUhEUgAA....(muy largo)",
+    raw_extraction: { transaction: { ticker: { value: "GEV" } } },
+    signed_url: "https://supabase.co/storage/v1/object/sign/smart-imports-private/xyz?token=SECRETO",
+  };
+  const safe = buildSafeLogEntry(dirty);
+  assert.equal(safe.image_base64, undefined);
+  assert.equal(safe.raw_extraction, undefined);
+  assert.equal(safe.signed_url, undefined);
+  assert.equal(safe.import_id, 42);
+  assert.equal(safe.model_provider, "anthropic");
+  assert.equal(safe.schema_version, SMART_IMPORT_SCHEMA_VERSION);
+});
+
+test("buildSafeLogEntry: version constants estan definidas y son estables", () => {
+  assert.equal(SMART_IMPORT_PROMPT_VERSION, "smart-import-v1");
+  assert.equal(SMART_IMPORT_SCHEMA_VERSION, "smart-import-raw-v1");
+});
