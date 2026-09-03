@@ -3334,16 +3334,18 @@ function AddForm({ onDone, existingPositions }) {
   const [err, setErr] = useState(null);
   const [duplicateMatch, setDuplicateMatch] = useState(null); // posicion existente encontrada, en espera de confirmacion
   const [confirmedMerge, setConfirmedMerge] = useState(false);
+  const [unknownAsset, setUnknownAsset] = useState(null); // { ticker, mergeInto } | null
 
-  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); setDuplicateMatch(null); setConfirmedMerge(false); }
+  function set(k, v) { setForm((f) => ({ ...f, [k]: v })); setDuplicateMatch(null); setConfirmedMerge(false); setUnknownAsset(null); }
 
   function pickResult(r) {
     setForm((f) => ({ ...f, ticker: r.ticker, name: r.name, type: r.type, coingecko_id: r.coingeckoId || "" }));
-    setDuplicateMatch(null); setConfirmedMerge(false);
+    setDuplicateMatch(null); setConfirmedMerge(false); setUnknownAsset(null);
   }
 
   async function doSubmit(mergeInto) {
     setBusy(true);
+    setErr(null);
     try {
       if (mergeInto) {
         // Suma esta compra a la posicion existente -- el servidor hace la
@@ -3365,8 +3367,36 @@ function AddForm({ onDone, existingPositions }) {
         });
       }
       onDone();
-    } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
+    } catch (e) {
+      if (e.data?.error === "UNKNOWN_ASSET") {
+        setUnknownAsset({ ticker: e.data.ticker, mergeInto });
+      } else if (e.data?.error === "ASSET_AMBIGUOUS") {
+        setErr(`"${form.ticker.toUpperCase()}" tiene más de un activo posible registrado — no se puede resolver automáticamente todavía.`);
+      } else {
+        setErr(e.message);
+      }
+    } finally { setBusy(false); }
+  }
+
+  async function confirmCreateAsset() {
+    if (!pin) { setErr("Falta tu PIN para crear el activo."); return; }
+    setBusy(true);
+    try {
+      const created = await manageAssets({ pin, action: "create", ticker: unknownAsset.ticker });
+      if (created.status !== "ok") {
+        setErr("No se pudo crear el activo: " + (created.error || "error desconocido"));
+        setBusy(false);
+        return;
+      }
+      const mergeInto = unknownAsset.mergeInto;
+      setUnknownAsset(null);
+      // Retry EXACTO de la accion original, mismos inputs -- doSubmit ya
+      // maneja su propio busy/err/finally.
+      await doSubmit(mergeInto);
+    } catch (e) {
+      setErr("No se pudo completar: " + e.message);
+      setBusy(false);
+    }
   }
 
   async function submit(e) {
@@ -3389,6 +3419,26 @@ function AddForm({ onDone, existingPositions }) {
   }
 
   const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+
+  if (unknownAsset) {
+    return (
+      <div style={{ background: NAVY_BG, border: `1px solid ${AMBER}`, borderRadius: 10, padding: 18, marginBottom: 24 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: AMBER, marginBottom: 8 }}>Activo no reconocido</div>
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 14 }}>
+          <b style={{ color: TXT }}>{unknownAsset.ticker}</b> no existe todavía en Asset Master de Moni Capital.
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button type="button" onClick={confirmCreateAsset} disabled={busy} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            {busy ? "Creando…" : "Agregar activo y continuar"}
+          </button>
+          <button type="button" onClick={() => setUnknownAsset(null)} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>
+            Cancelar
+          </button>
+        </div>
+        {err && <div style={{ color: RED, fontSize: 12, marginTop: 10 }}>{err}</div>}
+      </div>
+    );
+  }
 
   if (duplicateMatch && !confirmedMerge) {
     const newShares = Number(duplicateMatch.shares) + Number(form.shares);
@@ -3465,6 +3515,7 @@ function AddForm({ onDone, existingPositions }) {
     </form>
   );
 }
+
 
 function ConvictionStars({ value }) {
   if (!value) return <span style={{ color: MUTE, fontSize: 12 }}>Sin definir</span>;
