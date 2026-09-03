@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getTransactionEffects, isInternalTransfer, classifyTransfer } from "../lib/reconciliationEngine.js";
+import {
+  getTransactionEffects, isInternalTransfer, classifyTransfer,
+  getAccountEquity, computeNetWorth, computeAssetOwnership,
+  deriveNotional, computeDerivativeExposure, computeEffectiveExposure,
+} from "../lib/reconciliationEngine.js";
 
 // ================== A. GEV PENDING BUY ==================
 test("A - GEV PENDING BUY: holdings/cost_basis/cash/net_worth todo NONE, sin evidencia de reserved_cash -> warning", () => {
@@ -141,4 +145,183 @@ test("isInternalTransfer: knownAccountIds invalido -> throw", () => {
 test("isInternalTransfer: acepta array ademas de Set", () => {
   assert.equal(isInternalTransfer(1, 2, [1, 2]), true);
   assert.equal(isInternalTransfer(1, 99, [1, 2]), false);
+});
+
+// ================== C. Ledger BTC balance snapshot ==================
+test("C - Ledger BTC: owned=available=0.46996, encumbered=0", () => {
+  const r = computeAssetOwnership("BTC", [{ asset_id: "BTC", owned_value: 0.46996, encumbered_value: 0 }]);
+  assert.equal(r.owned, 0.46996);
+  assert.equal(r.available, 0.46996);
+  assert.equal(r.encumbered, 0);
+});
+
+test("computeAssetOwnership: encumbrance desconocida -> owned conocido, available/encumbered DATA_UNAVAILABLE", () => {
+  const r = computeAssetOwnership("BTC", [{ asset_id: "BTC", owned_value: 0.05 }]);
+  assert.equal(r.owned, 0.05);
+  assert.equal(r.available, "DATA_UNAVAILABLE");
+  assert.equal(r.encumbered, "DATA_UNAVAILABLE");
+});
+
+test("computeAssetOwnership: asset sin entradas -> todo 0", () => {
+  const r = computeAssetOwnership("ETH", [{ asset_id: "BTC", owned_value: 1, encumbered_value: 0 }]);
+  assert.equal(r.owned, 0);
+  assert.equal(r.available, 0);
+});
+
+// ================== getAccountEquity ==================
+test("getAccountEquity: equity explicita del proveedor -> se usa esa, sin recalcular", () => {
+  const r = getAccountEquity({ asset_id: "USDT", equity_value: 5000, wallet_balance_value: 999 }, "futures");
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 5000);
+});
+
+test("getAccountEquity: spot sin equity explicita -> usa wallet_balance_value", () => {
+  const r = getAccountEquity({ asset_id: "BTC", wallet_balance_value: 0.5 }, "spot");
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 0.5);
+});
+
+test("getAccountEquity: spot sin wallet_balance_value -> DATA_UNAVAILABLE, nunca 0", () => {
+  const r = getAccountEquity({ asset_id: "BTC" }, "spot");
+  assert.equal(r.status, "DATA_UNAVAILABLE");
+});
+
+test("getAccountEquity: futures con los 3 componentes -> suma", () => {
+  const r = getAccountEquity({ asset_id: "USDT", available_balance_value: 100, margin_balance_value: 50, unrealized_pnl_value: -5 }, "futures");
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 145);
+});
+
+test("getAccountEquity: futures con un componente faltante -> DATA_UNAVAILABLE, nunca asume 0", () => {
+  const r = getAccountEquity({ asset_id: "USDT", available_balance_value: 100, margin_balance_value: 50 }, "futures");
+  assert.equal(r.status, "DATA_UNAVAILABLE");
+});
+
+// ================== M. Double-count prevention ==================
+test("M - Binance Spot holding + Binance Spot account_equity: NO se suman ambos, gana account_equity", () => {
+  const holdings = [{ account_id: 2, asset_id: "BTC", value: 1000 }];
+  const accountEquities = [{ account_id: 2, value: 1200 }];
+  const r = computeNetWorth({ holdings, accountEquities });
+  assert.equal(r.value, 1200); // NUNCA 2200
+  assert.equal(r.conflicts.length, 1);
+  assert.equal(r.conflicts[0].resolution, "USED_ACCOUNT_EQUITY");
+});
+
+test("M2 - Mismo conflicto pero equity DATA_UNAVAILABLE (null) -> cae a holdings, sigue sin sumar ambos", () => {
+  const holdings = [{ account_id: 2, asset_id: "BTC", value: 1000 }];
+  const accountEquities = [{ account_id: 2, value: null }];
+  const r = computeNetWorth({ holdings, accountEquities });
+  assert.equal(r.value, 1000);
+  assert.equal(r.conflicts[0].resolution, "USED_HOLDINGS_FALLBACK");
+});
+
+test("computeNetWorth: cuentas sin overlap se suman normal, holdings sin account_id nunca conflictan", () => {
+  const holdings = [
+    { account_id: null, asset_id: "AAPL", value: 500 }, // posicion legacy sin account_id
+    { account_id: 5, asset_id: "BTC", value: 300 }, // Ledger, solo holdings
+  ];
+  const accountEquities = [{ account_id: 3, value: 800 }]; // Binance USD-M, solo equity
+  const r = computeNetWorth({ holdings, accountEquities });
+  assert.equal(r.value, 500 + 300 + 800);
+  assert.equal(r.conflicts.length, 0);
+  assert.equal(r.missingComponents.length, 0);
+});
+
+test("computeNetWorth: cuenta solo en accountEquities con value null -> missingComponents, no se rellena con 0", () => {
+  const r = computeNetWorth({ holdings: [], accountEquities: [{ account_id: 9, value: null }] });
+  assert.equal(r.value, 0);
+  assert.deepEqual(r.missingComponents, [9]);
+});
+
+// ================== F. COIN-M semantica no verificada ==================
+test("F - COIN-M sin entrada en el registry: UNIT_SEMANTICS_UNVERIFIED, nada derivado", () => {
+  const rawFacts = { position_quantity_value: 0.0514, position_quantity_unit: "BTC", entry_price: null, price_currency: null };
+  const key = "binance::coin_margined_futures::BTCUSD_PERP::perpetual";
+  const r = deriveNotional(rawFacts, key, {}); // registry vacio -- el caso real hoy
+  assert.equal(r.status, "UNIT_SEMANTICS_UNVERIFIED");
+  assert.equal(r.underlying_equivalent_value, null);
+  assert.equal(r.notional_value, null);
+  assert.ok(r.warnings.includes("UNIT_SEMANTICS_UNVERIFIED"));
+});
+
+test("deriveNotional: key desconocida en absoluto (registry con otras keys) -> tambien UNVERIFIED", () => {
+  const rawFacts = { position_quantity_value: 1, position_quantity_unit: "ETH" };
+  const r = deriveNotional(rawFacts, "otra::key::no::relacionada", { "algo::mas": { mode: "DIRECT_QUANTITY_IS_UNDERLYING" } });
+  assert.equal(r.status, "UNIT_SEMANTICS_UNVERIFIED");
+});
+
+test("deriveNotional: modo VERIFIED (DIRECT_QUANTITY_IS_UNDERLYING) sintetico, con precio -> notional calculado", () => {
+  const rawFacts = { position_quantity_value: 2, entry_price: 100, price_currency: "USD" };
+  const key = "test::linear::FOO::perpetual";
+  const registry = { [key]: { mode: "DIRECT_QUANTITY_IS_UNDERLYING", underlyingAssetId: "FOO" } };
+  const r = deriveNotional(rawFacts, key, registry);
+  assert.equal(r.status, "VERIFIED");
+  assert.equal(r.underlying_equivalent_value, 2);
+  assert.equal(r.underlying_equivalent_asset_id, "FOO");
+  assert.equal(r.notional_value, 200);
+  assert.equal(r.notional_asset_id, "USD");
+});
+
+test("deriveNotional: modo VERIFIED pero sin precio -> underlying_equivalent conocido, notional null + warning", () => {
+  const rawFacts = { position_quantity_value: 2 };
+  const key = "test::linear::FOO::perpetual";
+  const registry = { [key]: { mode: "DIRECT_QUANTITY_IS_UNDERLYING", underlyingAssetId: "FOO" } };
+  const r = deriveNotional(rawFacts, key, registry);
+  assert.equal(r.status, "VERIFIED");
+  assert.equal(r.notional_value, null);
+  assert.ok(r.warnings.includes("NOTIONAL_PRICE_MISSING"));
+});
+
+// ================== computeDerivativeExposure ==================
+test("computeDerivativeExposure: long y short verificados -> gross suma abs, net resta", () => {
+  const snapshots = [
+    { instrument: "BTCUSDT", side: "long", notional_value: 700, notional_asset_id: "USDT", unit_semantics_status: "VERIFIED" },
+    { instrument: "ETHUSDT", side: "short", notional_value: 300, notional_asset_id: "USDT", unit_semantics_status: "VERIFIED" },
+  ];
+  const r = computeDerivativeExposure(snapshots, { notionalAssetId: "USDT" });
+  assert.equal(r.gross, 1000);
+  assert.equal(r.net, 400);
+  assert.equal(r.excludedUnverified.length, 0);
+});
+
+test("computeDerivativeExposure: posicion UNVERIFIED se excluye del calculo pero se reporta, nunca se pierde en silencio", () => {
+  const snapshots = [
+    { instrument: "BTCUSDT", side: "long", notional_value: 700, notional_asset_id: "USDT", unit_semantics_status: "VERIFIED" },
+    { instrument: "BTCUSD_PERP", side: "long", notional_value: null, notional_asset_id: null, unit_semantics_status: "UNIT_SEMANTICS_UNVERIFIED" },
+  ];
+  const r = computeDerivativeExposure(snapshots, { notionalAssetId: "USDT" });
+  assert.equal(r.gross, 700);
+  assert.deepEqual(r.excludedUnverified, ["BTCUSD_PERP"]);
+});
+
+test("computeDerivativeExposure: asset distinto al pedido se excluye por mismatch, no se convierte a ciegas", () => {
+  const snapshots = [
+    { instrument: "BTCUSD_PERP", side: "long", notional_value: 0.05, notional_asset_id: "BTC", unit_semantics_status: "VERIFIED" },
+  ];
+  const r = computeDerivativeExposure(snapshots, { notionalAssetId: "USDT" });
+  assert.equal(r.gross, 0);
+  assert.deepEqual(r.excludedAssetMismatch, ["BTCUSD_PERP"]);
+});
+
+// ================== computeEffectiveExposure ==================
+test("computeEffectiveExposure: owned + derivative net, status OK sin exclusiones", () => {
+  const ownership = { owned: 0.5, available: 0.5, encumbered: 0 };
+  const exposure = { gross: 0.1, net: 0.1, excludedUnverified: [], excludedAssetMismatch: [] };
+  const r = computeEffectiveExposure(ownership, exposure);
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 0.6);
+});
+
+test("computeEffectiveExposure: con posiciones excluidas -> status PARTIAL, warning explicito", () => {
+  const ownership = { owned: 0.5, available: 0.5, encumbered: 0 };
+  const exposure = { gross: 0, net: 0, excludedUnverified: ["BTCUSD_PERP"], excludedAssetMismatch: [] };
+  const r = computeEffectiveExposure(ownership, exposure);
+  assert.equal(r.status, "PARTIAL");
+  assert.ok(r.warnings.includes("EXCLUDED_UNVERIFIED_POSITIONS"));
+});
+
+test("computeEffectiveExposure: ownership.owned no numerico -> DATA_UNAVAILABLE, nunca inventa un total", () => {
+  const r = computeEffectiveExposure({ owned: "DATA_UNAVAILABLE" }, { net: 5 });
+  assert.equal(r.status, "DATA_UNAVAILABLE");
+  assert.equal(r.value, null);
 });
