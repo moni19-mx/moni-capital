@@ -32,7 +32,17 @@ async function handleAssets(req, res, body) {
     if (!(await requirePin(res, pin))) return;
     const { name, asset_type, exchange, currency, provider_symbols, created_source } = body;
     const result = await createAsset(supabase, { ticker, name, asset_type, exchange, currency, provider_symbols, created_source });
-    return res.status(200).json(result);
+    // Traduccion explicita al contrato HTTP que el frontend ya espera
+    // (status:"ok") -- assetResolver.js internamente usa MATCHED_ASSET/
+    // ASSET_AMBIGUOUS/error, pero eso es vocabulario interno, no el
+    // contrato con el cliente.
+    if (result.status === "MATCHED_ASSET") {
+      return res.status(200).json({ status: "ok", asset_id: result.asset_id, asset: result.asset, already_existed: result.already_existed });
+    }
+    if (result.status === "ASSET_AMBIGUOUS") {
+      return res.status(200).json({ status: "ambiguous", error: "ASSET_AMBIGUOUS", candidates: result.candidates });
+    }
+    return res.status(200).json({ status: "error", error: result.error || "unknown_error" });
   }
   return res.status(400).json({ error: "unknown_action" });
 }
