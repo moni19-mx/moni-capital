@@ -4,7 +4,7 @@ import {
   getTransactionEffects, isInternalTransfer, classifyTransfer,
   getAccountEquity, computeNetWorth, computeAssetOwnership,
   deriveNotional, computeDerivativeExposure, computeEffectiveExposure,
-  matchDerivativePositionIdentity,
+  matchDerivativePositionIdentity, routeDerivativeSnapshot, routeDerivativeImportBatch,
 } from "../lib/reconciliationEngine.js";
 
 // ================== A. GEV PENDING BUY ==================
@@ -407,4 +407,95 @@ test("matchDerivativePositionIdentity: dos candidatas OPEN con la misma tupla (v
   const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null };
   const r = matchDerivativePositionIdentity(facts, existing);
   assert.equal(r.decision, "POSITION_IDENTITY_AMBIGUOUS");
+});
+
+// ================== D (routing). USD-M primer snapshot -> 2 proposals ==================
+test("D-routing - NEW_POSITION produce CREATE derivative_position + CREATE derivative_position_snapshot", () => {
+  const facts = {
+    account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual",
+    provider_position_id: null, margin_mode: "isolated",
+    position_quantity_value: 0.003, position_quantity_unit: "BTC",
+    entry_price: 77467.71, price_currency: "USDT",
+    margin_used_value: 139.07, margin_used_asset_id: "USDT",
+    observed_at: "2026-08-01T12:00:00Z",
+  };
+  const reconciliation = matchDerivativePositionIdentity(facts, []);
+  const proposals = routeDerivativeSnapshot(facts, reconciliation);
+  assert.equal(proposals.length, 2);
+  assert.equal(proposals[0].entity, "derivative_position");
+  assert.equal(proposals[0].operation, "CREATE");
+  assert.equal(proposals[1].entity, "derivative_position_snapshot");
+  assert.equal(proposals[1].operation, "CREATE");
+  assert.equal(proposals[1].target_id, null); // se resuelve despues de crear la posicion
+});
+
+test("routeDerivativeSnapshot: MATCH_EXISTING_HIGH produce SOLO el snapshot, sin CREATE de posicion nueva", () => {
+  const existing = [{ id: 42, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null, margin_mode: "isolated", position_quantity_value: 0.009, position_quantity_unit: "BTC" };
+  const reconciliation = matchDerivativePositionIdentity(facts, existing);
+  const proposals = routeDerivativeSnapshot(facts, reconciliation);
+  assert.equal(proposals.length, 1);
+  assert.equal(proposals[0].entity, "derivative_position_snapshot");
+  assert.equal(proposals[0].target_id, 42);
+});
+
+test("routeDerivativeSnapshot: AMBIGUOUS produce SOLO un REVIEW, nunca crea ni asocia nada", () => {
+  const reconciliation = { decision: "POSITION_IDENTITY_AMBIGUOUS", matchedPositionId: null, reconciliation_confidence: "AMBIGUOUS", reasons: ["conflicting_provider_position_id"] };
+  const proposals = routeDerivativeSnapshot({ instrument: "BTCUSDT" }, reconciliation);
+  assert.equal(proposals.length, 1);
+  assert.equal(proposals[0].entity, "derivative_position");
+  assert.equal(proposals[0].operation, "REVIEW");
+  assert.equal(proposals[0].reason, "POSITION_IDENTITY_AMBIGUOUS");
+});
+
+// ================== I / P. Multi-posicion, misma cuenta -- batch routing ==================
+test("I/P - Batch BTCUSDT LONG + ETHUSDT LONG + 1 balance USDT: 1 account_snapshot, 1 balance, 2 position snapshots, sin duplicar cuenta", () => {
+  const existingCandidates = [
+    { id: 100, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" },
+    { id: 101, account_id: 3, instrument: "ETHUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" },
+  ];
+  const batchResult = routeDerivativeImportBatch(
+    {
+      accountId: 3,
+      observedAt: "2026-08-01T12:00:00Z",
+      balanceFacts: [{ asset_id: "USDT", available_balance_value: 4194.93, margin_balance_value: 828.54, unrealized_pnl_value: -12 }],
+      positionFacts: [
+        { instrument: "BTCUSDT", side: "long", contract_type: "perpetual", margin_mode: "isolated", position_quantity_value: 0.009, position_quantity_unit: "BTC" },
+        { instrument: "ETHUSDT", side: "long", contract_type: "perpetual", margin_mode: "isolated", position_quantity_value: 0.2, position_quantity_unit: "ETH" },
+      ],
+    },
+    { openCandidates: existingCandidates }
+  );
+
+  assert.equal(batchResult.accountBalanceProposals.length, 1);
+  const positionSnapshotEntities = batchResult.positionSnapshotProposals.filter((p) => p.entity === "derivative_position_snapshot");
+  assert.equal(positionSnapshotEntities.length, 2);
+  assert.equal(batchResult.positionSnapshotProposals.filter((p) => p.entity === "derivative_position").length, 0); // ambas ya existian, sin CREATE de posicion
+  assert.equal(batchResult.warnings.length, 0);
+  // Confirmar que el account_snapshot es UNICO (un solo objeto, no un array con duplicados)
+  assert.equal(batchResult.accountSnapshotProposal.entity, "account_snapshot");
+  assert.equal(batchResult.accountSnapshotProposal.fields.account_id, 3);
+});
+
+test("routeDerivativeImportBatch: posicion ambigua dentro del batch se reporta en warnings, no tumba el resto del batch", () => {
+  const existingCandidates = [
+    { id: 1, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: "OLD_999" },
+  ];
+  const batchResult = routeDerivativeImportBatch(
+    {
+      accountId: 3,
+      observedAt: "2026-08-01T12:00:00Z",
+      balanceFacts: [],
+      positionFacts: [
+        { instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: "NEW_123" }, // conflicto -> AMBIGUOUS
+        { instrument: "ETHUSDT", side: "long", contract_type: "perpetual", position_quantity_value: 0.1, position_quantity_unit: "ETH" }, // normal -> NEW_POSITION
+      ],
+    },
+    { openCandidates: existingCandidates }
+  );
+  assert.equal(batchResult.warnings.length, 1);
+  assert.ok(batchResult.warnings[0].includes("POSITION_IDENTITY_AMBIGUOUS"));
+  // La segunda posicion (ETHUSDT) SI debe haberse procesado normal
+  const ethProposals = batchResult.positionSnapshotProposals.filter((p) => p.fields?.instrument === "ETHUSDT" || p.fields?.position_quantity_unit === "ETH");
+  assert.ok(ethProposals.length > 0);
 });
