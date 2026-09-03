@@ -5,6 +5,7 @@ import {
   getAccountEquity, computeNetWorth, computeAssetOwnership,
   deriveNotional, computeDerivativeExposure, computeEffectiveExposure,
   matchDerivativePositionIdentity, routeDerivativeSnapshot, routeDerivativeImportBatch,
+  classifyDuplicate,
 } from "../lib/reconciliationEngine.js";
 
 // ================== A. GEV PENDING BUY ==================
@@ -498,4 +499,51 @@ test("routeDerivativeImportBatch: posicion ambigua dentro del batch se reporta e
   // La segunda posicion (ETHUSDT) SI debe haberse procesado normal
   const ethProposals = batchResult.positionSnapshotProposals.filter((p) => p.fields?.instrument === "ETHUSDT" || p.fields?.position_quantity_unit === "ETH");
   assert.ok(ethProposals.length > 0);
+});
+
+// ================== K. Duplicado exacto por provider ID ==================
+test("K - Mismo provider_transaction_id en la misma cuenta: EXACT_DUPLICATE, matchLevel PROVIDER_ID", () => {
+  const existing = [{ id: 500, account_id: 2, provider_transaction_id: "BINANCE_TX_999" }];
+  const candidate = { account_id: 2, provider_transaction_id: "BINANCE_TX_999" };
+  const r = classifyDuplicate(candidate, existing);
+  assert.equal(r.result, "EXACT_DUPLICATE");
+  assert.equal(r.matchedTransactionId, 500);
+  assert.equal(r.matchLevel, "PROVIDER_ID");
+});
+
+test("classifyDuplicate: mismo provider_transaction_id pero cuenta DISTINTA -> no es duplicado por ese nivel", () => {
+  const existing = [{ id: 500, account_id: 2, provider_transaction_id: "BINANCE_TX_999" }];
+  const candidate = { account_id: 3, provider_transaction_id: "BINANCE_TX_999" };
+  const r = classifyDuplicate(candidate, existing);
+  assert.notEqual(r.matchLevel, "PROVIDER_ID");
+});
+
+// ================== L. Dos compras legitimas, mismo monto/dia ==================
+test("L - Dos compras reales del mismo monto el mismo dia: NUNCA EXACT_DUPLICATE, a lo mas POSSIBLE_DUPLICATE", () => {
+  const existing = [{ id: 600, asset_id: "META", transaction_date: "2026-08-12", type: "BUY", total: 500 }];
+  const candidate = { asset_id: "META", transaction_date: "2026-08-12", type: "BUY", total: 500 }; // sin transaction_at ni provider_transaction_id -- solo fecha
+  const r = classifyDuplicate(candidate, existing);
+  assert.notEqual(r.result, "EXACT_DUPLICATE"); // la aserción central del test L
+  assert.equal(r.result, "POSSIBLE_DUPLICATE");
+  assert.equal(r.matchLevel, "DATE_ONLY");
+});
+
+test("classifyDuplicate: timestamp exacto + todos los campos coinciden -> EXACT_DUPLICATE via EXACT_TIMESTAMP", () => {
+  const existing = [{ id: 700, account_id: 2, asset_id: "META", type: "BUY", transaction_at: "2026-08-12T14:30:00Z", quantity: 1.5, price: 333.33 }];
+  const candidate = { account_id: 2, asset_id: "META", type: "BUY", transaction_at: "2026-08-12T14:30:00Z", quantity: 1.5, price: 333.33 };
+  const r = classifyDuplicate(candidate, existing);
+  assert.equal(r.result, "EXACT_DUPLICATE");
+  assert.equal(r.matchLevel, "EXACT_TIMESTAMP");
+});
+
+test("classifyDuplicate: sin ninguna coincidencia -> NO_MATCH", () => {
+  const existing = [{ id: 1, asset_id: "META", transaction_date: "2026-08-12", total: 500 }];
+  const candidate = { asset_id: "META", transaction_date: "2026-08-13", total: 500 }; // fecha distinta
+  const r = classifyDuplicate(candidate, existing);
+  assert.equal(r.result, "NO_MATCH");
+  assert.equal(r.matchedTransactionId, null);
+});
+
+test("classifyDuplicate: existingTransactions no es array -> throw", () => {
+  assert.throws(() => classifyDuplicate({ asset_id: "META" }, "no-es-array"));
 });
