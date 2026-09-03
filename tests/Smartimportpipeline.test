@@ -1,0 +1,134 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { buildNormalizedExtraction, matchAccount } from "../lib/smartImportNormalize.js";
+import { getTransactionEffects, isEligibleForCreate, buildProposedChange, classifyDuplicate } from "../lib/reconciliationEngine.js";
+
+// Replica EXACTAMENTE el cableado de api/smart-import.js (pasos 9-14),
+// pero con "supabase"/duplicate-check simulados en vez de reales -- para
+// probar la composicion real de las funciones tal como el endpoint las
+// llama, no solo cada funcion aislada.
+function runPipeline({ raw, assetResolution, accounts, existingTransactions }) {
+  const accountMatch = matchAccount(
+    { accountNameRaw: raw.source?.account_name?.value ?? null, providerRaw: raw.source?.provider?.value ?? null },
+    accounts
+  );
+
+  const normalized = buildNormalizedExtraction({ raw, assetResolution, accountMatch });
+
+  const duplicateCandidate = {
+    account_id: normalized.account.account_id,
+    asset_id: normalized.asset.asset_id,
+    type: normalized.type,
+    quantity: normalized.quantity,
+    price: normalized.price,
+    total: normalized.total.value,
+    transaction_date: normalized.transaction_date,
+    transaction_at: null,
+    provider_transaction_id: normalized.provider_transaction_id,
+  };
+  const rawDuplicateResult = classifyDuplicate(duplicateCandidate, existingTransactions);
+  const matchedTransaction = rawDuplicateResult.matchedTransactionId != null
+    ? existingTransactions.find((t) => t.id === rawDuplicateResult.matchedTransactionId) || null
+    : null;
+  const duplicateResult = { ...rawDuplicateResult, matchedTransaction };
+
+  const effects = getTransactionEffects({
+    status: normalized.status.value === "PENDING" || normalized.status.value === "EXECUTED" ? normalized.status.value : "PENDING",
+    type: normalized.type === "BUY" || normalized.type === "SELL" ? normalized.type : "BUY",
+    fee: normalized.fee.value,
+  });
+
+  const eligibility = isEligibleForCreate(normalized);
+  const proposedChange = buildProposedChange({ normalized, duplicateResult, matchedTransaction, effects, eligibility });
+
+  return { normalized, duplicateResult, proposedChange };
+}
+
+function fv(value, confidence = "HIGH", evidence_text = null) {
+  return { value, confidence, evidence_text };
+}
+
+function gevRaw(overrides = {}) {
+  return {
+    document_type: "PURCHASE_CONFIRMATION",
+    sensitive_content_detected: false,
+    source: { provider: fv("ARQ"), account_name: fv(null, "LOW", null) },
+    transaction: {
+      ticker: fv("GEV"), asset_name: fv("GE Vernova"), type: fv("BUY"),
+      status_text_raw: fv("Pendiente"), status_model_guess: fv("PENDING"),
+      quantity: fv(1.973098215), price: fv(886.93), total: fv(1750),
+      currency: fv("USDC"), fee: fv(null, "LOW", null),
+      transaction_date: fv("2026-09-03"), transaction_time: fv(null, "LOW", null),
+      provider_transaction_id: fv(null, "LOW", null), order_id: fv(null, "LOW", null),
+      ...overrides.transaction,
+    },
+    warnings: [],
+  };
+}
+
+const ACCOUNTS = [{ id: 1, name: "ARQ", provider: "ARQ" }];
+const MATCHED_GEV = { status: "MATCHED_ASSET", ticker_normalized: "GEV", asset_id: 14 };
+const UNKNOWN_TICKER = { status: "UNKNOWN_ASSET", ticker_normalized: "ZZZZ", asset_id: null };
+
+// ================== A. Compra PENDING valida -> REVIEW_REQUIRED, CREATE/PENDING ==================
+test("A - pipeline completo: GEV PENDING nuevo -> ProposedChange CREATE con status PENDING", () => {
+  const { normalized, duplicateResult, proposedChange } = runPipeline({
+    raw: gevRaw(), assetResolution: MATCHED_GEV, accounts: ACCOUNTS, existingTransactions: [],
+  });
+  assert.equal(duplicateResult.result, "NO_MATCH");
+  assert.equal(proposedChange.operation, "CREATE");
+  assert.equal(proposedChange.fields.status, "PENDING");
+  assert.equal(normalized.overall_import_confidence, "HIGH");
+});
+
+// ================== B. Trade EXECUTED valido, nuevo -> CREATE/EXECUTED ==================
+test("B - pipeline completo: compra EXECUTED nueva, sin duplicado -> CREATE con status EXECUTED", () => {
+  const raw = gevRaw({ transaction: { status_text_raw: fv("Ejecutada"), status_model_guess: fv("EXECUTED") } });
+  const { proposedChange } = runPipeline({ raw, assetResolution: MATCHED_GEV, accounts: ACCOUNTS, existingTransactions: [] });
+  assert.equal(proposedChange.operation, "CREATE");
+  assert.equal(proposedChange.fields.status, "EXECUTED");
+});
+
+// ================== C. PENDING existente -> nueva evidencia EXECUTED -> UPDATE mismo id ==================
+test("C - pipeline completo: PENDING existente + nueva evidencia EXECUTED + mismo provider_transaction_id -> UPDATE, no segunda compra", () => {
+  const existingTransactions = [{
+    id: 200, account_id: 1, asset_id: 14, type: "BUY", status: "PENDING",
+    provider_transaction_id: "REAL_TX_555", total: 1750,
+  }];
+  const raw = gevRaw({
+    transaction: {
+      status_text_raw: fv("Ejecutada"), status_model_guess: fv("EXECUTED"),
+      provider_transaction_id: fv("REAL_TX_555"),
+    },
+  });
+  const { proposedChange } = runPipeline({ raw, assetResolution: MATCHED_GEV, accounts: ACCOUNTS, existingTransactions });
+  assert.equal(proposedChange.operation, "UPDATE");
+  assert.equal(proposedChange.target_id, 200);
+  assert.deepEqual(proposedChange.fields, { status: "EXECUTED" });
+});
+
+// ================== D. Possible duplicate date-only -> REVIEW, nunca UPDATE ==================
+test("D - pipeline completo: mismo dia/monto pero SIN provider_transaction_id -> POSSIBLE_DUPLICATE -> REVIEW, nunca UPDATE aunque diga EXECUTED", () => {
+  const existingTransactions = [{
+    id: 300, account_id: 1, asset_id: 14, type: "BUY", status: "PENDING",
+    provider_transaction_id: null, transaction_date: "2026-09-03", total: 1750,
+  }];
+  const raw = gevRaw({
+    transaction: { status_text_raw: fv("Ejecutada"), status_model_guess: fv("EXECUTED"), provider_transaction_id: fv(null, "LOW", null) },
+  });
+  const { duplicateResult, proposedChange } = runPipeline({ raw, assetResolution: MATCHED_GEV, accounts: ACCOUNTS, existingTransactions });
+  assert.equal(duplicateResult.result, "POSSIBLE_DUPLICATE");
+  assert.equal(proposedChange.operation, "REVIEW"); // NUNCA UPDATE -- aserción central
+  assert.equal(proposedChange.reason, "POSSIBLE_DUPLICATE");
+});
+
+// ================== E. Unknown asset -> REVIEW + warning ==================
+test("E - pipeline completo: ticker desconocido -> REVIEW por NOT_ELIGIBLE_FOR_CREATE, warning UNKNOWN_ASSET presente", () => {
+  const { normalized, proposedChange } = runPipeline({
+    raw: gevRaw({ transaction: { ticker: fv("ZZZZ") } }), assetResolution: UNKNOWN_TICKER, accounts: ACCOUNTS, existingTransactions: [],
+  });
+  assert.equal(proposedChange.operation, "REVIEW");
+  assert.ok(normalized.warnings.includes("UNKNOWN_ASSET"));
+});
+
+// ================== M. Invalid MIME / N. Oversized -- ya cubiertos en Stage 2 (validateImageInput), no se repiten aqui ==================
