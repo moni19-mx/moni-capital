@@ -4,6 +4,7 @@ import {
   getTransactionEffects, isInternalTransfer, classifyTransfer,
   getAccountEquity, computeNetWorth, computeAssetOwnership,
   deriveNotional, computeDerivativeExposure, computeEffectiveExposure,
+  matchDerivativePositionIdentity,
 } from "../lib/reconciliationEngine.js";
 
 // ================== A. GEV PENDING BUY ==================
@@ -324,4 +325,86 @@ test("computeEffectiveExposure: ownership.owned no numerico -> DATA_UNAVAILABLE,
   const r = computeEffectiveExposure({ owned: "DATA_UNAVAILABLE" }, { net: 5 });
   assert.equal(r.status, "DATA_UNAVAILABLE");
   assert.equal(r.value, null);
+});
+
+// ================== D. USD-M primer snapshot (sin candidatas) ==================
+test("D - USD-M primera vez, sin candidatas OPEN: NEW_POSITION", () => {
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null, margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(facts, []);
+  assert.equal(r.decision, "NEW_POSITION");
+  assert.equal(r.matchedPositionId, null);
+});
+
+// ================== E. USD-M snapshot actualizado (misma posicion) ==================
+test("E - USD-M snapshot actualizado: misma cuenta/instrumento/side/contract_type OPEN -> MATCH_EXISTING_HIGH, mismo id", () => {
+  const existing = [{ id: 42, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null, margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "MATCH_EXISTING_HIGH");
+  assert.equal(r.matchedPositionId, 42);
+  assert.equal(r.reconciliation_confidence, "HIGH");
+});
+
+test("E2 - margin_mode cambia respecto al candidato existente: baja a MEDIUM, no crea posicion nueva ni AMBIGUOUS", () => {
+  const existing = [{ id: 42, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null, margin_mode: "cross" };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "MATCH_EXISTING_MEDIUM");
+  assert.equal(r.matchedPositionId, 42);
+  assert.equal(r.reconciliation_confidence, "MEDIUM");
+});
+
+// ================== G. Close/reopen mismo dia ==================
+test("G - Posicion previa CLOSED no participa en el match: nueva evidencia OPEN -> NEW_POSITION", () => {
+  const existing = [{ id: 10, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "CLOSED", provider_position_id: null, margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null, margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "NEW_POSITION"); // el CLOSED se filtra, nunca se reengancha
+});
+
+// ================== H. Hedge mode ==================
+test("H - Hedge mode: existe LONG OPEN, llega evidencia SHORT del mismo instrumento -> NEW_POSITION, nunca se fusionan", () => {
+  const existing = [{ id: 20, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null, margin_mode: "isolated" }];
+  const factsShort = { account_id: 3, instrument: "BTCUSDT", side: "short", contract_type: "perpetual", provider_position_id: null, margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(factsShort, existing);
+  assert.equal(r.decision, "NEW_POSITION"); // side distinto = tupla distinta desde el inicio
+});
+
+// ================== J. Identidad ambigua ==================
+test("J - Tupla coincide pero provider_position_id conflictivo: POSITION_IDENTITY_AMBIGUOUS, no merge ni new silencioso", () => {
+  const existing = [{ id: 30, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: "OLD_ID_999", margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: "NEW_ID_123", margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "POSITION_IDENTITY_AMBIGUOUS");
+  assert.equal(r.matchedPositionId, null);
+  assert.equal(r.reconciliation_confidence, "AMBIGUOUS");
+});
+
+test("matchDerivativePositionIdentity: provider_position_id coincide exacto -> HIGH, gana sobre la tupla", () => {
+  const existing = [{ id: 55, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: "ABC123", margin_mode: "isolated" }];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: "ABC123", margin_mode: "isolated" };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "MATCH_EXISTING_HIGH");
+  assert.equal(r.matchedPositionId, 55);
+  assert.ok(r.reasons.includes("provider_position_id_match"));
+});
+
+test("matchDerivativePositionIdentity: side ausente -> INSUFFICIENT_DATA, resultado estructurado, no throw", () => {
+  const facts = { account_id: 3, instrument: "BTCUSDT", contract_type: "perpetual" };
+  const r = matchDerivativePositionIdentity(facts, []);
+  assert.equal(r.decision, "INSUFFICIENT_DATA");
+});
+
+test("matchDerivativePositionIdentity: account_id faltante -> throw (error de programacion)", () => {
+  assert.throws(() => matchDerivativePositionIdentity({ instrument: "BTCUSDT", side: "long", contract_type: "perpetual" }, []));
+});
+
+test("matchDerivativePositionIdentity: dos candidatas OPEN con la misma tupla (violacion hipotetica) -> AMBIGUOUS defensivo", () => {
+  const existing = [
+    { id: 1, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null },
+    { id: 2, account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", status: "OPEN", provider_position_id: null },
+  ];
+  const facts = { account_id: 3, instrument: "BTCUSDT", side: "long", contract_type: "perpetual", provider_position_id: null };
+  const r = matchDerivativePositionIdentity(facts, existing);
+  assert.equal(r.decision, "POSITION_IDENTITY_AMBIGUOUS");
 });
