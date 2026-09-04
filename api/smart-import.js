@@ -246,8 +246,13 @@ export default async function handler(req, res) {
   // ================== 6. Schema validation ==================
   const parsed = parseModelJsonOutput(visionResult.content, SmartImportRawExtractionSchema);
   if (!parsed.valid) {
+    console.error(JSON.stringify(buildSafeLogEntry({
+      import_id: importId, model_provider: "anthropic", status: "FAILED", error_code: "SCHEMA_VALIDATION_FAILED",
+      schema_version: SMART_IMPORT_SCHEMA_VERSION, prompt_version: SMART_IMPORT_PROMPT_VERSION,
+    })));
+    console.error("SCHEMA_VALIDATION_FAILED detail:", parsed.detail);
     await markFailed(importId, "SCHEMA_VALIDATION_FAILED");
-    return res.status(502).json({ ok: false, import_id: importId, status: "FAILED", error_code: "SCHEMA_VALIDATION_FAILED" });
+    return res.status(502).json({ ok: false, import_id: importId, status: "FAILED", error_code: "SCHEMA_VALIDATION_FAILED", detail: parsed.detail });
   }
   const raw = parsed.data;
 
