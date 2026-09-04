@@ -296,6 +296,16 @@ export default async function handler(req, res) {
   // Ya aplicados dentro de buildNormalizedExtraction (paso 9).
 
   // ================== 12. Duplicate check ==================
+  // NOTA HONESTA: transaction_at queda NULL deliberadamente. El modelo
+  // extrae fecha/hora en lenguaje natural en español (ej. "1 sept 2026",
+  // "9:16 a.m."), pero transactions.transaction_at es timestamptz real --
+  // convertir texto libre en un timestamp exacto y comparable de forma
+  // confiable (nombres de mes en español, am/pm, zonas horarias) es una
+  // funcionalidad real que merece su propio diseño, no un parche rapido
+  // aqui. Mientras tanto, el Nivel 2 de identidad (timestamp exacto)
+  // simplemente no esta disponible -- el sistema cae correctamente a
+  // Nivel 1 (provider_transaction_id) o Nivel 3 (solo fecha), nunca
+  // inventa una comparacion de timestamp que no sea confiable.
   const duplicateCandidate = {
     account_id: normalized.account.account_id,
     asset_id: normalized.asset.asset_id,
@@ -304,7 +314,7 @@ export default async function handler(req, res) {
     price: normalized.price,
     total: normalized.total.value,
     transaction_date: normalized.transaction_date,
-    transaction_at: null, // Phase 1 no separa hora exacta de forma confiable desde la imagen
+    transaction_at: null,
     provider_transaction_id: normalized.provider_transaction_id,
   };
   const duplicateResult = await resolveDuplicateCheck(supabase, duplicateCandidate);
