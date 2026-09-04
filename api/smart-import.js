@@ -225,7 +225,12 @@ export default async function handler(req, res) {
         role: "user",
         content: [
           { type: "image", source: { type: "base64", media_type: mime_type, data: image_base64 } },
-          { type: "text", text: "Extrae los datos de esta imagen segun el schema y las reglas del sistema." },
+          {
+            type: "text",
+            text: "Extrae los datos de esta imagen. Tu respuesta DEBE tener exactamente esta estructura JSON (los mismos nombres de campo, exactamente estos, sin inventar ni renombrar ninguno):\n\n"
+              + JSON.stringify(SmartImportRawExtractionSchema, null, 2)
+              + "\n\nResponde UNICAMENTE con un objeto JSON que cumpla ese schema. Nada de texto antes o despues, nada de markdown.",
+          },
         ],
       }],
       tools: [],
