@@ -3793,12 +3793,62 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
     );
   }
 
+  const [loadByIdValue, setLoadByIdValue] = useState("");
+  const [loadingById, setLoadingById] = useState(false);
+
+  async function loadExistingImport() {
+    const id = Number(loadByIdValue);
+    if (!id) return;
+    setLoadingById(true);
+    setErrorInfo(null);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/smart_imports?id=eq.${id}&select=*`, {
+        headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+      });
+      if (!res.ok) throw new Error("No se pudo leer el import");
+      const rows = await res.json();
+      const row = rows[0];
+      if (!row) { setErrorInfo({ error_code: null, custom: `No existe ningún import con id ${id}.` }); return; }
+      setImportData({
+        import_id: row.id,
+        status: row.status,
+        normalized_extraction: row.normalized_extraction,
+        proposed_changes: row.proposed_changes,
+        warnings: row.normalized_extraction?.warnings || [],
+      });
+      setUserEdits({});
+      if (row.status === "REVIEW_REQUIRED") {
+        setState("REVIEW");
+      } else if (row.status === "CONFIRMED") {
+        setErrorInfo({ error_code: null, custom: `El import #${id} ya está confirmado — no hay nada que revisar.` });
+      } else {
+        setErrorInfo({ error_code: row.error_code || null, custom: `Import #${id}: estado ${row.status}.` });
+      }
+    } catch (e) {
+      setErrorInfo({ error_code: null, custom: String(e.message || e) });
+    } finally {
+      setLoadingById(false);
+    }
+  }
+
   // ================== IDLE / FILE_SELECTED ==================
   if (state === "IDLE" || state === "FILE_SELECTED") {
     return (
       <div style={cardStyle}>
         <div style={{ fontSize: 13, fontWeight: 700, color: TXT, marginBottom: 12 }}>Importar captura</div>
         <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} style={{ fontSize: 12, color: MUTE, marginBottom: 12 }} />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0", fontSize: 11, color: MUTE }}>
+          <div style={{ flex: 1, height: 1, background: LINE }} />
+          o revisa un import ya analizado
+          <div style={{ flex: 1, height: 1, background: LINE }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, maxWidth: 280 }}>
+          <input style={{ ...inputStyle, width: 100 }} type="number" placeholder="ID del import" value={loadByIdValue} onChange={(e) => setLoadByIdValue(e.target.value)} />
+          <button type="button" onClick={loadExistingImport} disabled={loadingById} style={{ background: "none", border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>
+            {loadingById ? "Cargando…" : "Cargar"}
+          </button>
+        </div>
         {file && (
           <div style={{ display: "flex", gap: 14, alignItems: "flex-start", marginTop: 10, marginBottom: 14, flexWrap: "wrap" }}>
             <img src={previewUrl} alt="preview" style={{ maxWidth: 180, maxHeight: 180, borderRadius: 8, border: `1px solid ${LINE}`, objectFit: "contain" }} />
