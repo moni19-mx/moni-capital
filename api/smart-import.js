@@ -26,7 +26,7 @@ import {
 import {
   validateUserEditKeys, applyEditsToNormalized, buildRpcParams,
 } from "../lib/smartImportConfirm.js";
-import { normalizeFuturesAccountBalance, normalizeFuturesPositionFacts } from "../lib/futuresImportNormalize.js";
+import { normalizeFuturesAccountBalance, normalizeFuturesPositionFacts, resolveAccountContext } from "../lib/futuresImportNormalize.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -335,7 +335,7 @@ export default async function handler(req, res) {
   // ================== 1-2. PIN + validacion de request/imagen ==================
   if (!(await requirePin(res, pin))) return;
 
-  const { image_base64, mime_type, filename } = req.body || {};
+  const { image_base64, mime_type, filename, selected_account_id } = req.body || {};
   if (!image_base64 || !mime_type) {
     return res.status(400).json({ ok: false, error_code: "INVALID_REQUEST" });
   }
@@ -482,19 +482,48 @@ export default async function handler(req, res) {
     if (raw.document_type === "FUTURES_POSITION_SNAPSHOT") {
       normalizedSnapshot = normalizeFuturesPositionFacts(raw);
     } else {
-      const accountContext = {
-        accountType: raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" ? "spot" : "futures",
-        provider: raw.account?.provider?.value ?? null,
-        productType: raw.account?.product_type?.value ?? (raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" ? "SPOT" : null),
+      const { data: allAccounts } = await supabase.from("accounts").select("*");
+      const accountResolution = resolveAccountContext({
+        selectedAccountId: selected_account_id ?? null,
+        rawProvider: raw.account?.provider?.value ?? null,
+        rawProductType: raw.account?.product_type?.value ?? null,
+        accounts: allAccounts || [],
+      });
+
+      // accountContext para getAccountEquity: SOLO campos ya normalizados,
+      // nunca strings crudos del modelo (regla dura de esta fase).
+      const equityAccountContext = {
+        accountType: raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" ? "SPOT" : (accountResolution.accountType || "FUTURES"),
+        provider: accountResolution.provider,
+        productType: accountResolution.productType,
       };
+
       normalizedSnapshot = {
-        account: raw.account,
+        account: {
+          account_id: accountResolution.accountId,
+          provider: accountResolution.provider,
+          account_type: accountResolution.accountType,
+          product_type: accountResolution.productType,
+          context_source: accountResolution.contextSource,
+          raw_provider: accountResolution.rawProvider,
+          raw_product_type: accountResolution.rawProductType,
+        },
+        account_resolution_status: accountResolution.status,
+        // GAP DOCUMENTADO, a proposito: el "Balance de margen" total a
+        // nivel cuenta (ej. "$4,357.93") que Binance muestra arriba de la
+        // pantalla NO tiene todavia un campo estructurado propio en el
+        // schema de extraccion -- el modelo solo lo describe en warnings
+        // de texto libre. No se implementa el warning de reconciliacion
+        // account-level vs suma de asset-level en este paso (no estaba en
+        // el alcance autorizado) -- se deja para un paso futuro que
+        // agregue ese campo al schema formalmente.
         observed_at: raw.observed_at?.value ?? null,
         balances: (raw.balances || []).map((b) =>
           raw.document_type === "SPOT_ACCOUNT_SNAPSHOT"
             ? { asset_symbol: b.asset_symbol?.value ?? null, quantity: b.quantity?.value ?? null }
-            : normalizeFuturesAccountBalance(b, accountContext)
+            : normalizeFuturesAccountBalance(b, equityAccountContext)
         ),
+        warnings: accountResolution.warnings || [],
       };
     }
 
