@@ -16,10 +16,16 @@ import {
   callModel, validateImageInput, parseModelJsonOutput, buildSafeLogEntry,
   SMART_IMPORT_PROMPT_VERSION, SMART_IMPORT_SCHEMA_VERSION,
 } from "../lib/aiGateway.js";
-import { resolveAsset } from "../lib/assetResolver.js";
+import { resolveAsset, resolveAssetById } from "../lib/assetResolver.js";
 import { buildNormalizedExtraction, matchAccount } from "../lib/smartImportNormalize.js";
 import { resolveDuplicateCheck } from "../lib/reconciliationQueries.js";
-import { getTransactionEffects, isEligibleForCreate, buildProposedChange } from "../lib/reconciliationEngine.js";
+import {
+  getTransactionEffects, isEligibleForCreate, buildProposedChange,
+  evaluateDateUpdateEligibility, evaluateIdentityFieldConsistency,
+} from "../lib/reconciliationEngine.js";
+import {
+  validateUserEditKeys, applyEditsToNormalized, buildRpcParams,
+} from "../lib/smartImportConfirm.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -126,6 +132,189 @@ async function markFailed(importId, errorCode) {
   } catch (e) { /* el marcado de fallo nunca debe tumbar la respuesta de error ya en curso */ }
 }
 
+// ================== ACCION: confirm ==================
+async function handleConfirm(req, res, body) {
+  const { pin, import_id, approved_change_indices, user_edits } = body;
+  if (!(await requirePin(res, pin))) return;
+
+  if (import_id == null) {
+    return res.status(400).json({ ok: false, error_code: "IMPORT_NOT_FOUND" });
+  }
+
+  // ================== 2-3. Cargar smart_import, validar estado ==================
+  const { data: importRow, error: importErr } = await supabase.from("smart_imports").select("*").eq("id", import_id).maybeSingle();
+  if (importErr) return res.status(500).json({ ok: false, error_code: "DB_ERROR" });
+  if (!importRow) return res.status(404).json({ ok: false, error_code: "IMPORT_NOT_FOUND" });
+
+  if (importRow.status === "CONFIRMED") {
+    return res.status(200).json({ ok: true, import_id, status: "CONFIRMED", already_confirmed: true, applied: importRow.approved_changes });
+  }
+  if (importRow.status !== "REVIEW_REQUIRED") {
+    return res.status(409).json({ ok: false, import_id, status: importRow.status, error_code: "INVALID_IMPORT_STATE" });
+  }
+
+  // ================== 4. Validar approved_change_indices ==================
+  const proposedChanges = importRow.normalized_extraction ? (importRow.proposed_changes || []) : [];
+  if (!Array.isArray(approved_change_indices) || approved_change_indices.length !== 1) {
+    return res.status(400).json({ ok: false, import_id, error_code: "INVALID_APPROVED_INDICES" });
+  }
+  const idx = approved_change_indices[0];
+  const uniqueIndices = new Set(approved_change_indices);
+  if (uniqueIndices.size !== approved_change_indices.length || !Number.isInteger(idx) || idx < 0 || idx >= proposedChanges.length) {
+    return res.status(400).json({ ok: false, import_id, error_code: "INVALID_APPROVED_INDICES" });
+  }
+
+  // ================== 5. Validar whitelist de user_edits ==================
+  const editsForIndex = (user_edits && user_edits[String(idx)]) || {};
+  const keyCheck = validateUserEditKeys(editsForIndex);
+  if (!keyCheck.valid) {
+    return res.status(400).json({ ok: false, import_id, error_code: "INVALID_USER_EDIT", field: keyCheck.field });
+  }
+
+  // ================== 6. Aplicar edits ==================
+  const baseNormalized = importRow.normalized_extraction;
+  const { normalized: editedNormalized, auditTrail, identityChanged, assetEdited, accountEdited } =
+    applyEditsToNormalized(baseNormalized, editsForIndex);
+
+  // ================== 6b. Re-resolver asset/account si fueron editados (siempre, no solo si "identityChanged") ==================
+  if (assetEdited) {
+    const real = await resolveAssetById(supabase, editedNormalized.asset.asset_id);
+    if (real.status !== "MATCHED_ASSET") {
+      return res.status(400).json({ ok: false, import_id, error_code: "INVALID_USER_EDIT", field: "asset_id", detail: "UNKNOWN_ASSET" });
+    }
+    editedNormalized.asset = { ticker_raw: baseNormalized.asset?.ticker_raw ?? null, ticker_normalized: real.ticker_normalized, match_status: "MATCHED_ASSET", asset_id: real.asset_id };
+  }
+  if (accountEdited) {
+    if (editedNormalized.account.account_id != null) {
+      const { data: acc } = await supabase.from("accounts").select("id").eq("id", editedNormalized.account.account_id).maybeSingle();
+      if (!acc) {
+        return res.status(400).json({ ok: false, import_id, error_code: "INVALID_USER_EDIT", field: "account_id", detail: "UNKNOWN_ACCOUNT" });
+      }
+      editedNormalized.account = { provider_raw: baseNormalized.account?.provider_raw ?? null, match_status: "MATCHED_ACCOUNT", account_id: acc.id };
+    } else {
+      editedNormalized.account = { provider_raw: baseNormalized.account?.provider_raw ?? null, match_status: "UNKNOWN_ACCOUNT", account_id: null };
+    }
+  }
+
+  // ================== 7. Duplicate check SIEMPRE, con los valores (editados o no) actuales ==================
+  const duplicateCandidate = {
+    account_id: editedNormalized.account.account_id,
+    asset_id: editedNormalized.asset.asset_id,
+    type: editedNormalized.type,
+    quantity: editedNormalized.quantity,
+    price: editedNormalized.price,
+    total: editedNormalized.total?.value ?? null,
+    transaction_date: editedNormalized.transaction_date,
+    transaction_at: null,
+    provider_transaction_id: editedNormalized.provider_transaction_id,
+  };
+  const duplicateResult = await resolveDuplicateCheck(supabase, duplicateCandidate);
+
+  // ================== 8. SELL -- hard block, RPC nunca se llama ==================
+  if (editedNormalized.type === "SELL") {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "CONFIRMATION_NOT_ALLOWED", reason: "SELL_NOT_SUPPORTED_V1" });
+  }
+
+  const effects = getTransactionEffects({
+    status: editedNormalized.status.value === "PENDING" || editedNormalized.status.value === "EXECUTED" ? editedNormalized.status.value : "PENDING",
+    type: editedNormalized.type === "BUY" ? "BUY" : "BUY",
+    fee: editedNormalized.fee?.value ?? null,
+  });
+  const eligibility = isEligibleForCreate(editedNormalized);
+  const decision = buildProposedChange({ normalized: editedNormalized, duplicateResult, matchedTransaction: duplicateResult.matchedTransaction, effects, eligibility });
+
+  // ================== REVIEW: nunca se confirma como CREATE/UPDATE ==================
+  if (decision.operation === "REVIEW") {
+    const reasonCode = decision.reason === "EXACT_DUPLICATE" ? "DUPLICATE_DETECTED_AT_CONFIRM"
+      : decision.reason === "POSSIBLE_DUPLICATE" ? "STALE_PROPOSAL"
+      : "CONFIRMATION_NOT_ALLOWED";
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: reasonCode, reason: decision.reason, warnings: editedNormalized.warnings });
+  }
+
+  let rpcOperation, targetTransactionId = null, shouldUpdateTransactionDate = false, dateChangeReason = null;
+
+  if (decision.operation === "UPDATE") {
+    // ================== 9. Bloqueo de posicion nueva solo aplica a CREATE; UPDATE ya tiene target existente ==================
+    targetTransactionId = decision.target_id;
+
+    // Cargar la fila completa del target para material-difference y date-confidence checks
+    const { data: targetTx } = await supabase.from("transactions").select("*").eq("id", targetTransactionId).maybeSingle();
+    if (!targetTx) {
+      return res.status(409).json({ ok: false, import_id, error_code: "TARGET_TRANSACTION_NOT_FOUND" });
+    }
+
+    const consistency = evaluateIdentityFieldConsistency({
+      originalQuantity: targetTx.quantity, newQuantity: editedNormalized.quantity,
+      originalAmount: targetTx.amount, newAmount: editedNormalized.total?.value != null ? -Math.abs(editedNormalized.total.value) : null,
+    });
+    if (consistency.action === "REQUIRES_REVIEW") {
+      return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "CONFIRMATION_NOT_ALLOWED", reason: consistency.reason, detail: consistency });
+    }
+
+    // Confidence original de la fecha: transactions.import_id -> smart_imports.normalized_extraction.transaction_date_confidence
+    let originalDateConfidence = null;
+    if (targetTx.import_id != null) {
+      const { data: origImport } = await supabase.from("smart_imports").select("normalized_extraction").eq("id", targetTx.import_id).maybeSingle();
+      originalDateConfidence = origImport?.normalized_extraction?.transaction_date_confidence ?? null;
+    }
+    const dateEligibility = evaluateDateUpdateEligibility({
+      originalDate: targetTx.transaction_date, originalConfidence: originalDateConfidence,
+      newDate: editedNormalized.transaction_date, newConfidence: editedNormalized.transaction_date_confidence ?? null,
+    });
+    if (dateEligibility.action === "REQUIRES_REVIEW") {
+      shouldUpdateTransactionDate = false;
+    } else if (dateEligibility.action === "UPDATE_ALLOWED") {
+      shouldUpdateTransactionDate = true;
+      dateChangeReason = dateEligibility.reason;
+    }
+
+    rpcOperation = "UPDATE_PENDING_TO_EXECUTED";
+  } else {
+    // CREATE
+    if (editedNormalized.status.value === "EXECUTED") {
+      const { data: existingPos } = await supabase.from("positions").select("id").eq("asset_id", editedNormalized.asset.asset_id).maybeSingle();
+      if (!existingPos) {
+        return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "NEW_POSITION_METADATA_REQUIRED" });
+      }
+      rpcOperation = "CREATE_EXECUTED_EXISTING_POSITION";
+    } else {
+      rpcOperation = "CREATE_PENDING";
+    }
+  }
+
+  // ================== 15. Una sola llamada al RPC ==================
+  const approvedChangesSnapshot = { ...decision, audit_trail: auditTrail };
+  const rpcParams = buildRpcParams({
+    importId: import_id, operation: rpcOperation, targetTransactionId,
+    normalized: editedNormalized, shouldUpdateTransactionDate, dateChangeReason,
+    approvedChanges: approvedChangesSnapshot, userEdits: user_edits || {},
+  });
+
+  const { data: rpcResult, error: rpcError } = await supabase.rpc("confirm_smart_import_transaction", rpcParams);
+  if (rpcError) {
+    // Error inesperado del RPC -- nunca se oculta, nunca se marca CONFIRMED falsamente.
+    console.error(JSON.stringify(buildSafeLogEntry({ import_id, status: "ERROR", error_code: "RPC_UNEXPECTED_ERROR" })));
+    return res.status(500).json({ ok: false, import_id, error_code: "RPC_UNEXPECTED_ERROR" });
+  }
+
+  // ================== 16. Interpretar resultado ==================
+  if (rpcResult.result === "CONFIRMED") {
+    return res.status(200).json({
+      ok: true, import_id, status: "CONFIRMED",
+      applied: [{ entity: "transaction", id: rpcResult.transaction_id, operation: rpcResult.transaction_operation }],
+      position_operation: rpcResult.position_operation,
+    });
+  }
+  if (rpcResult.result === "ALREADY_CONFIRMED" || rpcResult.result === "ALREADY_APPLIED") {
+    return res.status(200).json({ ok: true, import_id, status: rpcResult.result, transaction_id: rpcResult.transaction_id ?? null });
+  }
+
+  // Cualquier otro resultado controlado del RPC (IMPORT_NOT_FOUND, INVALID_IMPORT_STATE,
+  // POSITION_NOT_FOUND_AT_CONFIRM, TARGET_TRANSACTION_NOT_FOUND, TARGET_TRANSACTION_CHANGED,
+  // DUPLICATE_IDENTITY_AT_CONFIRM, MULTIPLE_POSITIONS_FOUND, INVALID_OPERATION)
+  return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: rpcResult.result, detail: rpcResult });
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -139,6 +328,11 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "method_not_allowed" });
   }
   const { pin, action } = req.body || {};
+
+  if (action === "confirm") {
+    return handleConfirm(req, res, req.body || {});
+  }
+
   if (action !== "extract") {
     return res.status(400).json({ error: "unknown_action" });
   }
