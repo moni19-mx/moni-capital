@@ -26,6 +26,7 @@ import {
 import {
   validateUserEditKeys, applyEditsToNormalized, buildRpcParams,
 } from "../lib/smartImportConfirm.js";
+import { normalizeFuturesAccountBalance, normalizeFuturesPositionFacts } from "../lib/futuresImportNormalize.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -33,80 +34,74 @@ const supabase = createClient(
 );
 
 // ================== Schema congelado (SmartImportRawExtraction) ==================
-const SmartImportRawExtractionSchema = {
-  definitions: {
-    FieldValueString: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
-      properties: { value: { type: ["string", "null"] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
-    FieldValueNumber: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
-      properties: { value: { type: ["number", "null"] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
-    FieldValueTradeType: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
-      properties: { value: { enum: ["BUY", "SELL", null] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
-    FieldValueStatusGuess: { type: "object", additionalProperties: false, required: ["value", "confidence", "evidence_text"],
-      properties: { value: { enum: ["PROPOSED", "PENDING", "EXECUTED", "CANCELLED", "REJECTED", null] }, confidence: { enum: ["HIGH", "MEDIUM", "LOW"] }, evidence_text: { type: ["string", "null"] } } },
-  },
-  type: "object",
-  additionalProperties: false,
-  required: ["document_type", "sensitive_content_detected", "source", "transaction", "warnings"],
-  properties: {
-    document_type: { enum: ["PURCHASE_CONFIRMATION", "SALE_CONFIRMATION", "UNKNOWN"] },
-    sensitive_content_detected: { type: "boolean" },
-    source: {
-      type: "object", additionalProperties: false, required: ["provider", "account_name"],
-      properties: {
-        provider: { $ref: "#/definitions/FieldValueString" },
-        account_name: { $ref: "#/definitions/FieldValueString" },
-      },
-    },
-    transaction: {
-      type: "object", additionalProperties: false,
-      required: ["ticker", "asset_name", "type", "status_text_raw", "status_model_guess", "quantity", "price", "total", "currency", "fee", "transaction_date", "transaction_time", "provider_transaction_id", "order_id"],
-      properties: {
-        ticker: { $ref: "#/definitions/FieldValueString" },
-        asset_name: { $ref: "#/definitions/FieldValueString" },
-        type: { $ref: "#/definitions/FieldValueTradeType" },
-        status_text_raw: { $ref: "#/definitions/FieldValueString" },
-        status_model_guess: { $ref: "#/definitions/FieldValueStatusGuess" },
-        quantity: { $ref: "#/definitions/FieldValueNumber" },
-        price: { $ref: "#/definitions/FieldValueNumber" },
-        total: { $ref: "#/definitions/FieldValueNumber" },
-        currency: { $ref: "#/definitions/FieldValueString" },
-        fee: { $ref: "#/definitions/FieldValueNumber" },
-        transaction_date: { $ref: "#/definitions/FieldValueString" },
-        transaction_time: { $ref: "#/definitions/FieldValueString" },
-        provider_transaction_id: { $ref: "#/definitions/FieldValueString" },
-        order_id: { $ref: "#/definitions/FieldValueString" },
-      },
-    },
-    warnings: { type: "array", items: { type: "string" } },
-  },
-};
+import { SmartImportRawExtractionSchema } from "../lib/smartImportSchema.js";
 
 const VISION_SYSTEM_PROMPT = `Eres el motor de extraccion de Smart Import de Moni Capital. Tu unica
-tarea es leer una imagen (screenshot de una confirmacion de compra o
-venta) y devolver UNICAMENTE un objeto JSON que siga exactamente el
-schema proporcionado. Nunca texto libre, nunca explicaciones fuera del
-JSON, nunca markdown.
+tarea es leer una imagen y devolver UNICAMENTE un objeto JSON que siga
+exactamente el schema proporcionado. Nunca texto libre, nunca
+explicaciones fuera del JSON, nunca markdown.
 
-Reglas obligatorias, sin excepcion:
+PRIMERO clasifica que tipo de documento es la imagen, usando document_type:
+
+- PURCHASE_CONFIRMATION / SALE_CONFIRMATION: confirmacion de una compra
+  o venta individual de un activo (accion, cripto).
+- SPOT_ACCOUNT_SNAPSHOT: vista de balances de una cuenta spot/wallet
+  (tenencias propias, sin apalancamiento, sin posiciones).
+- FUTURES_ACCOUNT_SNAPSHOT: vista del balance de una cuenta de futuros
+  (wallet balance, margin balance, available, unrealized PnL a nivel
+  de cuenta) -- NO una posicion individual.
+- FUTURES_POSITION_SNAPSHOT: vista de UNA posicion abierta de futuros
+  (instrumento, side, leverage, entry/mark/liquidation price).
+- UNKNOWN: la imagen no corresponde claramente a ninguno de los
+  anteriores.
+
+Cada tipo de documento tiene su propio conjunto de campos -- el JSON que
+devuelvas debe tener EXACTAMENTE los campos de su tipo, ningun campo de
+otro tipo mezclado.
+
+Reglas obligatorias, sin excepcion, para TODOS los tipos:
 
 1. Solo reportas lo que es VISIBLEMENTE evidente en la imagen. Nunca
    adivinas, nunca infieres, nunca completas un dato faltante.
 2. Si un dato no aparece en la imagen: value = null. Nunca inventes un
    valor "razonable".
-3. status_model_guess NUNCA puede ser "EXECUTED" solo porque veas
-   quantity y price -- esos campos NO son evidencia de ejecucion. Solo
-   marca EXECUTED si ves texto/icono que lo confirme explicitamente.
-4. Un simbolo "$" NUNCA significa automaticamente USD. Si no ves un
-   codigo de moneda explicito (USD, USDC, USDT, MXN, etc.), currency
-   debe quedar null.
-5. NUNCA calcules un campo financiero faltante (total, price, quantity).
-6. Cada campo relevante lleva su evidence_text: la cita textual exacta
+3. Cada campo relevante lleva su evidence_text: la cita textual exacta
    de lo que viste. Si no hay evidencia, evidence_text es null.
-7. Si detectas contenido que parezca una seed phrase, private key, o
+4. Si detectas contenido que parezca una seed phrase, private key, o
    password: sensitive_content_detected = true, y NO reproduzcas ese
    texto en ningun campo del JSON, ni en evidence_text.
-8. Tu respuesta debe validar exactamente contra el JSON Schema
+5. Tu respuesta debe validar exactamente contra el JSON Schema
    proporcionado. Nada de campos extra, nada de campos faltantes.
+
+Reglas adicionales para PURCHASE_CONFIRMATION / SALE_CONFIRMATION:
+
+- status_model_guess NUNCA puede ser "EXECUTED" solo porque veas
+  quantity y price -- esos campos NO son evidencia de ejecucion. Solo
+  marca EXECUTED si ves texto/icono que lo confirme explicitamente.
+- Un simbolo "$" NUNCA significa automaticamente USD. Si no ves un
+  codigo de moneda explicito (USD, USDC, USDT, MXN, etc.), currency
+  debe quedar null.
+- NUNCA calcules un campo financiero faltante (total, price, quantity).
+
+Reglas adicionales para FUTURES_ACCOUNT_SNAPSHOT:
+
+- NUNCA calcules ni derives "equity" -- solo reporta los campos que
+  la pantalla muestra literalmente (wallet_balance, margin_balance,
+  available_balance, unrealized_pnl, initial_margin, maintenance_margin).
+  El calculo de equity lo hace el sistema despues, nunca tu.
+- Si un componente no es visible en la pantalla, su value es null --
+  nunca asumas que "no visible" significa cero.
+
+Reglas adicionales para FUTURES_POSITION_SNAPSHOT:
+
+- notional es el valor nocional/valor de la posicion tal como lo
+  muestra la pantalla (si lo muestra) -- nunca lo calcules tu
+  multiplicando price x quantity.
+- side debe ser exactamente "LONG" o "SHORT" segun lo que la pantalla
+  indique explicitamente (color, texto, icono) -- null si no es claro.
+- account_ref es el nombre de la cuenta/pestaña tal como aparece en
+  pantalla (ej. "Binance USD-M", "Binance COIN-M") -- texto literal,
+  no interpretado.
 
 Responde UNICAMENTE con el JSON. Sin backticks de markdown, sin texto
 antes o despues.`;
@@ -473,7 +468,63 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, import_id: importId, status: "FAILED", error_code: "DB_WRITE_FAILED" });
   }
 
-  // ================== 9. Normalization: asset + account resolution ==================
+  // ================== 9. Normalization: bifurca segun document_type ==================
+  // PURCHASE_CONFIRMATION/SALE_CONFIRMATION: pipeline existente, sin cambios.
+  // Los 3 tipos de snapshot: normalizacion + resolucion de asset/cuenta,
+  // pero SIN duplicate-check ni ProposedChange todavia -- la persistencia
+  // real de snapshots (routeDerivativeImportBatch) no esta autorizada
+  // todavia en esta fase. Llega a REVIEW_REQUIRED con los datos
+  // normalizados visibles, para que puedas confirmar que la extraccion
+  // en si funciona antes de construir la escritura real.
+  if (raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" || raw.document_type === "FUTURES_ACCOUNT_SNAPSHOT" || raw.document_type === "FUTURES_POSITION_SNAPSHOT") {
+    let normalizedSnapshot;
+
+    if (raw.document_type === "FUTURES_POSITION_SNAPSHOT") {
+      normalizedSnapshot = normalizeFuturesPositionFacts(raw);
+    } else {
+      const accountContext = {
+        accountType: raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" ? "spot" : "futures",
+        provider: raw.account?.provider?.value ?? null,
+        productType: raw.account?.product_type?.value ?? (raw.document_type === "SPOT_ACCOUNT_SNAPSHOT" ? "SPOT" : null),
+      };
+      normalizedSnapshot = {
+        account: raw.account,
+        observed_at: raw.observed_at?.value ?? null,
+        balances: (raw.balances || []).map((b) =>
+          raw.document_type === "SPOT_ACCOUNT_SNAPSHOT"
+            ? { asset_symbol: b.asset_symbol?.value ?? null, quantity: b.quantity?.value ?? null }
+            : normalizeFuturesAccountBalance(b, accountContext)
+        ),
+      };
+    }
+
+    await supabase.from("smart_imports").update({
+      normalized_extraction: normalizedSnapshot,
+      proposed_changes: [],
+      status: "REVIEW_REQUIRED",
+    }).eq("id", importId);
+
+    return res.status(200).json({
+      ok: true,
+      import_id: importId,
+      status: "REVIEW_REQUIRED",
+      document_type: raw.document_type,
+      normalized_extraction: normalizedSnapshot,
+      proposed_changes: [],
+      warnings: [...globalWarnings, "FUTURES_PERSISTENCE_NOT_YET_IMPLEMENTED"],
+      previous_import_ids: previousImportIds,
+    });
+  }
+
+  if (raw.document_type === "UNKNOWN") {
+    await supabase.from("smart_imports").update({ normalized_extraction: null, proposed_changes: [], status: "REVIEW_REQUIRED" }).eq("id", importId);
+    return res.status(200).json({
+      ok: true, import_id: importId, status: "REVIEW_REQUIRED", document_type: "UNKNOWN",
+      warnings: [...globalWarnings, "DOCUMENT_TYPE_UNKNOWN"], previous_import_ids: previousImportIds,
+    });
+  }
+
+  // ---- A partir de aqui: PURCHASE_CONFIRMATION / SALE_CONFIRMATION, pipeline existente sin cambios ----
   const tickerRaw = raw.transaction.ticker?.value ?? null;
   const assetResolution = await resolveAsset(supabase, tickerRaw);
 
