@@ -426,6 +426,7 @@ export default async function handler(req, res) {
       authContext: { authenticated: true },
       providerOverride: "anthropic",
       allowFallback: false,
+      maxTokens: 4096,
     });
   } catch (e) {
     await markFailed(importId, "VISION_PROVIDER_UNAVAILABLE");
@@ -438,6 +439,19 @@ export default async function handler(req, res) {
   }
 
   // ================== 6. Schema validation ==================
+  if (visionResult.stopReason === "max_tokens") {
+    // Distincion explicita: esto NO es un JSON malformado por parte del
+    // modelo -- es la respuesta cortada a la mitad por el limite de
+    // tokens. Error especifico en vez del generico "invalid_json"
+    // confuso que se veia antes.
+    console.error(JSON.stringify(buildSafeLogEntry({
+      import_id: importId, model_provider: "anthropic", status: "FAILED", error_code: "RESPONSE_TRUNCATED_MAX_TOKENS",
+      schema_version: SMART_IMPORT_SCHEMA_VERSION, prompt_version: SMART_IMPORT_PROMPT_VERSION,
+    })));
+    await markFailed(importId, "RESPONSE_TRUNCATED_MAX_TOKENS");
+    return res.status(502).json({ ok: false, import_id: importId, status: "FAILED", error_code: "RESPONSE_TRUNCATED_MAX_TOKENS" });
+  }
+
   const parsed = parseModelJsonOutput(visionResult.content, SmartImportRawExtractionSchema);
   if (!parsed.valid) {
     console.error(JSON.stringify(buildSafeLogEntry({
