@@ -3960,10 +3960,13 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
             <span style={{ fontSize: 12, color: MUTE }}>Activo</span>
             {assetUnresolved ? (
-              <select style={{ ...inputStyle, width: 160 }} value={userEdits.asset_id || ""} onChange={(e) => setEdit("asset_id", Number(e.target.value))}>
-                <option value="">Elegir activo…</option>
-                {assets.map((a) => <option key={a.asset_id || a.id} value={a.asset_id}>{a.ticker}</option>)}
-              </select>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                {userEdits.asset_id != null && <span style={{ color: MUTE, fontSize: 11 }}>editado ·</span>}
+                <select style={{ ...inputStyle, width: 160, borderColor: userEdits.asset_id != null ? GOLD : LINE, color: userEdits.asset_id != null ? GOLD : TXT }} value={userEdits.asset_id || ""} onChange={(e) => setEdit("asset_id", Number(e.target.value))}>
+                  <option value="">Elegir activo…</option>
+                  {assets.map((a) => <option key={a.asset_id || a.id} value={a.asset_id}>{a.ticker}</option>)}
+                </select>
+              </span>
             ) : (
               <span style={{ fontSize: 13, color: userEdits.asset_id != null ? GOLD : TXT }}>{assetLabel}</span>
             )}
@@ -3971,10 +3974,13 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
             <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
             {(effective.account_id == null || "account_id" in userEdits) ? (
-              <select style={{ ...inputStyle, width: 160 }} value={userEdits.account_id ?? ""} onChange={(e) => setEdit("account_id", e.target.value ? Number(e.target.value) : null)}>
-                <option value="">Sin identificar</option>
-                {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-              </select>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                {"account_id" in userEdits && <span style={{ color: MUTE, fontSize: 11 }}>editado ·</span>}
+                <select style={{ ...inputStyle, width: 160, borderColor: "account_id" in userEdits ? GOLD : LINE, color: "account_id" in userEdits ? GOLD : TXT }} value={userEdits.account_id ?? ""} onChange={(e) => setEdit("account_id", e.target.value ? Number(e.target.value) : null)}>
+                  <option value="">Sin identificar</option>
+                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </span>
             ) : (
               <span onClick={() => setEdit("account_id", effective.account_id)} style={{ cursor: "pointer", fontSize: 13, color: TXT }} title="Click para cambiar">
                 {accountLabel}
