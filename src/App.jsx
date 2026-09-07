@@ -3707,7 +3707,8 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   // Gating de UX -- el backend sigue siendo la autoridad final. Esto solo
   // evita clicks obviamente inutiles (SELL, activo sin resolver, duplicado
   // conocido) -- nunca reemplaza la revalidacion real del servidor.
-  const hasUnresolvedDuplicate = (normalized?.warnings || []).some((w) => w === "EXACT_DUPLICATE" || w === "POSSIBLE_DUPLICATE");
+  const duplicateResultForGating = proposedChange?.duplicate_check?.result;
+  const hasUnresolvedDuplicate = duplicateResultForGating === "EXACT_DUPLICATE" || duplicateResultForGating === "POSSIBLE_DUPLICATE";
   const assetUnresolved = effective && effective.asset_match !== "MATCHED_ASSET";
   const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !hasUnresolvedDuplicate;
 
