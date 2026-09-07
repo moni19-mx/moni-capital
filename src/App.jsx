@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import {
   TrendingUp, TrendingDown, Wallet, Layers, Coins, ShieldAlert, ChevronRight,
-  Plus, Trash2, RefreshCw, AlertTriangle, Search, Eye,
+  Plus, Trash2, RefreshCw, AlertTriangle, Search, Eye, Upload,
 } from "lucide-react";
 import {
   scoreBreakdown, simulateMonthsToGoal, solveRequiredContribution,
@@ -102,6 +102,22 @@ async function callAI(resource, payload) {
 async function generateInsight(payload) { return callAI("generate_insight", payload); }
 async function saveInsight(payload) { return callAI("save_insight", payload); }
 
+// Smart Import usa un endpoint propio (/api/smart-import), con "action"
+// en vez de "resource" -- por eso NO reutiliza callManage() tal cual,
+// pero sigue el mismo patron de manejo de error (.data adjunto al Error).
+async function callSmartImport(payload) {
+  const res = await fetch("/api/smart-import", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok || data.ok === false) {
+    const err = new Error(data.error === "invalid_pin" ? "PIN incorrecto" : (data.error_code || data.error || "Error"));
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
 const TOOL_LABELS = {
   get_portfolio_summary: "Portfolio Summary",
   get_position: "Detalle de Posición",
@@ -143,6 +159,7 @@ export default function Dashboard() {
   const [decisions, setDecisions] = useState([]);
   const [rebalanceTargets, setRebalanceTargets] = useState([]);
   const [aiInsights, setAiInsights] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   // Un solo desbloqueo por sesion para TODA la experiencia de Moni AI
   // (Daily Brief + Ask), no por componente -- vive aqui arriba para
   // sobrevivir cambios de pestaña.
@@ -160,12 +177,13 @@ export default function Dashboard() {
   function openAsset(meta) { setAssetDetail(meta); }
   function closeAsset() { setAssetDetail(null); }
   const [showAdd, setShowAdd] = useState(false);
+  const [showSmartImport, setShowSmartImport] = useState(false);
 
   async function loadAll() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData, insightsData] = await Promise.all([
+      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData, insightsData, accountsData] = await Promise.all([
         sb("positions"),
         sb("watchlist").catch(() => []),
         sb("thesis").catch(() => []),
@@ -177,6 +195,7 @@ export default function Dashboard() {
         sb("decisions").catch(() => []),
         sb("rebalance_targets").catch(() => []),
         sb("ai_insights").catch(() => []),
+        sb("accounts").catch(() => []),
       ]);
       setPositions(pos);
       setWatchlist(wl);
@@ -189,6 +208,7 @@ export default function Dashboard() {
       setDecisions(decisionsData || []);
       setRebalanceTargets(rebalanceData || []);
       setAiInsights([...(insightsData || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
+      setAccounts(accountsData || []);
 
       fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
 
@@ -644,13 +664,29 @@ export default function Dashboard() {
 
         {tab === "gestionar" && (
           <Panel title="Gestionar posiciones">
-            <button onClick={() => setShowAdd((s) => !s)} style={{
-              background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
-              fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 20,
-            }}>
-              <Plus size={16} /> Agregar activo
-            </button>
+            <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+              <button onClick={() => { setShowAdd((s) => !s); setShowSmartImport(false); }} style={{
+                background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "10px 16px",
+                fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+              }}>
+                <Plus size={16} /> Agregar activo
+              </button>
+              <button onClick={() => { setShowSmartImport((s) => !s); setShowAdd(false); }} style={{
+                background: "none", color: GOLD, border: `1px solid ${GOLD}`, borderRadius: 8, padding: "10px 16px",
+                fontWeight: 700, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6,
+              }}>
+                <Upload size={16} /> Importar captura
+              </button>
+            </div>
             {showAdd && <AddForm onDone={() => { setShowAdd(false); loadAll(); }} existingPositions={enriched} />}
+            {showSmartImport && (
+              <SmartImportFlow
+                onDone={() => { setShowSmartImport(false); loadAll(); }}
+                onCancel={() => setShowSmartImport(false)}
+                assets={enriched}
+                accounts={accounts}
+              />
+            )}
             <ManageTable rows={enriched} onDeleted={loadAll} />
           </Panel>
         )}
@@ -3516,6 +3552,452 @@ function AddForm({ onDone, existingPositions }) {
   );
 }
 
+
+// ================== Smart Import ==================
+
+const SMART_IMPORT_WARNING_MESSAGES = {
+  EXACT_IMAGE_MATCH: "Esta captura ya fue analizada anteriormente.",
+  POSSIBLE_DUPLICATE: "Existe una transacción similar que requiere revisión.",
+  EXACT_DUPLICATE: "Esta transacción parece estar registrada.",
+  UNKNOWN_ASSET: "No pudimos identificar el activo.",
+  ASSET_AMBIGUOUS: "Hay más de un activo posible — elige el correcto.",
+  UNKNOWN_ACCOUNT: "No pudimos identificar la cuenta.",
+  PRICE_QUANTITY_TOTAL_MISMATCH: "El total mostrado no coincide con cantidad × precio.",
+  CURRENCY_AMBIGUOUS: "No pudimos determinar la moneda con certeza.",
+  LOW_IMAGE_QUALITY: "La imagen no tiene suficiente claridad.",
+  SELL_NOT_SUPPORTED_V1: "Las ventas todavía no pueden confirmarse desde Smart Import.",
+  NEW_POSITION_METADATA_REQUIRED: "Este activo necesita información adicional antes de crear una posición.",
+  DATE_UNPARSEABLE: "No pudimos interpretar la fecha con certeza.",
+  DOCUMENT_TYPE_TRANSACTION_TYPE_CONFLICT: "El tipo de documento no coincide con el tipo de transacción detectado.",
+};
+
+const SMART_IMPORT_ERROR_MESSAGES = {
+  INVALID_REQUEST: "Solicitud inválida.",
+  INVALID_IMAGE_MIME_TYPE: "Formato de imagen no soportado. Usa JPEG, PNG o WEBP.",
+  IMAGE_TOO_LARGE: "La imagen es demasiado grande.",
+  INVALID_IMAGE_DATA: "No pudimos leer la imagen.",
+  VISION_PROVIDER_UNAVAILABLE: "El servicio de análisis no está disponible en este momento. Intenta de nuevo.",
+  SCHEMA_VALIDATION_FAILED: "No pudimos interpretar correctamente esta captura.",
+  IMPORT_REJECTED_SENSITIVE_CONTENT: "Esta imagen puede contener información sensible (contraseñas, frases semilla) y no fue procesada.",
+  UNKNOWN_ASSET: "No pudimos identificar el activo.",
+  UNKNOWN_ACCOUNT: "No pudimos identificar la cuenta.",
+  DUPLICATE_DETECTED_AT_CONFIRM: "Esta transacción ya existe en tu historial.",
+  STALE_PROPOSAL: "La información cambió desde que se analizó la imagen — vuelve a intentar.",
+  SELL_NOT_SUPPORTED_V1: "Las ventas todavía no pueden confirmarse desde Smart Import.",
+  NEW_POSITION_METADATA_REQUIRED: "Este activo necesita información adicional antes de crear una posición. Agrégalo primero desde \"Agregar activo\".",
+  INVALID_USER_EDIT: "Uno de los valores editados no es válido.",
+  CONFIRMATION_NOT_ALLOWED: "Esta importación no se puede confirmar todavía.",
+  IMPORT_NOT_FOUND: "No encontramos esta importación.",
+  INVALID_IMPORT_STATE: "El estado de esta importación cambió — vuelve a intentar desde una captura nueva.",
+  INVALID_APPROVED_INDICES: "Hubo un problema interno seleccionando qué confirmar.",
+  RPC_UNEXPECTED_ERROR: "Ocurrió un error inesperado al confirmar. Nada se guardó.",
+  DB_ERROR: "Ocurrió un error al cargar la importación.",
+  TARGET_TRANSACTION_NOT_FOUND: "La transacción relacionada ya no existe.",
+  TARGET_TRANSACTION_CHANGED: "La transacción relacionada cambió mientras tanto — vuelve a intentar.",
+  DUPLICATE_IDENTITY_AT_CONFIRM: "Esta operación ya está registrada con esos mismos datos.",
+  POSITION_NOT_FOUND_AT_CONFIRM: "No encontramos la posición para actualizar.",
+};
+
+function humanWarning(code) {
+  return SMART_IMPORT_WARNING_MESSAGES[code] || null; // sin fallback crudo -- si no lo conocemos, mejor omitirlo que mostrar el enum
+}
+function humanError(code) {
+  return SMART_IMPORT_ERROR_MESSAGES[code] || "No se pudo completar la operación. Intenta de nuevo.";
+}
+
+function fileSizeLabel(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+const SMART_IMPORT_STATUS_LABELS = { PENDING: "Pendiente", EXECUTED: "Ejecutada", AMBIGUOUS: "Ambigua", UNKNOWN: "Desconocida" };
+const SMART_IMPORT_TYPE_LABELS = { BUY: "Compra", SELL: "Venta" };
+
+function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
+  const [state, setState] = useState("IDLE"); // IDLE|FILE_SELECTED|EXTRACTING|REVIEW|CONFIRMING|SUCCESS|ERROR
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [pin, setPin] = useState("");
+  const [importData, setImportData] = useState(null); // respuesta completa de extract
+  const [userEdits, setUserEdits] = useState({}); // { asset_id, account_id, type, status, quantity, price, total, fee, transaction_date }
+  const [editingField, setEditingField] = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null); // { error_code, detail }
+  const [confirmResult, setConfirmResult] = useState(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    return () => { if (previewUrl) URL.revokeObjectURL(previewUrl); };
+  }, [previewUrl]);
+
+  function handleFileChange(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setFile(f);
+    setPreviewUrl(URL.createObjectURL(f));
+    setState("FILE_SELECTED");
+    setErrorInfo(null);
+  }
+
+  async function analyze() {
+    if (!file) return;
+    if (!pin) { setErrorInfo({ error_code: null, custom: "Falta tu PIN." }); return; }
+    setState("EXTRACTING");
+    setErrorInfo(null);
+    try {
+      const image_base64 = await fileToBase64(file);
+      const data = await callSmartImport({
+        pin, action: "extract", image_base64, mime_type: file.type, filename: file.name,
+      });
+      setImportData(data);
+      setUserEdits({});
+      if (data.status === "REVIEW_REQUIRED") {
+        setState("REVIEW");
+      } else {
+        // REJECTED u otro estado no confirmable -- se muestra como error/warning, no como review normal.
+        setErrorInfo({ error_code: data.error_code || null, warnings: data.warnings || [] });
+        setState("ERROR");
+      }
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null });
+      setState("ERROR");
+    }
+  }
+
+  function setEdit(field, value) {
+    setUserEdits((prev) => ({ ...prev, [field]: value }));
+  }
+
+  const normalized = importData?.normalized_extraction || null;
+  const proposedChange = importData?.proposed_changes?.[0] || null;
+
+  // Vista "efectiva" (normalized + edits) -- SOLO para mostrar en pantalla
+  // y para el gating de UX. Nunca se manda al servidor como fields sueltos;
+  // solo se manda user_edits, y el servidor vuelve a calcular todo.
+  const effective = normalized ? {
+    asset_id: userEdits.asset_id ?? normalized.asset.asset_id,
+    asset_match: userEdits.asset_id != null ? "MATCHED_ASSET" : normalized.asset.match_status,
+    account_id: "account_id" in userEdits ? userEdits.account_id : normalized.account.account_id,
+    type: userEdits.type ?? normalized.type,
+    status: userEdits.status ?? normalized.status?.value,
+    quantity: userEdits.quantity ?? normalized.quantity,
+    price: userEdits.price ?? normalized.price,
+    total: userEdits.total ?? normalized.total?.value,
+    fee: "fee" in userEdits ? userEdits.fee : normalized.fee?.value,
+    transaction_date: userEdits.transaction_date ?? normalized.transaction_date,
+  } : null;
+
+  const assetLabel = effective?.asset_id != null
+    ? (assets.find((a) => a.asset_id === effective.asset_id)?.ticker || normalized?.asset?.ticker_normalized || normalized?.asset?.ticker_raw)
+    : (normalized?.asset?.ticker_raw || "—");
+  const accountLabel = effective?.account_id != null
+    ? (accounts.find((a) => a.id === effective.account_id)?.name || "—")
+    : "Sin identificar";
+
+  // Gating de UX -- el backend sigue siendo la autoridad final. Esto solo
+  // evita clicks obviamente inutiles (SELL, activo sin resolver, duplicado
+  // conocido) -- nunca reemplaza la revalidacion real del servidor.
+  const hasUnresolvedDuplicate = (normalized?.warnings || []).some((w) => w === "EXACT_DUPLICATE" || w === "POSSIBLE_DUPLICATE");
+  const assetUnresolved = effective && effective.asset_match !== "MATCHED_ASSET";
+  const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !hasUnresolvedDuplicate;
+
+  async function confirm() {
+    if (!importData) return;
+    setState("CONFIRMING");
+    setErrorInfo(null);
+    try {
+      const data = await callSmartImport({
+        pin, action: "confirm", import_id: importData.import_id,
+        approved_change_indices: [0],
+        user_edits: Object.keys(userEdits).length ? { "0": userEdits } : {},
+      });
+      setConfirmResult(data);
+      setState("SUCCESS");
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null, detail: e.data?.detail });
+      setState("ERROR");
+    }
+  }
+
+  function reset() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setFile(null); setPreviewUrl(null); setImportData(null); setUserEdits({});
+    setErrorInfo(null); setConfirmResult(null); setState("IDLE");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  const inputStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, color: TXT, borderRadius: 6, padding: "8px 10px", fontSize: 13, width: "100%" };
+  const cardStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24 };
+
+  // ================== SENSITIVE CONTENT / ERROR ==================
+  if (state === "ERROR") {
+    const isSensitive = errorInfo?.error_code === "IMPORT_REJECTED_SENSITIVE_CONTENT";
+    return (
+      <div style={{ ...cardStyle, border: `1px solid ${RED}` }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: RED, marginBottom: 8 }}>
+          {isSensitive ? "Contenido sensible detectado" : "No se pudo procesar"}
+        </div>
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 14 }}>
+          {isSensitive
+            ? "Esta imagen puede contener información sensible (contraseñas, frases semilla) y no fue procesada."
+            : (errorInfo?.custom || humanError(errorInfo?.error_code))}
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button type="button" onClick={reset} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+            Intentar con otra captura
+          </button>
+          <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "8px 14px", fontSize: 12, cursor: "pointer" }}>
+            Cerrar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ================== SUCCESS ==================
+  if (state === "SUCCESS") {
+    const isExecuted = effective?.status === "EXECUTED";
+    const alreadyConfirmed = confirmResult?.already_confirmed;
+    return (
+      <div style={{ ...cardStyle, border: `1px solid ${GREEN}` }}>
+        <div style={{ fontSize: 15, fontWeight: 700, color: GREEN, marginBottom: 10 }}>
+          {alreadyConfirmed ? "Esta importación ya estaba confirmada" : "Importación confirmada"}
+        </div>
+        <div style={{ fontSize: 13, color: TXT, display: "grid", gap: 6, marginBottom: 16 }}>
+          {isExecuted ? (
+            <>
+              <div><b style={{ color: GOLD }}>{effective.quantity}</b> {assetLabel} agregadas</div>
+              <div>Portfolio actualizado</div>
+            </>
+          ) : (
+            <>
+              <div>Transacción pendiente registrada</div>
+              <div style={{ color: MUTE }}>Holdings sin cambio por ahora</div>
+            </>
+          )}
+        </div>
+        <button type="button" onClick={onDone} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          Listo
+        </button>
+      </div>
+    );
+  }
+
+  // ================== IDLE / FILE_SELECTED ==================
+  if (state === "IDLE" || state === "FILE_SELECTED") {
+    return (
+      <div style={cardStyle}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: TXT, marginBottom: 12 }}>Importar captura</div>
+        <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} style={{ fontSize: 12, color: MUTE, marginBottom: 12 }} />
+        {file && (
+          <div style={{ display: "flex", gap: 14, alignItems: "flex-start", marginTop: 10, marginBottom: 14, flexWrap: "wrap" }}>
+            <img src={previewUrl} alt="preview" style={{ maxWidth: 180, maxHeight: 180, borderRadius: 8, border: `1px solid ${LINE}`, objectFit: "contain" }} />
+            <div style={{ fontSize: 12, color: MUTE }}>
+              <div style={{ color: TXT, marginBottom: 2 }}>{file.name}</div>
+              <div>{fileSizeLabel(file.size)}</div>
+            </div>
+          </div>
+        )}
+        {file && (
+          <div style={{ maxWidth: 280 }}>
+            <label style={{ fontSize: 11, color: MUTE }}>Tu PIN *</label>
+            <input style={inputStyle} type="password" value={pin} onChange={(e) => setPin(e.target.value)} />
+          </div>
+        )}
+        {errorInfo?.custom && <div style={{ color: RED, fontSize: 12, marginTop: 10 }}>{errorInfo.custom}</div>}
+        {file && (
+          <div style={{ marginTop: 14 }}>
+            <button type="button" onClick={analyze} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+              Analizar
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ================== EXTRACTING / CONFIRMING ==================
+  if (state === "EXTRACTING" || state === "CONFIRMING") {
+    return (
+      <div style={cardStyle}>
+        <div style={{ fontSize: 13, color: MUTE }}>
+          {state === "EXTRACTING" ? "Leyendo captura y revisando tu cartera…" : "Confirmando…"}
+        </div>
+      </div>
+    );
+  }
+
+  // ================== REVIEW ==================
+  if (state === "REVIEW" && normalized) {
+    const warnings = normalized.warnings || [];
+    const overall = normalized.overall_import_confidence;
+    const showConfidenceWarning = overall === "LOW" || overall === "AMBIGUOUS";
+    const duplicateResult = proposedChange?.duplicate_check?.result;
+    const effects = proposedChange?.effects || {};
+    const feeDisplay = effective.fee != null ? `$${effective.fee}` : "No visible";
+
+    function fieldRow(label, key, type = "text") {
+      const isEdited = key in userEdits;
+      const isEditingThis = editingField === key;
+      return (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
+          <span style={{ fontSize: 12, color: MUTE }}>{label}</span>
+          {isEditingThis ? (
+            <input
+              autoFocus type={type} defaultValue={effective[key] ?? ""} style={{ ...inputStyle, width: 140 }}
+              onBlur={(e) => { const v = type === "number" ? Number(e.target.value) : e.target.value; setEdit(key, v); setEditingField(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+            />
+          ) : (
+            <span onClick={() => setEditingField(key)} style={{ cursor: "pointer", fontSize: 13, color: isEdited ? GOLD : TXT, textAlign: "right" }} title="Click para editar">
+              {isEdited && <span style={{ color: MUTE, fontSize: 11, marginRight: 6 }}>editado ·</span>}
+              {effective[key] != null && effective[key] !== "" ? String(effective[key]) : "—"}
+            </span>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: TXT }}>Revisión de Smart Import</div>
+          <span style={{
+            fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20,
+            background: effective.status === "EXECUTED" ? "#0F2A1D" : "#1A1710",
+            color: effective.status === "EXECUTED" ? GREEN : AMBER,
+          }}>
+            {SMART_IMPORT_STATUS_LABELS[effective.status] || effective.status}
+          </span>
+        </div>
+
+        {warnings.includes("EXACT_IMAGE_MATCH") && (
+          <div style={{ fontSize: 12, color: MUTE, background: "#161c2e", border: `1px solid ${LINE}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+            {humanWarning("EXACT_IMAGE_MATCH")}
+          </div>
+        )}
+
+        {showConfidenceWarning && (
+          <div style={{ fontSize: 12, color: AMBER, background: "#1A1710", border: `1px solid ${AMBER}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+            Esta captura tiene información poco clara — revisa los datos con cuidado antes de confirmar.
+          </div>
+        )}
+
+        {(duplicateResult === "EXACT_DUPLICATE" || duplicateResult === "POSSIBLE_DUPLICATE") && (
+          <div style={{ fontSize: 12, color: RED, background: "#2A1414", border: `1px solid ${RED}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+            {duplicateResult === "EXACT_DUPLICATE" ? humanWarning("EXACT_DUPLICATE") : humanWarning("POSSIBLE_DUPLICATE")}
+          </div>
+        )}
+
+        {effective.type === "SELL" && (
+          <div style={{ fontSize: 12, color: RED, background: "#2A1414", border: `1px solid ${RED}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+            {humanWarning("SELL_NOT_SUPPORTED_V1")}
+          </div>
+        )}
+
+        <div style={{ display: "grid", gap: 0, marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
+            <span style={{ fontSize: 12, color: MUTE }}>Activo</span>
+            {assetUnresolved ? (
+              <select style={{ ...inputStyle, width: 160 }} value={userEdits.asset_id || ""} onChange={(e) => setEdit("asset_id", Number(e.target.value))}>
+                <option value="">Elegir activo…</option>
+                {assets.map((a) => <option key={a.asset_id || a.id} value={a.asset_id}>{a.ticker}</option>)}
+              </select>
+            ) : (
+              <span style={{ fontSize: 13, color: userEdits.asset_id != null ? GOLD : TXT }}>{assetLabel}</span>
+            )}
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
+            <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
+            {(effective.account_id == null || "account_id" in userEdits) ? (
+              <select style={{ ...inputStyle, width: 160 }} value={userEdits.account_id ?? ""} onChange={(e) => setEdit("account_id", e.target.value ? Number(e.target.value) : null)}>
+                <option value="">Sin identificar</option>
+                {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            ) : (
+              <span onClick={() => setEdit("account_id", effective.account_id)} style={{ cursor: "pointer", fontSize: 13, color: TXT }} title="Click para cambiar">
+                {accountLabel}
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
+            <span style={{ fontSize: 12, color: MUTE }}>Tipo</span>
+            <span style={{ fontSize: 13, color: TXT }}>{SMART_IMPORT_TYPE_LABELS[effective.type] || effective.type}</span>
+          </div>
+          {fieldRow("Cantidad", "quantity", "number")}
+          {fieldRow("Precio", "price", "number")}
+          {fieldRow("Total", "total", "number")}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
+            <span style={{ fontSize: 12, color: MUTE }}>Fee</span>
+            <span onClick={() => setEditingField("fee")} style={{ cursor: "pointer", fontSize: 13, color: "fee" in userEdits ? GOLD : TXT }}>
+              {editingField === "fee" ? (
+                <input autoFocus type="number" defaultValue={effective.fee ?? ""} style={{ ...inputStyle, width: 100 }}
+                  onBlur={(e) => { setEdit("fee", e.target.value === "" ? null : Number(e.target.value)); setEditingField(null); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }} />
+              ) : feeDisplay}
+            </span>
+          </div>
+          {fieldRow("Fecha", "transaction_date")}
+        </div>
+
+        <div style={{ background: "#161c2e", border: `1px solid ${LINE}`, borderRadius: 8, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: GOLD, marginBottom: 8 }}>Qué va a cambiar</div>
+          {effective.status === "PENDING" ? (
+            <div style={{ fontSize: 12, color: MUTE, display: "grid", gap: 4 }}>
+              <div>Se registrará una transacción pendiente</div>
+              <div>Holdings: sin cambio</div>
+              <div>Cost basis: sin cambio</div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: MUTE, display: "grid", gap: 4 }}>
+              {effects.holdings === "INCREASE" && <div>Shares: <b style={{ color: GOLD }}>+{effective.quantity}</b> {assetLabel}</div>}
+              {effects.cost_basis === "INCREASE" && <div>Cost basis: <b style={{ color: GOLD }}>+${effective.total}{effective.fee ? ` + $${effective.fee} fee` : ""}</b></div>}
+              <div>Transacción ejecutada</div>
+            </div>
+          )}
+          {effects.warnings?.includes("PENDING_RESERVED_CASH_NO_EVIDENCE") && (
+            <div style={{ fontSize: 11, color: MUTE, marginTop: 6, fontStyle: "italic" }}>No hay evidencia de que se haya reservado efectivo para esta operación.</div>
+          )}
+        </div>
+
+        {warnings.filter((w) => humanWarning(w) && w !== "EXACT_IMAGE_MATCH").length > 0 && (
+          <div style={{ marginBottom: 16, display: "grid", gap: 6 }}>
+            {warnings.filter((w) => humanWarning(w) && w !== "EXACT_IMAGE_MATCH").map((w) => (
+              <div key={w} style={{ fontSize: 12, color: AMBER }}>• {humanWarning(w)}</div>
+            ))}
+          </div>
+        )}
+
+        {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button type="button" onClick={confirm} disabled={!canAttemptConfirm} style={{
+            background: canAttemptConfirm ? GOLD : LINE, color: canAttemptConfirm ? "#1A1305" : MUTE,
+            border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
+            cursor: canAttemptConfirm ? "pointer" : "not-allowed",
+          }}>
+            Confirmar importación
+          </button>
+          <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "10px 16px", fontSize: 13, cursor: "pointer" }}>
+            Cancelar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
 
 function ConvictionStars({ value }) {
   if (!value) return <span style={{ color: MUTE, fontSize: 12 }}>Sin definir</span>;
