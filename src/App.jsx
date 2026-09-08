@@ -3838,12 +3838,14 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
     : "Sin identificar";
 
   // Gating de UX -- el backend sigue siendo la autoridad final. Esto solo
-  // evita clicks obviamente inutiles (SELL, activo sin resolver, duplicado
-  // conocido) -- nunca reemplaza la revalidacion real del servidor.
+  // evita clicks obviamente inutiles (SELL, activo sin resolver, cuenta
+  // sin resolver, duplicado conocido) -- nunca reemplaza la revalidacion
+  // real del servidor.
   const duplicateResultForGating = proposedChange?.duplicate_check?.result;
   const hasUnresolvedDuplicate = duplicateResultForGating === "EXACT_DUPLICATE" || duplicateResultForGating === "POSSIBLE_DUPLICATE";
   const assetUnresolved = effective && effective.asset_match !== "MATCHED_ASSET";
-  const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !hasUnresolvedDuplicate;
+  const accountUnresolved = effective && effective.account_id == null;
+  const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !accountUnresolved && !hasUnresolvedDuplicate;
 
   async function createNewAsset(ticker, name) {
     if (!importData || creatingAsset) return;
