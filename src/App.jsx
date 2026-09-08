@@ -3857,13 +3857,13 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   const accountUnresolved = effective && effective.account_id == null;
   const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !accountUnresolved && !hasUnresolvedDuplicate;
 
-  async function createNewAsset(ticker, name) {
+  async function createNewAsset(ticker, name, assetType) {
     if (!importData || creatingAsset) return;
     setCreatingAsset(true);
     setErrorInfo(null);
     try {
       const data = await callSmartImport({
-        pin, action: "create_asset_and_resolve", import_id: importData.import_id, ticker, name,
+        pin, action: "create_asset_and_resolve", import_id: importData.import_id, ticker, name, asset_type: assetType || undefined,
       });
       // El servidor ya resolvio el asset y actualizo normalized_extraction
       // -- se refleja localmente para que el gating (assetUnresolved) se
@@ -3878,14 +3878,17 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
 
   // Buscar por nombre/ticker (misma fuente que "Agregar activo" manual) --
   // si el resultado ya existe en `assets`, solo lo selecciona; si no,
-  // lo crea usando el ticker/nombre YA VERIFICADOS por la busqueda (mas
-  // confiable que el texto crudo que la vision extrajo de la imagen).
+  // lo crea usando ticker/nombre/TIPO ya verificados por la busqueda (mas
+  // confiable que el texto crudo que la vision extrajo de la imagen, y
+  // sobre todo: SI manda asset_type, a diferencia del boton viejo de
+  // "crear activo nuevo" que nunca lo mandaba -- esa omision fue la causa
+  // real del bug "necesita informacion adicional" que bloqueo a AVGO).
   function pickSearchedAsset(r) {
     const existing = assets.find((a) => a.ticker === r.ticker);
     if (existing) {
       setEdit("asset_id", existing.asset_id);
     } else {
-      createNewAsset(r.ticker, r.name);
+      createNewAsset(r.ticker, r.name, r.type);
     }
   }
 
