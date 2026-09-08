@@ -3588,6 +3588,9 @@ const SMART_IMPORT_ERROR_MESSAGES = {
   INVALID_USER_EDIT: "Uno de los valores editados no es válido.",
   CONFIRMATION_NOT_ALLOWED: "Esta importación no se puede confirmar todavía.",
   IMPORT_NOT_FOUND: "No encontramos esta importación.",
+  ASSET_CREATION_FAILED: "No pudimos crear el activo. Intenta de nuevo.",
+  ASSET_ALREADY_RESOLVED: "Este activo ya fue identificado — refresca la pantalla.",
+  ASSET_AMBIGUOUS: "Ya existe más de un activo con ese ticker — elige el correcto desde el selector.",
   INVALID_IMPORT_STATE: "El estado de esta importación cambió — vuelve a intentar desde una captura nueva.",
   INVALID_APPROVED_INDICES: "Hubo un problema interno seleccionando qué confirmar.",
   RPC_UNEXPECTED_ERROR: "Ocurrió un error inesperado al confirmar. Nada se guardó.",
@@ -3630,6 +3633,7 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   const [pin, setPin] = useState("");
   const [importData, setImportData] = useState(null); // respuesta completa de extract
   const [userEdits, setUserEdits] = useState({}); // { asset_id, account_id, type, status, quantity, price, total, fee, transaction_date }
+  const [creatingAsset, setCreatingAsset] = useState(false);
   const [editingField, setEditingField] = useState(null);
   const [errorInfo, setErrorInfo] = useState(null); // { error_code, detail }
   const [confirmResult, setConfirmResult] = useState(null);
@@ -3711,6 +3715,25 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   const hasUnresolvedDuplicate = duplicateResultForGating === "EXACT_DUPLICATE" || duplicateResultForGating === "POSSIBLE_DUPLICATE";
   const assetUnresolved = effective && effective.asset_match !== "MATCHED_ASSET";
   const canAttemptConfirm = !!proposedChange && effective && effective.type !== "SELL" && !assetUnresolved && !hasUnresolvedDuplicate;
+
+  async function createNewAsset(ticker, name) {
+    if (!importData || creatingAsset) return;
+    setCreatingAsset(true);
+    setErrorInfo(null);
+    try {
+      const data = await callSmartImport({
+        pin, action: "create_asset_and_resolve", import_id: importData.import_id, ticker, name,
+      });
+      // El servidor ya resolvio el asset y actualizo normalized_extraction
+      // -- se refleja localmente para que el gating (assetUnresolved) se
+      // recalule solo, sin volver a pedir toda la extraccion.
+      setImportData((prev) => ({ ...prev, normalized_extraction: data.normalized_extraction }));
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || "ASSET_CREATION_FAILED", detail: e.data?.detail });
+    } finally {
+      setCreatingAsset(false);
+    }
+  }
 
   async function confirm() {
     if (!importData) return;
@@ -3971,6 +3994,17 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
               <span style={{ fontSize: 13, color: userEdits.asset_id != null ? GOLD : TXT }}>{assetLabel}</span>
             )}
           </div>
+          {assetUnresolved && normalized?.asset?.ticker_raw && userEdits.asset_id == null && (
+            <div style={{ display: "flex", justifyContent: "flex-end", padding: "4px 0 10px" }}>
+              <button
+                onClick={() => createNewAsset(normalized.asset.ticker_raw, normalized.asset.name_raw)}
+                disabled={creatingAsset}
+                style={{ fontSize: 12, color: GOLD, background: "transparent", border: `1px solid ${GOLD}`, borderRadius: 6, padding: "5px 10px", cursor: creatingAsset ? "default" : "pointer", opacity: creatingAsset ? 0.6 : 1 }}
+              >
+                {creatingAsset ? "Creando…" : `+ Crear "${normalized.asset.ticker_raw}"${normalized.asset.name_raw ? ` (${normalized.asset.name_raw})` : ""} como activo nuevo`}
+              </button>
+            </div>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${LINE}` }}>
             <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
             {(effective.account_id == null || "account_id" in userEdits) ? (
