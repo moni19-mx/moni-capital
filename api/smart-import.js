@@ -232,6 +232,7 @@ async function handleConfirm(req, res, body) {
   }
 
   let rpcOperation, targetTransactionId = null, shouldUpdateTransactionDate = false, dateChangeReason = null;
+  let newPositionAssetInfo = null;
 
   if (decision.operation === "UPDATE") {
     // ================== 9. Bloqueo de posicion nueva solo aplica a CREATE; UPDATE ya tiene target existente ==================
@@ -274,9 +275,17 @@ async function handleConfirm(req, res, body) {
     if (editedNormalized.status.value === "EXECUTED") {
       const { data: existingPos } = await supabase.from("positions").select("id").eq("asset_id", editedNormalized.asset.asset_id).maybeSingle();
       if (!existingPos) {
-        return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "NEW_POSITION_METADATA_REQUIRED" });
+        // Nunca es la primera vez que se ve este activo -- se crea la
+        // posicion directamente, igual que ya hace "Agregar activo"
+        // manual, usando nombre/tipo YA GUARDADOS en `assets` (nunca el
+        // texto crudo de la imagen). sector/tema/strategic_role quedan
+        // NULL -- se llenan despues manualmente si se desea.
+        const { data: assetRow } = await supabase.from("assets").select("name, asset_type").eq("asset_id", editedNormalized.asset.asset_id).maybeSingle();
+        newPositionAssetInfo = { name: assetRow?.name ?? null, asset_type: assetRow?.asset_type ?? null };
+        rpcOperation = "CREATE_EXECUTED_NEW_POSITION";
+      } else {
+        rpcOperation = "CREATE_EXECUTED_EXISTING_POSITION";
       }
-      rpcOperation = "CREATE_EXECUTED_EXISTING_POSITION";
     } else {
       rpcOperation = "CREATE_PENDING";
     }
@@ -288,6 +297,7 @@ async function handleConfirm(req, res, body) {
     importId: import_id, operation: rpcOperation, targetTransactionId,
     normalized: editedNormalized, shouldUpdateTransactionDate, dateChangeReason,
     approvedChanges: approvedChangesSnapshot, userEdits: user_edits || {},
+    positionName: newPositionAssetInfo?.name, positionType: newPositionAssetInfo?.asset_type,
   });
 
   const { data: rpcResult, error: rpcError } = await supabase.rpc("confirm_smart_import_transaction", rpcParams);
