@@ -585,8 +585,14 @@ export default async function handler(req, res) {
       // asset de notional ya resuelto (ej. "BTCUSDT" - "USDT" = "BTC").
       // Nunca se crea un asset nuevo aqui -- si no se puede resolver,
       // underlying_asset_id queda null y el warning lo refleja.
+      //
+      // FIX real: el modelo a veces captura el encabezado completo de la
+      // pantalla (ej. "BTCUSD CM PERP." en vez de solo "BTCUSD") -- se
+      // toma solo el primer token alfanumerico contiguo antes de derivar,
+      // para no depender de que el string completo termine limpio.
       const notionalAssetSymbol = raw.price_currency?.value ?? "USDT"; // USD-M: notional siempre en la misma moneda que los precios
-      const instrumentRaw = raw.instrument?.value ? raw.instrument.value.trim().toUpperCase() : null;
+      const instrumentFull = raw.instrument?.value ? raw.instrument.value.trim().toUpperCase() : null;
+      const instrumentRaw = instrumentFull ? (instrumentFull.match(/^[A-Z0-9]+/)?.[0] ?? instrumentFull) : null;
       let underlyingTicker = null;
       if (instrumentRaw && notionalAssetSymbol && instrumentRaw.endsWith(notionalAssetSymbol.toUpperCase())) {
         underlyingTicker = instrumentRaw.slice(0, instrumentRaw.length - notionalAssetSymbol.toUpperCase().length);
