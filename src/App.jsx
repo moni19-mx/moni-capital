@@ -57,6 +57,18 @@ async function fetchMarketData(items) {
   return res.json();
 }
 
+// READ-ONLY: estado actual (solo latest snapshot confirmado por cuenta/
+// posicion) de Binance Futures, ya valuado a USD. Nunca escribe nada.
+async function fetchFuturesEquity() {
+  try {
+    const res = await fetch("/api/futures-equity");
+    if (!res.ok) return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
+    return res.json();
+  } catch {
+    return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
+  }
+}
+
 async function searchAssets(q) {
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
   if (!res.ok) throw new Error("Busqueda fallo");
@@ -168,6 +180,7 @@ export default function Dashboard() {
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
+  const [futuresEquity, setFuturesEquity] = useState({ total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] });
   const [updatedAt, setUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
@@ -225,6 +238,9 @@ export default function Dashboard() {
       setMarketData(data);
       setMarketErrors(errors || []);
       setUpdatedAt(ts);
+
+      // Futures: read-only, nunca bloquea la carga principal si falla.
+      fetchFuturesEquity().then(setFuturesEquity).catch(() => {});
     } catch (e) {
       setLoadError(String(e.message || e));
     } finally {
@@ -269,7 +285,15 @@ export default function Dashboard() {
   const cryptoValue = withValue.filter((p) => p.type === "crypto").reduce((a, p) => a + p.value, 0);
   const cashValue = cashMovements.reduce((a, m) => a + (m.type === "deposito" ? Number(m.amount) : -Number(m.amount)), 0);
 
-  const patrimonio = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+  // Patrimonio Base: portafolio tradicional + cash, SIN Futures.
+  // Patrimonio Total: Base + Futures Equity (solo el ultimo snapshot
+  // confirmado por cuenta -- ver api/futures-equity.js). `patrimonio`
+  // sigue siendo el nombre usado en el resto de la app (metas, alocacion,
+  // etc.) y ahora representa el TOTAL, ya que es el numero real que
+  // corresponde a esas metricas.
+  const patrimonioBase = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+  const futuresEquityUsd = futuresEquity.total_value_usd || 0;
+  const patrimonio = patrimonioBase + futuresEquityUsd;
 
   // Hash de frescura del Daily Brief: cambia si sube PROMPT_VERSION, si
   // cambia de dia, o si el patrimonio se movio de forma material. No
@@ -445,15 +469,22 @@ export default function Dashboard() {
         )}
 
         <div style={{ background: `linear-gradient(135deg, ${PANEL} 0%, #151C33 100%)`, border: `1px solid ${LINE}`, borderRadius: 14, padding: "32px 36px", marginBottom: 20 }}>
-          <div style={{ fontSize: 12, color: MUTE, letterSpacing: 1.5, marginBottom: 8 }}>PATRIMONIO TOTAL (con dato en vivo)</div>
+          <div style={{ fontSize: 12, color: MUTE, letterSpacing: 1.5, marginBottom: 8 }}>PATRIMONIO TOTAL (incluye Futures)</div>
           <div className="display num" style={{ fontSize: "clamp(32px, 8vw, 56px)", fontWeight: 700, letterSpacing: -1, lineHeight: 1 }}>
             {fmt$2(patrimonio)}
           </div>
-          <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap", alignItems: "baseline" }}>
             <Metric label="Capital invertido" value={fmt$2(invested)} />
             <Metric label="Ganancia / Pérdida" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
             <Metric label="Rendimiento" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
+            <Metric label="Patrimonio Base (sin Futures)" value={fmt$2(patrimonioBase)} />
+            {futuresEquityUsd > 0 && <Metric label="Futures Equity" value={fmt$2(futuresEquityUsd)} color={GOLD} />}
           </div>
+          {!futuresEquity.is_complete && (
+            <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
+              ⚠ Patrimonio parcialmente valuado — algún componente de Futures no pudo valuarse a USD todavía.
+            </div>
+          )}
           <GoalBar goal={primaryGoal} patrimonio={patrimonio} goalPct={goalPct} onNavigate={setTab} />
         </div>
 
@@ -463,6 +494,11 @@ export default function Dashboard() {
           <KpiCard icon={Coins} label="Valor en cripto" value={fmt$2(cryptoValue)} />
           <KpiCard icon={Eye} label="En watchlist" value={`${watchlist.length}`} />
         </div>
+
+        {futuresEquity.accounts.length > 0 && (
+          <FuturesSection futuresEquity={futuresEquity} />
+        )}
+
 
         {!assetDetail && (
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
@@ -729,6 +765,93 @@ function KpiCard({ icon: Icon, label, value }) {
         <Icon size={14} color={GOLD} /> {label}
       </div>
       <div className="num" style={{ fontSize: 22, fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+
+function timeAgoLabel(isoString) {
+  if (!isoString) return "—";
+  const ms = Date.now() - new Date(isoString).getTime();
+  const hours = ms / 3600000;
+  if (hours < 1) return `hace ${Math.max(1, Math.round(ms / 60000))} min`;
+  if (hours < 24) return `hace ${Math.round(hours)}h`;
+  return `hace ${Math.round(hours / 24)}d`;
+}
+
+// Solo CURRENT STATE (el ultimo snapshot confirmado por cuenta/posicion,
+// via api/futures-equity.js). Snapshots historicos siguen en la base
+// para auditoria pero nunca aparecen aqui.
+function FuturesSection({ futuresEquity }) {
+  const positionsByAccount = {};
+  (futuresEquity.positions || []).forEach((p) => {
+    (positionsByAccount[p.account_id] = positionsByAccount[p.account_id] || []).push(p);
+  });
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: TXT, marginBottom: 14, letterSpacing: 0.3 }}>Binance Futures</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 14 }}>
+        {futuresEquity.accounts.map((acc) => {
+          const primaryBalance = acc.balances[0];
+          const positions = positionsByAccount[acc.account_id] || [];
+          return (
+            <div key={acc.account_id} style={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 14, padding: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>{acc.account_name}</div>
+                <div style={{ fontSize: 11, color: MUTE }}>Actualizado {timeAgoLabel(acc.observed_at)}{acc.is_stale ? " ⚠" : ""}</div>
+              </div>
+
+              <div style={{ display: "flex", gap: 24, marginTop: 10, flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: 11, color: MUTE }}>Equity</div>
+                  <div className="num" style={{ fontSize: 18, fontWeight: 700 }}>
+                    {primaryBalance ? `${primaryBalance.equity_value} ${primaryBalance.ticker}` : "—"}
+                  </div>
+                  <div style={{ fontSize: 12, color: MUTE }}>{acc.valuation_status === "OK" ? fmt$2(acc.value_usd) : "Valuación no disponible"}</div>
+                </div>
+                {primaryBalance?.available_balance_value != null && (
+                  <div>
+                    <div style={{ fontSize: 11, color: MUTE }}>Disponible</div>
+                    <div className="num" style={{ fontSize: 15 }}>{primaryBalance.available_balance_value} {primaryBalance.ticker}</div>
+                  </div>
+                )}
+              </div>
+
+              {positions.map((p) => (
+                <div key={p.derivative_position_id} style={{ marginTop: 16, paddingTop: 14, borderTop: `1px solid ${LINE}` }}>
+                  <div style={{ fontSize: 12, color: MUTE, marginBottom: 6 }}>
+                    {p.instrument} · {p.side === "long" ? "LONG" : "SHORT"} {p.leverage ? `${p.leverage}x` : ""} {p.margin_mode || ""}
+                    {p.is_stale ? " ⚠" : ""}
+                  </div>
+                  <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: 13 }}>
+                    {p.notional_value != null ? (
+                      <div><span style={{ color: MUTE }}>Notional: </span>{p.notional_value}</div>
+                    ) : (
+                      <div><span style={{ color: MUTE }}>Notional: </span>Pendiente de verificación</div>
+                    )}
+                    {p.position_quantity_value != null && (
+                      <div><span style={{ color: MUTE }}>Tamaño: </span>{p.position_quantity_value} {p.position_quantity_unit}</div>
+                    )}
+                    {p.unrealized_pnl_value != null && (
+                      <div style={{ color: p.unrealized_pnl_value >= 0 ? GREEN : RED }}>
+                        <span style={{ color: MUTE }}>PnL: </span>{p.unrealized_pnl_value}
+                      </div>
+                    )}
+                    {p.roi_pct != null && (
+                      <div style={{ color: p.roi_pct >= 0 ? GREEN : RED }}>ROI: {p.roi_pct}%</div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: 12, color: MUTE, marginTop: 6 }}>
+                    {p.entry_price != null && <div>Entry: {p.entry_price}</div>}
+                    {p.mark_price != null && <div>Mark: {p.mark_price}</div>}
+                    {p.liquidation_price != null && <div>Liq: {p.liquidation_price}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
