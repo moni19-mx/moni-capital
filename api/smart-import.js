@@ -27,6 +27,7 @@ import {
   validateUserEditKeys, applyEditsToNormalized, buildRpcParams,
 } from "../lib/smartImportConfirm.js";
 import { normalizeFuturesAccountBalance, normalizeFuturesPositionFacts, resolveAccountContext } from "../lib/futuresImportNormalize.js";
+import { matchDerivativePositionIdentity, routeDerivativeSnapshot } from "../lib/reconciliationEngine.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -102,6 +103,10 @@ Reglas adicionales para FUTURES_POSITION_SNAPSHOT:
 - account_ref es el nombre de la cuenta/pestaña tal como aparece en
   pantalla (ej. "Binance USD-M", "Binance COIN-M") -- texto literal,
   no interpretado.
+- Si ademas de "PNL no realizado" la pantalla muestra un campo separado
+  como "PNL Obtenido" (realized/funding ya cobrado), repórtalo en
+  obtained_pnl_raw -- nunca lo confundas ni lo sumes con unrealized_pnl,
+  son conceptos distintos en la pantalla.
 
 Responde UNICAMENTE con el JSON. Sin backticks de markdown, sin texto
 antes o despues.`;
@@ -494,7 +499,92 @@ export default async function handler(req, res) {
     let normalizedSnapshot;
 
     if (raw.document_type === "FUTURES_POSITION_SNAPSHOT") {
-      normalizedSnapshot = normalizeFuturesPositionFacts(raw);
+      const { data: allAccounts } = await supabase.from("accounts").select("*");
+      const accountResolution = resolveAccountContext({
+        selectedAccountId: selected_account_id ?? null,
+        rawProvider: null, // FUTURES_POSITION_SNAPSHOT no extrae provider -- solo cuenta seleccionada resuelve identidad aqui
+        rawProductType: null,
+        accounts: allAccounts || [],
+      });
+
+      // contract_type: el schema de extraccion NO lo captura como campo
+      // discreto (Binance lo muestra como badge "Perp." junto al ticker,
+      // no como texto separado confiable). LIMITACION CONOCIDA, no oculta:
+      // se asume 'perpetual' por default para USD-M, ya que es
+      // abrumadoramente el caso comun -- futuros con fecha de vencimiento
+      // se verian distintos (fecha explicita en el ticker) y no estan
+      // cubiertos todavia por esta heuristica.
+      const contractType = "perpetual";
+
+      // underlying asset: se deriva del instrument quitando el ticker del
+      // asset de notional ya resuelto (ej. "BTCUSDT" - "USDT" = "BTC").
+      // Nunca se crea un asset nuevo aqui -- si no se puede resolver,
+      // underlying_asset_id queda null y el warning lo refleja.
+      const notionalAssetSymbol = raw.price_currency?.value ?? "USDT"; // USD-M: notional siempre en la misma moneda que los precios
+      const instrumentRaw = raw.instrument?.value ? raw.instrument.value.trim().toUpperCase() : null;
+      let underlyingTicker = null;
+      if (instrumentRaw && notionalAssetSymbol && instrumentRaw.endsWith(notionalAssetSymbol.toUpperCase())) {
+        underlyingTicker = instrumentRaw.slice(0, instrumentRaw.length - notionalAssetSymbol.toUpperCase().length);
+      }
+      const underlyingAssetResolution = underlyingTicker ? await resolveAsset(supabase, underlyingTicker) : { status: "UNKNOWN_ASSET", asset_id: null };
+      const notionalAssetResolution = await resolveAsset(supabase, notionalAssetSymbol);
+
+      const positionWarnings = [];
+      if (accountResolution.status !== "MATCHED_ACCOUNT") positionWarnings.push("UNKNOWN_ACCOUNT");
+      if (underlyingAssetResolution.status !== "MATCHED_ASSET") positionWarnings.push("UNKNOWN_UNDERLYING_ASSET");
+      if (notionalAssetResolution.status !== "MATCHED_ASSET") positionWarnings.push("UNKNOWN_NOTIONAL_ASSET");
+
+      const notionalValueRaw = raw.notional?.value ?? null;
+      const normalizedFacts = {
+        ...normalizeFuturesPositionFacts(raw, contractType),
+        account_id: accountResolution.accountId,
+        underlying_asset_id: underlyingAssetResolution.asset_id,
+        notional_value: notionalValueRaw,
+        notional_asset_id: notionalValueRaw != null ? notionalAssetResolution.asset_id : null,
+        // USD-M: notional reportado directo por la interfaz, nunca derivado.
+        notional_source_type: "REPORTED",
+        unit_semantics_status: notionalValueRaw != null ? "VERIFIED" : "UNIT_SEMANTICS_UNVERIFIED",
+        unrealized_pnl_asset_id: raw.unrealized_pnl?.value != null ? notionalAssetResolution.asset_id : null,
+        margin_used_asset_id: raw.margin_used?.value != null ? notionalAssetResolution.asset_id : null,
+        observed_at: raw.observed_at?.value ?? null,
+      };
+
+      // observed_at: regla A/B ya aprobada -- sin timestamp visible, se
+      // usa smart_imports.created_at (determinista, nunca current time).
+      let observedAtSource = "SOURCE_TIMESTAMP";
+      if (!normalizedFacts.observed_at) {
+        const { data: importRow } = await supabase.from("smart_imports").select("created_at").eq("id", importId).single();
+        normalizedFacts.observed_at = importRow?.created_at ?? null;
+        observedAtSource = "IMPORT_CREATED_AT";
+      }
+
+      let identityResult = { decision: "INSUFFICIENT_DATA", matchedPositionId: null, reconciliation_confidence: null, reasons: ["account_or_asset_unresolved"] };
+      let proposedChanges = [];
+      if (accountResolution.accountId != null && normalizedFacts.instrument && normalizedFacts.side && contractType) {
+        const { data: openCandidates } = await supabase.from("derivative_positions").select("*").eq("account_id", accountResolution.accountId).eq("status", "OPEN");
+        identityResult = matchDerivativePositionIdentity(normalizedFacts, openCandidates || []);
+        proposedChanges = routeDerivativeSnapshot(normalizedFacts, identityResult);
+      }
+
+      normalizedSnapshot = {
+        account: {
+          account_id: accountResolution.accountId,
+          provider: accountResolution.provider,
+          account_type: accountResolution.accountType,
+          product_type: accountResolution.productType,
+          context_source: accountResolution.contextSource,
+        },
+        normalized_facts: normalizedFacts,
+        contract_type_assumption: "DEFAULTED_TO_PERPETUAL_USD_M", // limitacion conocida, ver comentario arriba
+        observed_at_source: observedAtSource,
+        notional_source_type: "REPORTED",
+        obtained_pnl_raw: raw.obtained_pnl_raw ? { value: raw.obtained_pnl_raw.value, asset_symbol: raw.obtained_pnl_raw.asset_symbol, evidence_text: raw.obtained_pnl_raw.evidence_text } : null,
+        identity_result: identityResult,
+        proposed_changes: proposedChanges,
+        exposure_preview: normalizedFacts.notional_value != null ? { gross: Math.abs(normalizedFacts.notional_value), net: normalizedFacts.side === "short" ? -Math.abs(normalizedFacts.notional_value) : Math.abs(normalizedFacts.notional_value) } : null,
+        net_worth_delta: 0,
+        warnings: positionWarnings,
+      };
     } else {
       const { data: allAccounts } = await supabase.from("accounts").select("*");
       const accountResolution = resolveAccountContext({
