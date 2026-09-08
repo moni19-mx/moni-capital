@@ -16,7 +16,7 @@ import {
   callModel, validateImageInput, parseModelJsonOutput, buildSafeLogEntry,
   SMART_IMPORT_PROMPT_VERSION, SMART_IMPORT_SCHEMA_VERSION,
 } from "../lib/aiGateway.js";
-import { resolveAsset, resolveAssetById } from "../lib/assetResolver.js";
+import { resolveAsset, resolveAssetById, createAsset } from "../lib/assetResolver.js";
 import { buildNormalizedExtraction, matchAccount } from "../lib/smartImportNormalize.js";
 import { resolveDuplicateCheck } from "../lib/reconciliationQueries.js";
 import {
@@ -315,6 +315,67 @@ async function handleConfirm(req, res, body) {
   return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: rpcResult.result, detail: rpcResult });
 }
 
+// ==================================================
+// create_asset_and_resolve -- accion EXPLICITA (el usuario toco un boton
+// "Crear este activo nuevo" en la UI, viendo el ticker/nombre extraidos).
+// Reutiliza createAsset() ya existente/probado -- nunca duplica logica de
+// creacion. Solo permite crear si el import esta REVIEW_REQUIRED y su
+// asset esta genuinamente UNKNOWN_ASSET -- nunca reemplaza un asset ya
+// resuelto por otro camino.
+// ==================================================
+async function handleCreateAssetAndResolve(req, res, body) {
+  const { pin, import_id, ticker, name, asset_type, currency } = body;
+  if (!(await requirePin(res, pin))) return;
+
+  if (import_id == null || !ticker) {
+    return res.status(400).json({ ok: false, error_code: "INVALID_REQUEST" });
+  }
+
+  const { data: importRow, error: importErr } = await supabase.from("smart_imports").select("*").eq("id", import_id).maybeSingle();
+  if (importErr) return res.status(500).json({ ok: false, error_code: "DB_ERROR" });
+  if (!importRow) return res.status(404).json({ ok: false, error_code: "IMPORT_NOT_FOUND" });
+  if (importRow.status !== "REVIEW_REQUIRED") {
+    return res.status(409).json({ ok: false, import_id, status: importRow.status, error_code: "INVALID_IMPORT_STATE" });
+  }
+
+  const currentAsset = importRow.normalized_extraction?.asset;
+  if (!currentAsset || currentAsset.match_status !== "UNKNOWN_ASSET") {
+    // Defensa: nunca se usa esta accion para "reasignar" un asset ya
+    // resuelto -- solo tiene sentido cuando genuinamente no se identifico.
+    return res.status(409).json({ ok: false, import_id, error_code: "ASSET_ALREADY_RESOLVED" });
+  }
+
+  const creation = await createAsset(supabase, {
+    ticker, name: name || null, asset_type: asset_type || null, currency: currency || "USD",
+    created_source: "SMART_IMPORT_USER_CONFIRMED",
+  });
+  if (creation.status === "ASSET_AMBIGUOUS") {
+    return res.status(409).json({ ok: false, import_id, error_code: "ASSET_AMBIGUOUS", candidates: creation.candidates });
+  }
+  if (creation.status !== "MATCHED_ASSET") {
+    return res.status(500).json({ ok: false, import_id, error_code: "ASSET_CREATION_FAILED" });
+  }
+
+  const updatedNormalized = {
+    ...importRow.normalized_extraction,
+    asset: {
+      asset_id: creation.asset_id,
+      ticker_raw: currentAsset.ticker_raw,
+      ticker_normalized: creation.ticker_normalized,
+      match_status: "MATCHED_ASSET",
+    },
+    warnings: (importRow.normalized_extraction.warnings || []).filter((w) => w !== "UNKNOWN_ASSET"),
+  };
+
+  const { error: updateErr } = await supabase.from("smart_imports").update({ normalized_extraction: updatedNormalized }).eq("id", import_id);
+  if (updateErr) return res.status(500).json({ ok: false, error_code: "DB_ERROR" });
+
+  return res.status(200).json({
+    ok: true, import_id, asset_id: creation.asset_id, already_existed: creation.already_existed,
+    normalized_extraction: updatedNormalized,
+  });
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -331,6 +392,10 @@ export default async function handler(req, res) {
 
   if (action === "confirm") {
     return handleConfirm(req, res, req.body || {});
+  }
+
+  if (action === "create_asset_and_resolve") {
+    return handleCreateAssetAndResolve(req, res, req.body || {});
   }
 
   if (action !== "extract") {
