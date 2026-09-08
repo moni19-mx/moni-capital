@@ -147,7 +147,11 @@ export default async function handler(req, res) {
       });
     }
 
-    res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=40");
+    // Sin cache-control: este es un dashboard financiero -- prefiero
+    // siempre fresco, nunca correr el riesgo de servir equity/exposure
+    // vieja desde CDN/navegador. market-data.js si cachea (precios de
+    // mercado cambian constantemente de todos modos), pero equity de
+    // cuenta debe reflejar siempre el ultimo snapshot + precio real.
     res.status(200).json({
       total_value_usd: totalValueUsd,
       is_complete: isComplete,
