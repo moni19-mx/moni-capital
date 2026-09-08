@@ -21,12 +21,13 @@ const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h -- no excluye del total, 
 
 async function resolvePriceUsd(ticker, providerSymbols) {
   const coingeckoId = providerSymbols?.coingecko || COINGECKO_FALLBACK_IDS[ticker];
-  if (!coingeckoId) return null;
+  const debug = { ticker, providerSymbols: providerSymbols ?? null, resolvedCoingeckoId: coingeckoId ?? null };
+  if (!coingeckoId) return { price: null, debug: { ...debug, reason: "NO_COINGECKO_ID_RESOLVED" } };
   try {
-    const { price } = await getCryptoData(supabase, ticker, coingeckoId);
-    return typeof price === "number" ? price : null;
-  } catch {
-    return null; // nunca inventa un precio -- PRICE_UNAVAILABLE aguas abajo
+    const result = await getCryptoData(supabase, ticker, coingeckoId);
+    return { price: typeof result.price === "number" ? result.price : null, debug: { ...debug, rawResult: result } };
+  } catch (e) {
+    return { price: null, debug: { ...debug, reason: "EXCEPTION", errorMessage: String(e && e.message || e) } };
   }
 }
 
@@ -74,10 +75,11 @@ export default async function handler(req, res) {
         const ticker = b.assets?.ticker ?? null;
         const equityValue = b.equity_value != null ? Number(b.equity_value) : null;
         const availableValue = b.available_balance_value != null ? Number(b.available_balance_value) : null;
-        const priceUsd = equityValue != null && ticker ? await resolvePriceUsd(ticker, b.assets?.provider_symbols) : null;
+        const priceResolution = equityValue != null && ticker ? await resolvePriceUsd(ticker, b.assets?.provider_symbols) : { price: null, debug: { reason: "NO_EQUITY_OR_TICKER" } };
+        const priceUsd = priceResolution.price;
         const valuation = valuateAccountEquity({ account_id: account.id, asset_id: b.asset_id, equity_value: equityValue, price_usd_per_unit: priceUsd });
 
-        balancesOut.push({ asset_id: b.asset_id, ticker, available_balance_value: availableValue, ...valuation });
+        balancesOut.push({ asset_id: b.asset_id, ticker, available_balance_value: availableValue, ...valuation, _debug: priceResolution.debug });
 
         if (valuation.status === "OK") {
           accountValueUsd += valuation.value_usd;
