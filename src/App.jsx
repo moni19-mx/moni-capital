@@ -3765,6 +3765,7 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   const [editingField, setEditingField] = useState(null);
   const [errorInfo, setErrorInfo] = useState(null); // { error_code, detail }
   const [confirmResult, setConfirmResult] = useState(null);
+  const [assetSearchQuery, setAssetSearchQuery] = useState("");
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -3860,6 +3861,19 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
       setErrorInfo({ error_code: e.data?.error_code || "ASSET_CREATION_FAILED", detail: e.data?.detail });
     } finally {
       setCreatingAsset(false);
+    }
+  }
+
+  // Buscar por nombre/ticker (misma fuente que "Agregar activo" manual) --
+  // si el resultado ya existe en `assets`, solo lo selecciona; si no,
+  // lo crea usando el ticker/nombre YA VERIFICADOS por la busqueda (mas
+  // confiable que el texto crudo que la vision extrajo de la imagen).
+  function pickSearchedAsset(r) {
+    const existing = assets.find((a) => a.ticker === r.ticker);
+    if (existing) {
+      setEdit("asset_id", existing.asset_id);
+    } else {
+      createNewAsset(r.ticker, r.name);
     }
   }
 
@@ -4122,6 +4136,17 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
               <span style={{ fontSize: 13, color: userEdits.asset_id != null ? GOLD : TXT }}>{assetLabel}</span>
             )}
           </div>
+          {assetUnresolved && (
+            <div style={{ padding: "4px 0 10px" }}>
+              <div style={{ fontSize: 11, color: MUTE, marginBottom: 4 }}>O busca por nombre o ticker (igual que al agregar manualmente):</div>
+              <TickerSearchInput
+                value={assetSearchQuery}
+                onChange={setAssetSearchQuery}
+                onPick={(r) => { pickSearchedAsset(r); setAssetSearchQuery(r.ticker); }}
+                placeholder={normalized?.asset?.name_raw || normalized?.asset?.ticker_raw || "Ej. Broadcom, AVGO…"}
+              />
+            </div>
+          )}
           {assetUnresolved && normalized?.asset?.ticker_raw && userEdits.asset_id == null && (
             <div style={{ display: "flex", justifyContent: "flex-end", padding: "4px 0 10px" }}>
               <button
