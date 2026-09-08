@@ -475,11 +475,16 @@ export default function Dashboard() {
           </div>
           <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap", alignItems: "baseline" }}>
             <Metric label="Capital invertido" value={fmt$2(invested)} />
-            <Metric label="Ganancia / Pérdida" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
-            <Metric label="Rendimiento" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
+            <Metric label="Ganancia / Pérdida (portafolio tradicional)" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
+            <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
             <Metric label="Patrimonio Base (sin Futures)" value={fmt$2(patrimonioBase)} />
             {futuresEquityUsd > 0 && <Metric label="Futures Equity" value={fmt$2(futuresEquityUsd)} color={GOLD} />}
           </div>
+          {futuresEquityUsd > 0 && (
+            <div style={{ marginTop: 10, fontSize: 12, color: MUTE }}>
+              Futures Equity se suma al Patrimonio Total, pero todavía no tiene un cálculo de ganancia/rendimiento propio — no sabemos con certeza cuánto capital inicial entró a esas cuentas, así que no queremos mostrarte una cifra que parezca precisa sin serlo.
+            </div>
+          )}
           {!futuresEquity.is_complete && (
             <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
               ⚠ Patrimonio parcialmente valuado — algún componente de Futures no pudo valuarse a USD todavía.
