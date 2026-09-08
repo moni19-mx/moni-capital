@@ -3766,6 +3766,16 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   const [errorInfo, setErrorInfo] = useState(null); // { error_code, detail }
   const [confirmResult, setConfirmResult] = useState(null);
   const [assetSearchQuery, setAssetSearchQuery] = useState("");
+  // Estos 2 DEBEN vivir aqui arriba, nunca despues de un return
+  // condicional -- viven originalmente despues del bloque "SUCCESS" (y
+  // tambien despues de "ERROR"), violando las Rules of Hooks de React:
+  // cuando el estado llegaba a SUCCESS o ERROR, el componente hacia
+  // return ANTES de llegar a estos useState, y React tumbaba todo el
+  // componente (pantalla en blanco) por "menos hooks de los esperados".
+  // Bug preexistente, nunca antes disparado porque ninguna confirmacion
+  // real habia llegado a SUCCESS todavia.
+  const [loadByIdValue, setLoadByIdValue] = useState("");
+  const [loadingById, setLoadingById] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -3960,9 +3970,6 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
       </div>
     );
   }
-
-  const [loadByIdValue, setLoadByIdValue] = useState("");
-  const [loadingById, setLoadingById] = useState(false);
 
   async function loadExistingImport() {
     const id = Number(loadByIdValue);
