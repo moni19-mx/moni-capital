@@ -29,6 +29,7 @@ import {
   buildMarketDataItems, mergeMarketData, enrichPositions, computeCashValue,
   computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
   computeInvested, computeTotalGain, unclassifiedPositions, summarizeGlobalFreshness,
+  computePortfolioWeights, computeNetWorthWeights, computePatrimonioBreakdown, computeConcentration,
 } from "../lib/financialSnapshot.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -744,14 +745,53 @@ export default function Dashboard() {
   }, [patrimonio, invested, stocksValue, cryptoValue, cashValue, missing.length]);
 
   const top5 = [...withValue].sort((a, b) => b.value - a.value).slice(0, 5);
-  const top1Pct = patrimonio ? (top5[0]?.value || 0) / patrimonio : 0;
-  const top3Pct = patrimonio ? top5.slice(0, 3).reduce((a, p) => a + p.value, 0) / patrimonio : 0;
 
-  const allocType = [
-    { name: "Acciones", value: stocksValue, color: GOLD },
-    { name: "Cripto", value: cryptoValue, color: "#7C8CF8" },
-    { name: "Efectivo", value: cashValue, color: MUTE },
-  ].filter((a) => a.value > 0);
+  // Sprint P5 (Portfolio Weights / Allocation Truth). Dos metricas
+  // DISTINTAS, nunca mezcladas (lib/financialSnapshot.js tiene el
+  // detalle completo de cada formula/status):
+  // - portfolioWeights: peso dentro del portafolio TRADICIONAL
+  //   (acciones+cripto+efectivo, SIN Futures) -- denominador nuevo, no
+  //   existia antes de este sprint.
+  // - netWorthWeights: peso dentro de TODO el patrimonio (incluye
+  //   Futures Equity) -- esto es lo que el codigo YA hacia antes (mal
+  //   llamado "Allocation"), ahora explicito y con status propio.
+  const portfolioWeights = useMemo(() => computePortfolioWeights(enriched), [enriched]);
+  const netWorthWeights = useMemo(
+    () => computeNetWorthWeights(enriched, patrimonio, portfolioWeights.status, futuresEquity.is_complete),
+    [enriched, patrimonio, portfolioWeights.status, futuresEquity.is_complete]
+  );
+  // Concentracion SIEMPRE sobre el portafolio tradicional (item 5 del
+  // sprint: "No usar Patrimonio Total para alertas de concentración").
+  // top1Pct/top3Pct se mantienen como FRACCION (0-1) por compatibilidad
+  // con SemRow/computeSystemHealth (lib/financialMath.js, sin tocar) --
+  // solo cambia de que universo vienen (antes: patrimonio total; ahora:
+  // portafolio tradicional).
+  const concentration = useMemo(() => computeConcentration(portfolioWeights), [portfolioWeights]);
+  const concentrationPartial = concentration.status !== "COMPLETE";
+  const top1Pct = concentration.top1_pct / 100;
+  const top3Pct = concentration.top3_pct / 100;
+
+  const patrimonioBreakdown = useMemo(
+    () => computePatrimonioBreakdown({ stocksValue, cryptoValue, cashValue, futuresEquityUsd, patrimonio }),
+    [stocksValue, cryptoValue, cashValue, futuresEquityUsd, patrimonio]
+  );
+  // Colores fijos por categoria (mismo criterio visual que antes, ahora
+  // con Futures Equity incluido como su propia rebanada -- item 6:
+  // "el pie debe sumar ~100%").
+  const BREAKDOWN_COLORS = { "Acciones": GOLD, "Cripto": "#7C8CF8", "Efectivo": MUTE, "Futures Equity": "#5FA8D3" };
+  const allocType = patrimonioBreakdown.map((c) => ({ ...c, color: BREAKDOWN_COLORS[c.name] || MUTE }));
+
+  // Lookup rapido de pesos por posicion para RichPositionsTable/AssetDetail.
+  const portfolioWeightById = useMemo(() => {
+    const m = {};
+    portfolioWeights.weights.forEach((w) => { m[w.id] = w.portfolio_weight_pct; });
+    return m;
+  }, [portfolioWeights]);
+  const netWorthWeightById = useMemo(() => {
+    const m = {};
+    netWorthWeights.weights.forEach((w) => { m[w.id] = w.net_worth_weight_pct; });
+    return m;
+  }, [netWorthWeights]);
 
   const concColor = top1Pct > 0.35 ? RED : top1Pct > 0.2 ? AMBER : GREEN;
 
@@ -784,11 +824,13 @@ export default function Dashboard() {
   // Estado de Hoy: motor de reglas, riesgo > oportunidad > default. Moni AI solo narra esto, nunca lo decide.
   const estadoDeHoy = useMemo(() => {
     if (patrimonio === 0) return { emoji: "🟢", label: "Sin datos suficientes", detail: "" };
-    if (top1Pct > 0.35) {
+    // Sprint P5 (item 5/J): sin datos completos de portafolio tradicional
+    // no se dispara una alerta de concentración como si fuera confiable.
+    if (!concentrationPartial && top1Pct > 0.35) {
       const top = top5[0];
       return {
         emoji: "🔴", label: `Revisar concentración en ${top?.ticker || ""}`,
-        detail: `Tu posición #1 pesa ${(top1Pct * 100).toFixed(1)}% de tu patrimonio.`,
+        detail: `Tu posición #1 pesa ${(top1Pct * 100).toFixed(1)}% de tu portafolio.`,
       };
     }
     if (scoredOpportunities.length && scoredOpportunities[0].score >= 80) {
@@ -801,13 +843,17 @@ export default function Dashboard() {
       };
     }
     return { emoji: "🟢", label: "Mantener estrategia", detail: "Ninguna señal relevante hoy." };
-  }, [patrimonio, top1Pct, top5, scoredOpportunities]);
+  }, [patrimonio, top1Pct, top5, scoredOpportunities, concentrationPartial]);
 
   // Estado de la Estrategia: reglas sobre datos ya calculados, sin opinión de IA
   const estadoEstrategia = useMemo(() => {
     if (patrimonio === 0) return [];
     const badges = [];
-    if (top1Pct > 0.35) badges.push({ text: "Concentración elevada", color: RED });
+    // Sprint P5 (item 5/J): CONCENTRATION_DATA_PARTIAL explicito en vez
+    // de una alerta de concentración fabricada sobre un universo
+    // incompleto de posiciones tradicionales.
+    if (concentrationPartial) badges.push({ text: "Concentración: datos parciales", color: AMBER });
+    else if (top1Pct > 0.35) badges.push({ text: "Concentración elevada", color: RED });
     else if (top1Pct > 0.2) badges.push({ text: "Concentración moderada", color: AMBER });
     else badges.push({ text: "Diversificación correcta", color: GREEN });
 
@@ -822,7 +868,7 @@ export default function Dashboard() {
       badges.push({ text: "Estrategia alineada", color: GREEN });
     }
     return badges;
-  }, [patrimonio, top1Pct, cashValue, withValue]);
+  }, [patrimonio, top1Pct, cashValue, withValue, concentrationPartial]);
 
   // Qué cambió desde tu última visita: resta simple contra el snapshot anterior, ya existente en la tabla snapshots
   const cambiosRecientes = useMemo(() => {
@@ -992,6 +1038,10 @@ export default function Dashboard() {
             transactions={transactions}
             journalEntries={journalEntries}
             patrimonio={patrimonio}
+            portfolioWeightById={portfolioWeightById}
+            netWorthWeightById={netWorthWeightById}
+            portfolioWeightStatus={portfolioWeights.status}
+            netWorthWeightStatus={netWorthWeights.status}
             onBack={closeAsset}
             onSaved={loadAll}
             onOpenAsset={openAsset}
@@ -1061,7 +1111,7 @@ export default function Dashboard() {
                         <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
                           <span style={{ width: 10, height: 10, borderRadius: "50%", background: e.color, display: "inline-block" }} />
                           <span style={{ color: MUTE }}>{e.name}</span>
-                          <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{patrimonio ? ((e.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
+                          <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{e.pct != null ? `${e.pct.toFixed(1)}%` : "—"}</span>
                         </div>
                       ))}
                     </div>
@@ -1128,7 +1178,12 @@ export default function Dashboard() {
 
         {tab === "posiciones" && (
           <Panel title="Top Posiciones — con contexto de rango">
-            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} missingRows={missing} patrimonio={patrimonio} onOpenAsset={openAsset} />
+            <RichPositionsTable
+              rows={[...withValue].sort((a, b) => b.value - a.value)} missingRows={missing} patrimonio={patrimonio}
+              portfolioWeightById={portfolioWeightById} netWorthWeightById={netWorthWeightById}
+              portfolioWeightStatus={portfolioWeights.status}
+              onOpenAsset={openAsset}
+            />
           </Panel>
         )}
 
@@ -1143,6 +1198,7 @@ export default function Dashboard() {
             patrimonio={patrimonio} invested={invested} totalGain={totalGain} totalPct={totalPct}
             stocksValue={stocksValue} cryptoValue={cryptoValue} cashValue={cashValue}
             withValue={withValue} top5={top5} top1Pct={top1Pct} top3Pct={top3Pct} concColor={concColor}
+            concentrationPartial={concentrationPartial} portfolioWeightById={portfolioWeightById}
             allocType={allocType} snapshots={snapshots} goal={primaryGoal} goalPct={goalPct}
             transactions={transactions} cashMovements={cashMovements}
             onOpenAsset={openAsset}
@@ -1385,7 +1441,24 @@ function Panel({ title, children, span }) {
   );
 }
 
-function SemRow({ label, value, color }) {
+function SemRow({ label, value, color, partial }) {
+  // Sprint P5 (Portfolio Weights): `partial` -- cuando el universo detras
+  // de `value` no esta completo (ver computeConcentration), NUNCA se
+  // muestra un % como si fuera exacto (item 3 del sprint) -- se muestra
+  // texto explicito en vez de un numero fabricado sobre datos parciales.
+  if (partial) {
+    return (
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
+          <span style={{ color: MUTE }}>{label}</span>
+          <span className="num" style={{ fontWeight: 700, color: MUTE }}>Parcial</span>
+        </div>
+        <div style={{ height: 6, background: LINE, borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: "100%", background: `repeating-linear-gradient(45deg, ${LINE}, ${LINE} 4px, transparent 4px, transparent 8px)` }} />
+        </div>
+      </div>
+    );
+  }
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
@@ -2296,18 +2369,26 @@ function PriceFreshnessDot({ market }) {
   return <span title={priceTooltip(market)} style={{ color: AMBER, marginLeft: 4, cursor: "help" }}>●</span>;
 }
 
-function RichPositionsTable({ rows, missingRows, patrimonio, onOpenAsset }) {
+function RichPositionsTable({ rows, missingRows, patrimonio, portfolioWeightById, netWorthWeightById, portfolioWeightStatus, onOpenAsset }) {
   // Sprint P4.1: MISMOS `rows`/`patrimonio` que la tabla de desktop --
   // solo cambia como se renderizan (responsive rendering, nunca dos
   // datasets distintos). Card por posicion: ticker, valor de mercado,
   // PnL, precio, allocation -- exactamente lo pedido, tap abre el detalle
   // (mismo onOpenAsset que ya usaba la tabla).
+  //
+  // Sprint P5 (Portfolio Weights / Allocation Truth, item 4): la
+  // columna "Allocation" de antes en realidad era TOTAL_NET_WORTH_WEIGHT_PCT
+  // (peso / Patrimonio Total, incluye Futures) -- ahora "Peso Patrimonio",
+  // explicito. "Peso Portafolio" es NUEVO: peso dentro del portafolio
+  // tradicional (sin Futures), ver computePortfolioWeights.
   const isMobile = useIsMobile();
+  const partial = portfolioWeightStatus !== "COMPLETE";
   if (isMobile) {
     return (
       <div className="mc-card-list">
         {rows.map((p) => {
-          const allocPct = patrimonio ? (p.value / patrimonio) * 100 : null;
+          const pw = portfolioWeightById[p.id];
+          const nw = netWorthWeightById[p.id];
           return (
             <button
               key={p.id}
@@ -2325,11 +2406,17 @@ function RichPositionsTable({ rows, missingRows, patrimonio, onOpenAsset }) {
               </div>
               <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
                 <span>Precio: {p.market?.price != null ? fmt$2(p.market.price) : "—"}<PriceFreshnessDot market={p.market} /></span>
-                <span>Allocation: {allocPct != null ? `${allocPct.toFixed(1)}%` : "—"}</span>
+                <span>Peso Portafolio: {pw != null ? `${pw.toFixed(1)}%` : "—"}</span>
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
+                <span>Peso Patrimonio: {nw != null ? `${nw.toFixed(1)}%` : "—"}</span>
               </div>
             </button>
           );
         })}
+        {partial && (
+          <div style={{ fontSize: 11, color: AMBER, padding: "4px 2px" }}>⚠ Peso Portafolio parcial — faltan precios de algunas posiciones.</div>
+        )}
         {(missingRows || []).map((p) => (
           <div key={p.id} className="mc-card-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6, opacity: 0.75 }}>
             <div><b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></div>
@@ -2352,31 +2439,39 @@ function RichPositionsTable({ rows, missingRows, patrimonio, onOpenAsset }) {
             <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
             <th style={{ padding: "8px 6px", textAlign: "right" }}>Cap. Mercado</th>
             <th style={{ padding: "8px 6px" }}>Rango</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Peso Portafolio{partial ? " ⚠" : ""}</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Peso Patrimonio</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((p, i) => (
-            <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
-              <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
-              <td style={{ padding: "10px 6px" }}>
-                <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
-                  <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
-                </button>
-              </td>
-              <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}<PriceFreshnessDot market={p.market} /></td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
-                {p.gain != null ? fmt$2(p.gain) : "—"}
-              </td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (p.market?.changePct || 0) >= 0 ? GREEN : RED }}>
-                {p.market?.changePct != null ? fmtPct1(p.market.changePct) : "—"}
-              </td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmtBig(p.market?.marketCap)}</td>
-              <td style={{ padding: "10px 6px" }}>
-                {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
-              </td>
-            </tr>
-          ))}
+          {rows.map((p, i) => {
+            const pw = portfolioWeightById[p.id];
+            const nw = netWorthWeightById[p.id];
+            return (
+              <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
+                <td style={{ padding: "10px 6px" }}>
+                  <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                    <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
+                  </button>
+                </td>
+                <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}<PriceFreshnessDot market={p.market} /></td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
+                  {p.gain != null ? fmt$2(p.gain) : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (p.market?.changePct || 0) >= 0 ? GREEN : RED }}>
+                  {p.market?.changePct != null ? fmtPct1(p.market.changePct) : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmtBig(p.market?.marketCap)}</td>
+                <td style={{ padding: "10px 6px" }}>
+                  {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{pw != null ? `${pw.toFixed(1)}%` : "—"}</td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{nw != null ? `${nw.toFixed(1)}%` : "—"}</td>
+              </tr>
+            );
+          })}
           {(missingRows || []).map((p) => (
             <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}`, opacity: 0.75 }}>
               <td style={{ padding: "10px 6px", color: MUTE }}>—</td>
@@ -2386,11 +2481,14 @@ function RichPositionsTable({ rows, missingRows, patrimonio, onOpenAsset }) {
                 </button>
               </td>
               <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
-              <td colSpan={5} style={{ padding: "10px 6px", color: AMBER, fontSize: 12 }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</td>
+              <td colSpan={7} style={{ padding: "10px 6px", color: AMBER, fontSize: 12 }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</td>
             </tr>
           ))}
         </tbody>
       </table>
+      {partial && (
+        <div style={{ fontSize: 11, color: AMBER, marginTop: 8 }}>⚠ Peso Portafolio parcial — faltan precios de algunas posiciones tradicionales, la distribución de arriba no representa el 100% de tu portafolio todavía.</div>
+      )}
     </div>
   );
 }
@@ -2887,7 +2985,8 @@ function RebalanceTargetForm({ onDone, onCancel }) {
 
 function WealthTab({
   patrimonio, invested, totalGain, totalPct, stocksValue, cryptoValue, cashValue,
-  withValue, top5, top1Pct, top3Pct, concColor, allocType, snapshots, goal, goalPct,
+  withValue, top5, top1Pct, top3Pct, concColor, concentrationPartial, portfolioWeightById,
+  allocType, snapshots, goal, goalPct,
   transactions, cashMovements, onOpenAsset,
 }) {
   const bySector = useMemo(() => {
@@ -2990,19 +3089,28 @@ function WealthTab({
         </div>
       </Panel>
 
-      <Panel title="4. Concentración">
-        <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
-        <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
+      <Panel title="4. Concentración (portafolio tradicional)">
+        {/* Sprint P5 (item 5): SIEMPRE sobre el portafolio tradicional,
+            nunca sobre Patrimonio Total -- ver computeConcentration en
+            lib/financialSnapshot.js. */}
+        <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} partial={concentrationPartial} />
+        <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} partial={concentrationPartial} />
+        {concentrationPartial && (
+          <div style={{ fontSize: 11, color: AMBER, marginBottom: 10 }}>⚠ Datos parciales — no todas las posiciones tienen precio, los pesos individuales de abajo no representan el 100% de tu portafolio.</div>
+        )}
         <div style={{ marginTop: 14 }}>
-          {top5.map((p, i) => (
-            <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
-              display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
-              borderBottom: `1px solid ${LINE}`, padding: "8px 0", cursor: "pointer", color: TXT, fontSize: 12, textAlign: "left",
-            }}>
-              <span>{i + 1}. <b style={{ color: GOLD }}>{p.ticker}</b></span>
-              <span className="num">{fmt$2(p.value)} · {patrimonio ? ((p.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
-            </button>
-          ))}
+          {top5.map((p, i) => {
+            const w = portfolioWeightById[p.id];
+            return (
+              <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
+                display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
+                borderBottom: `1px solid ${LINE}`, padding: "8px 0", cursor: "pointer", color: TXT, fontSize: 12, textAlign: "left",
+              }}>
+                <span>{i + 1}. <b style={{ color: GOLD }}>{p.ticker}</b></span>
+                <span className="num">{fmt$2(p.value)} · {w != null ? `${w.toFixed(1)}%` : "—"}</span>
+              </button>
+            );
+          })}
         </div>
       </Panel>
 
@@ -3787,7 +3895,11 @@ function WatchlistAddForm({ result, onDone }) {
   );
 }
 
-function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEntries, patrimonio, onBack, onSaved, onOpenAsset }) {
+function AssetDetailScreen({
+  meta, positions, watchlist, transactions, journalEntries, patrimonio,
+  portfolioWeightById, netWorthWeightById, portfolioWeightStatus, netWorthWeightStatus,
+  onBack, onSaved, onOpenAsset,
+}) {
   const [market, setMarket] = useState(null);
   const [loadingMarket, setLoadingMarket] = useState(false);
   const [showThesisEdit, setShowThesisEdit] = useState(false);
@@ -3815,7 +3927,12 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
     return idx >= 0 ? { pos: idx + 1, total: sorted.length } : null;
   }, [positions, meta.ticker]);
 
-  const pctPatrimonio = position?.value != null && patrimonio ? (position.value / patrimonio) * 100 : null;
+  // Sprint P5 (item 9): "solo cuando status COMPLETE" -- si el universo
+  // de posiciones tradicionales (portfolio) o el patrimonio total
+  // (incluye Futures) esta incompleto, se muestra "—"/"Parcial" en vez
+  // de un % que parezca exacto sin serlo.
+  const portfolioWeightPct = position && portfolioWeightStatus === "COMPLETE" ? portfolioWeightById[position.id] : null;
+  const netWorthWeightPct = position && netWorthWeightStatus === "COMPLETE" ? netWorthWeightById[position.id] : null;
 
   const scoreData = useMemo(() => {
     if (!market) return null;
@@ -3824,10 +3941,12 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
 
   const decision = useMemo(() => {
     if (!position || !market) return { emoji: "⚪", label: "Sin posición propia", detail: "Este activo no es parte de tu portafolio todavía." };
-    if (pctPatrimonio != null && pctPatrimonio > 35) return { emoji: "🔴", label: "Revisar concentración", detail: `Pesa ${pctPatrimonio.toFixed(1)}% de tu patrimonio.` };
+    // Concentracion: sobre Peso Portafolio (tradicional), nunca Patrimonio
+    // Total (item 5) -- y solo si el dato es COMPLETE (nunca gated=null).
+    if (portfolioWeightPct != null && portfolioWeightPct > 35) return { emoji: "🔴", label: "Revisar concentración", detail: `Pesa ${portfolioWeightPct.toFixed(1)}% de tu portafolio.` };
     if (scoreData && scoreData.total >= 80) return { emoji: "🟡", label: "Revisar", detail: `Opportunity Score ${scoreData.total}.` };
     return { emoji: "🟢", label: "Mantener", detail: "Sin señales relevantes ahora mismo." };
-  }, [position, market, pctPatrimonio, scoreData]);
+  }, [position, market, portfolioWeightPct, scoreData]);
 
   const timelineEvents = useMemo(() => {
     const txEvents = (transactions || [])
@@ -3933,7 +4052,8 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
         {position && (
           <Panel title="Portfolio Impact">
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 14 }}>
-              <Metric label="Peso actual" value={pctPatrimonio != null ? `${pctPatrimonio.toFixed(2)}%` : "—"} />
+              <Metric label="Peso Portafolio" value={portfolioWeightPct != null ? `${portfolioWeightPct.toFixed(2)}%` : "Parcial"} />
+              <Metric label="Peso Patrimonio Total" value={netWorthWeightPct != null ? `${netWorthWeightPct.toFixed(2)}%` : "Parcial"} />
               <Metric label="Ranking" value={ranking ? `#${ranking.pos} de ${ranking.total}` : "—"} />
               <Metric label="Sector" value={position.sector || "Sin definir"} />
               <Metric label="Tema" value={position.tema || "Sin definir"} />
