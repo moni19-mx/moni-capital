@@ -110,12 +110,19 @@ export default async function handler(req, res) {
     const { data: openPositions } = await supabase
       .from("derivative_positions").select("id, account_id, instrument, side, margin_mode").eq("status", "OPEN");
 
+    // Sprint P0.2 (item 14, performance): antes esto era un for-loop
+    // secuencial (1 query por posicion abierta, una tras otra). Las
+    // queries son independientes entre si -- Promise.all las dispara
+    // todas en paralelo, mismo resultado, sin la latencia acumulada de
+    // N round-trips secuenciales a Supabase.
     const positionsOut = [];
-    for (const pos of openPositions || []) {
-      const { data: allPosSnapshots } = await supabase
-        .from("derivative_position_snapshots")
-        .select("*")
-        .eq("derivative_position_id", pos.id);
+    const positionSnapshotResults = await Promise.all(
+      (openPositions || []).map((pos) =>
+        supabase.from("derivative_position_snapshots").select("*").eq("derivative_position_id", pos.id)
+          .then(({ data }) => ({ pos, allPosSnapshots: data }))
+      )
+    );
+    for (const { pos, allPosSnapshots } of positionSnapshotResults) {
       const s = selectLatestPositionSnapshot(allPosSnapshots, pos.id);
       if (!s) continue;
       const ageMs = Date.now() - new Date(s.observed_at).getTime();

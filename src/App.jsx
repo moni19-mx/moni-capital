@@ -23,6 +23,13 @@ import { classifyBalanceForPersistence } from "../lib/futuresImportNormalize.js"
 import {
   initialSourceMeta, resolveAllSourceMeta, isCriticalInitialFailure, isCurrentRequest,
 } from "../lib/dataSourceState.js";
+// Sprint P0.2 (Financial Totals Correctness + Stability): formula
+// canonica unica de los totales financieros -- ver lib/financialSnapshot.js.
+import {
+  buildMarketDataItems, mergeMarketData, enrichPositions, computeCashValue,
+  computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
+  computeInvested, computeTotalGain, unclassifiedPositions,
+} from "../lib/financialSnapshot.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -452,82 +459,74 @@ export default function Dashboard() {
   // ni deja que una respuesta vieja sobrescriba estado mas nuevo.
   const latestRequestIdRef = useRef(0);
 
+  // Sprint P0.2 (Financial Totals Correctness + Stability). Rediseño de
+  // loadAll() alrededor de un GRUPO CRITICO que se commitea como una
+  // sola unidad atomica (items 7/8/9 del sprint): positions +
+  // cash_movements + marketData + futuresEquity son EXACTAMENTE las 4
+  // fuentes que alimentan Total Acciones/Cripto, Patrimonio Base y
+  // Patrimonio Total -- nunca se pinta una combinacion incompleta de
+  // ellas (p.ej. positions nuevas con marketData todavia vacia). Las
+  // demas fuentes (no financieras) arrancan en paralelo desde el
+  // inicio -- ya no esperan a que el grupo critico complete para
+  // EMPEZAR a pedirse -- pero commitean su propio estado de forma
+  // independiente, sin bloquear ni ser bloqueadas por el grupo critico.
   async function loadAll() {
     const myRequestId = ++latestRequestIdRef.current;
     setLoading(true);
     try {
-      // Promise.allSettled, nunca Promise.all: un fallo de UNA fuente no
-      // puede impedir que las demas se procesen.
-      const settled1 = await Promise.allSettled([
-        sb("positions"), sb("watchlist"), sb("thesis"), sb("snapshots"),
-        sb("cash_movements"), sb("transactions"), sb("goals"), sb("journal_entries"),
-        sb("decisions"), sb("rebalance_targets"), sb("ai_insights"), sb("accounts"),
-      ]);
+      // Todo arranca en paralelo. market-data es la unica fuente con una
+      // dependencia real (necesita `items` derivados de positions/
+      // watchlist) -- futures-equity y market-pulse YA NO esperan a que
+      // resuelvan las demas lecturas de Supabase, porque no tienen
+      // ninguna dependencia real de esos datos (antes esperaban sin
+      // necesidad, agregando latencia real a cada carga).
+      const positionsP = sb("positions");
+      const watchlistP = sb("watchlist");
+      const thesisP = sb("thesis");
+      const snapshotsP = sb("snapshots");
+      const cashMovementsP = sb("cash_movements");
+      const transactionsP = sb("transactions");
+      const goalsP = sb("goals");
+      const journalP = sb("journal_entries");
+      const decisionsP = sb("decisions");
+      const rebalanceP = sb("rebalance_targets");
+      const insightsP = sb("ai_insights");
+      const accountsP = sb("accounts");
+      const futuresEquityP = fetchFuturesEquity();
+      const marketPulseP = fetchMarketPulse();
+
+      const [posR, wlR] = await Promise.allSettled([positionsP, watchlistP]);
       if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada por un refresh mas nuevo
-
-      const [posR, wlR, thR, snapsR, cmR, txR, goalsR, journalR, decisionsR, rebalanceR, insightsR, accountsR] = settled1;
-
-      // Solo se llama al setter cuando la fuente tuvo exito -- NO
-      // llamarlo en el caso "rejected" YA preserva el ultimo valor
-      // valido, sin logica adicional.
-      if (posR.status === "fulfilled") setPositions(posR.value);
-      if (wlR.status === "fulfilled") setWatchlist(wlR.value);
-      if (thR.status === "fulfilled") setThesis(thR.value);
-      if (snapsR.status === "fulfilled") setSnapshots([...snapsR.value].sort((a, b) => (a.date < b.date ? -1 : 1)));
-      if (cmR.status === "fulfilled") setCashMovements([...cmR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      if (txR.status === "fulfilled") setTransactions([...txR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      if (goalsR.status === "fulfilled") setGoals(goalsR.value || []);
-      if (journalR.status === "fulfilled") setJournalEntries([...journalR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      if (decisionsR.status === "fulfilled") setDecisions(decisionsR.value || []);
-      if (rebalanceR.status === "fulfilled") setRebalanceTargets(rebalanceR.value || []);
-      if (insightsR.status === "fulfilled") setAiInsights([...(insightsR.value || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
-      if (accountsR.status === "fulfilled") setAccounts(accountsR.value || []);
-
-      const now1 = new Date().toISOString();
-      const resultsMap1 = {};
-      ["positions", "watchlist", "thesis", "snapshots", "cash_movements", "transactions", "goals", "journal_entries", "decisions", "rebalance_targets", "ai_insights", "accounts"]
-        .forEach((n, i) => { resultsMap1[n] = settled1[i]; });
-      const meta1 = resolveAllSourceMeta(sourceMetaRef.current, resultsMap1, now1);
-      setSourceMeta((prev) => ({ ...prev, ...meta1 }));
-
-      // Unico caso de error bloqueante real: positions nunca tuvo datos
-      // validos Y este intento tambien fallo. Cualquier otro fallo se
-      // resuelve en silencio conservando el ultimo valor bueno (marcado
-      // STALE en sourceMeta, nunca mostrado como si fuera un error fatal).
-      setLoadError(
-        isCriticalInitialFailure(meta1.positions)
-          ? String(posR.reason?.message || posR.reason || "No se pudo cargar el portafolio")
-          : null
-      );
 
       // items para precios de mercado: si positions/watchlist fallaron
       // en ESTE intento, se usa el ultimo valor conocido (via ref) en
       // vez de dejar de pedir precios por completo.
       const positionsForItems = posR.status === "fulfilled" ? posR.value : positionsRef.current;
       const watchlistForItems = wlR.status === "fulfilled" ? wlR.value : watchlistRef.current;
-      const items = [];
-      const seen = new Set();
-      [...positionsForItems.filter((p) => p.type !== "cash"), ...watchlistForItems].forEach((p) => {
-        const key = `${p.ticker}-${p.type}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        items.push({ ticker: p.ticker, type: p.type, coingeckoId: p.coingecko_id || undefined });
-      });
+      const marketDataP = fetchMarketData(buildMarketDataItems(positionsForItems, watchlistForItems));
 
-      // market-pulse / market-data / futures-equity: independientes
-      // entre si (Promise.allSettled) -- antes, un fallo de market-data
-      // (que va con `await` directo) impedia que futures-equity se
-      // intentara siquiera, porque saltaba al catch general.
-      const [pulseR, marketR, futuresR] = await Promise.allSettled([
-        fetchMarketPulse(),
-        fetchMarketData(items),
-        fetchFuturesEquity(),
-      ]);
-      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada mientras esperabamos estos 3
+      // ================== GRUPO CRITICO ==================
+      // Se espera a que las 4 fuentes financieras hayan resuelto (exito
+      // o fallo) y se commitean TODAS en el mismo tick sincronico (React
+      // 18 agrupa setState consecutivos sin await entre ellos en un solo
+      // render) -- este es el fix real del flicker "abre -> $X -> $0 ->
+      // $Y" reportado por el usuario: antes, positions se commiteaba
+      // solo, y marketData/futuresEquity llegaban en un commit aparte y
+      // mas tardio, asi que Total Acciones/Patrimonio se pintaban de
+      // forma incompleta (solo cash, sin acciones/futures) en el medio.
+      const [cmR, marketR, futuresR] = await Promise.allSettled([cashMovementsP, marketDataP, futuresEquityP]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada mientras esperabamos el grupo critico
 
-      if (pulseR.status === "fulfilled") setMarketPulse(pulseR.value);
+      if (posR.status === "fulfilled") setPositions(posR.value);
+      if (wlR.status === "fulfilled") setWatchlist(wlR.value);
+      if (cmR.status === "fulfilled") setCashMovements([...cmR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
       if (marketR.status === "fulfilled") {
-        setMarketData(marketR.value.data);
+        // Root cause real de P0.2: MERGE por ticker, nunca reemplazo
+        // completo del mapa -- ver lib/financialSnapshot.js::mergeMarketData.
+        // Un ticker que fallo SOLO este ciclo (el resto de la respuesta
+        // sigue siendo 200 OK) conserva su ultimo precio conocido en vez
+        // de desaparecer del total.
+        setMarketData((prev) => mergeMarketData(prev, marketR.value.data));
         setMarketErrors(marketR.value.errors || []);
         setUpdatedAt(marketR.value.updatedAt);
       }
@@ -536,9 +535,62 @@ export default function Dashboard() {
       // via sourceMeta, en vez de convertirse silenciosamente en $0.
       if (futuresR.status === "fulfilled") setFuturesEquity(futuresR.value);
 
-      const now2 = new Date().toISOString();
-      const meta2 = resolveAllSourceMeta(sourceMetaRef.current, { marketPulse: pulseR, marketData: marketR, futuresEquity: futuresR }, now2);
-      setSourceMeta((prev) => ({ ...prev, ...meta2 }));
+      const nowCritical = new Date().toISOString();
+      const metaCritical = resolveAllSourceMeta(
+        sourceMetaRef.current,
+        { positions: posR, watchlist: wlR, cash_movements: cmR, marketData: marketR, futuresEquity: futuresR },
+        nowCritical
+      );
+      setSourceMeta((prev) => ({ ...prev, ...metaCritical }));
+
+      // Unico caso de error bloqueante real: positions nunca tuvo datos
+      // validos Y este intento tambien fallo. Cualquier otro fallo se
+      // resuelve en silencio conservando el ultimo valor bueno (marcado
+      // STALE en sourceMeta, nunca mostrado como si fuera un error fatal).
+      setLoadError(
+        isCriticalInitialFailure(metaCritical.positions)
+          ? String(posR.reason?.message || posR.reason || "No se pudo cargar el portafolio")
+          : null
+      );
+
+      // El grupo critico (lo unico que determina Total Acciones/
+      // Patrimonio) ya esta resuelto y commiteado -- las fuentes no
+      // financieras de abajo pueden seguir en vuelo sin que el usuario
+      // siga viendo "Actualizando...".
+      if (isCurrentRequest(myRequestId, latestRequestIdRef.current)) setLoading(false);
+
+      // ================== NO CRITICAS ==================
+      // Ya estaban en vuelo desde el inicio de la funcion -- no
+      // bloquean ni son bloqueadas por el grupo critico, solo se
+      // commitean tan pronto como esten listas (normalmente ya lo estan
+      // para cuando llegamos aqui, por haber arrancado en paralelo).
+      const [thR, snapsR, txR, goalsR, journalR, decisionsR, rebalanceR, insightsR, accountsR, pulseR] =
+        await Promise.allSettled([
+          thesisP, snapshotsP, transactionsP, goalsP, journalP, decisionsP, rebalanceP, insightsP, accountsP, marketPulseP,
+        ]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return;
+
+      if (thR.status === "fulfilled") setThesis(thR.value);
+      if (snapsR.status === "fulfilled") setSnapshots([...snapsR.value].sort((a, b) => (a.date < b.date ? -1 : 1)));
+      if (txR.status === "fulfilled") setTransactions([...txR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (goalsR.status === "fulfilled") setGoals(goalsR.value || []);
+      if (journalR.status === "fulfilled") setJournalEntries([...journalR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (decisionsR.status === "fulfilled") setDecisions(decisionsR.value || []);
+      if (rebalanceR.status === "fulfilled") setRebalanceTargets(rebalanceR.value || []);
+      if (insightsR.status === "fulfilled") setAiInsights([...(insightsR.value || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
+      if (accountsR.status === "fulfilled") setAccounts(accountsR.value || []);
+      if (pulseR.status === "fulfilled") setMarketPulse(pulseR.value);
+
+      const nowNonCritical = new Date().toISOString();
+      const metaNonCritical = resolveAllSourceMeta(
+        sourceMetaRef.current,
+        {
+          thesis: thR, snapshots: snapsR, transactions: txR, goals: goalsR, journal_entries: journalR,
+          decisions: decisionsR, rebalance_targets: rebalanceR, ai_insights: insightsR, accounts: accountsR, marketPulse: pulseR,
+        },
+        nowNonCritical
+      );
+      setSourceMeta((prev) => ({ ...prev, ...metaNonCritical }));
     } finally {
       if (isCurrentRequest(myRequestId, latestRequestIdRef.current)) setLoading(false);
     }
@@ -556,19 +608,12 @@ export default function Dashboard() {
     return m;
   }, [thesis]);
 
-  const enriched = useMemo(() => positions.map((p) => {
-    const cost = Number(p.cost_basis);
-    let value = null, md = null;
-    if (p.type === "cash") {
-      value = cost;
-    } else {
-      md = marketData[p.ticker];
-      if (md) value = Number(p.shares) * md.price;
-    }
-    const gain = value != null ? value - cost : null;
-    const pct = value != null && cost ? gain / cost : null;
-    return { ...p, value, gain, pct, market: md || null, thesis: thesisByTicker[p.ticker] || null };
-  }), [positions, marketData, thesisByTicker]);
+  // Sprint P0.2: formula canonica unica (lib/financialSnapshot.js) --
+  // mismo calculo exacto que antes, ahora en un solo lugar testeable.
+  const enriched = useMemo(
+    () => enrichPositions(positions, marketData, thesisByTicker),
+    [positions, marketData, thesisByTicker]
+  );
 
   const watchlistEnriched = useMemo(() => watchlist.map((w) => ({
     ...w, market: marketData[w.ticker] || null,
@@ -576,10 +621,15 @@ export default function Dashboard() {
 
   const withValue = enriched.filter((p) => p.value != null);
   const missing = enriched.filter((p) => p.value == null);
+  // Root cause real de P0.2 (item 3/16 del sprint): una posicion con
+  // `type` no clasificado (ni stock/crypto/cash) nunca puede valuarse --
+  // problema de DATOS, no de red. Se reporta aparte de `missing` para
+  // no confundir "todavia no llega el precio" con "el dato esta mal".
+  const unclassified = unclassifiedPositions(positions);
 
-  const stocksValue = withValue.filter((p) => p.type === "stock").reduce((a, p) => a + p.value, 0);
-  const cryptoValue = withValue.filter((p) => p.type === "crypto").reduce((a, p) => a + p.value, 0);
-  const cashValue = cashMovements.reduce((a, m) => a + (m.type === "deposito" ? Number(m.amount) : -Number(m.amount)), 0);
+  const stocksValue = computeStocksValue(enriched);
+  const cryptoValue = computeCryptoValue(enriched);
+  const cashValue = computeCashValue(cashMovements);
 
   // Patrimonio Base: portafolio tradicional + cash, SIN Futures.
   // Patrimonio Total: Base + Futures Equity (solo el ultimo snapshot
@@ -587,9 +637,9 @@ export default function Dashboard() {
   // sigue siendo el nombre usado en el resto de la app (metas, alocacion,
   // etc.) y ahora representa el TOTAL, ya que es el numero real que
   // corresponde a esas metricas.
-  const patrimonioBase = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+  const patrimonioBase = computePatrimonioBase(enriched, cashValue);
   const futuresEquityUsd = futuresEquity.total_value_usd || 0;
-  const patrimonio = patrimonioBase + futuresEquityUsd;
+  const patrimonio = computePatrimonio(patrimonioBase, futuresEquityUsd);
 
   // Hash de frescura del Daily Brief: cambia si sube PROMPT_VERSION, si
   // cambia de dia, o si el patrimonio se movio de forma material. No
@@ -599,8 +649,8 @@ export default function Dashboard() {
   const dailyBriefHash = `${PROMPT_VERSION_FRONTEND}::${todayISO}::${Math.round(patrimonio / 10) * 10}`;
   const latestInsight = aiInsights.find((i) => i.scope === "today") || null;
   const insightIsFresh = latestInsight?.based_on_hash === dailyBriefHash;
-  const invested = withValue.reduce((a, p) => a + Number(p.cost_basis), 0) + cashValue;
-  const totalGain = patrimonio - invested;
+  const invested = computeInvested(enriched, cashValue);
+  const totalGain = computeTotalGain(patrimonio, invested);
   const totalPct = invested ? totalGain / invested : 0;
 
   const snapshotPosted = useRef(false);
@@ -773,6 +823,20 @@ export default function Dashboard() {
             Sin precio en vivo por ahora: {missing.map((m) => m.ticker).join(", ")}. No se inventa su valor.
           </Banner>
         )}
+        {unclassified.length > 0 && !loadError && (
+          <Banner color={RED}>
+            {unclassified.length === 1 ? "1 posición" : `${unclassified.length} posiciones`} sin tipo de activo asignado ({unclassified.map((p) => p.ticker).join(", ")}) — no se puede valuar ni se incluye en tus totales hasta corregir su clasificación. Esto no es un problema de red, es un dato pendiente de corregir.
+          </Banner>
+        )}
+        {(() => {
+          const missingTickers = new Set(missing.map((m) => m.ticker));
+          const usingLastKnown = marketErrors.filter((t) => !missingTickers.has(t));
+          return usingLastKnown.length > 0 && !loadError ? (
+            <Banner color={AMBER}>
+              Usando el último precio conocido para: {usingLastKnown.join(", ")} (el proveedor de precios no respondió en este ciclo, tu total no cambia por esto).
+            </Banner>
+          ) : null;
+        })()}
 
         <div style={{ background: `linear-gradient(135deg, ${PANEL} 0%, #151C33 100%)`, border: `1px solid ${LINE}`, borderRadius: 14, padding: "32px 36px", marginBottom: 20 }}>
           <div style={{ fontSize: 12, color: MUTE, letterSpacing: 1.5, marginBottom: 8 }}>PATRIMONIO TOTAL (incluye Futures)</div>
