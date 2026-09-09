@@ -28,7 +28,7 @@ import {
 import {
   buildMarketDataItems, mergeMarketData, enrichPositions, computeCashValue,
   computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
-  computeInvested, computeTotalGain, unclassifiedPositions,
+  computeInvested, computeTotalGain, unclassifiedPositions, summarizeGlobalFreshness,
 } from "../lib/financialSnapshot.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -55,6 +55,44 @@ const fmtBig = (v) => {
   if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
   return fmt$2(v);
 };
+
+// Sprint P0.4 (Price Freshness UI, item 5) -- texto discreto para el
+// indicador global, solo se llama cuando status !== ALL_GOOD (ver
+// summarizeGlobalFreshness en lib/financialSnapshot.js). Presentacion
+// pura, sin decidir ningun $ ni ningun estado -- solo redacta lo que
+// summarizeGlobalFreshness ya calculo.
+function freshnessStatusText(f) {
+  if (f.status === "PROVIDER_RATE_LIMITED") {
+    return "Proveedor de precios con límite de tasa activo — usando últimos precios válidos";
+  }
+  if (f.status === "PARTIAL_MISSING") {
+    return `${f.missingCount} ${f.missingCount === 1 ? "posición sin precio" : "posiciones sin precio"} por ahora`;
+  }
+  if (f.status === "PARTIAL_STALE") {
+    return `${f.staleCount} ${f.staleCount === 1 ? "precio usando" : "precios usando"} último dato válido`;
+  }
+  return "";
+}
+
+// Sprint P0.4 (item 6) -- antiguedad humana para el tooltip por
+// posicion ("hace 4m 12s"). Presentacion pura.
+function ageLabel(fetchedAtIso, now = new Date()) {
+  if (!fetchedAtIso) return "desconocida";
+  const ms = Math.max(0, now.getTime() - new Date(fetchedAtIso).getTime());
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `hace ${m}m ${s}s` : `hace ${s}s`;
+}
+
+const PRICE_SOURCE_LABELS = { finnhub: "Finnhub", coingecko: "CoinGecko", finnhub_cache: "Finnhub (cache)", coingecko_cache: "CoinGecko (cache)", cache_stale: "último dato válido" };
+
+function priceTooltip(market) {
+  if (!market) return "";
+  const priceTxt = market.price != null ? fmt$2(market.price) : "—";
+  const sourceTxt = PRICE_SOURCE_LABELS[market.price_source] || market.price_source || "—";
+  return `${priceTxt} · Actualizado ${ageLabel(market.price_fetched_at)} · Proveedor: ${sourceTxt} · Estado: ${market.price_status || "—"}`;
+}
 
 // Sprint P0.1 (Reliable Data Loading): sb()/fetchMarketData() delegan en
 // lib/dataFetchers.js -- fetchFuturesEquity/fetchMarketPulse se importan
@@ -406,6 +444,11 @@ export default function Dashboard() {
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
+  // Sprint P0.4 (Price Freshness UI): provider_health ya venia en la
+  // respuesta de /api/market-data desde P0.3 pero nunca se guardaba en
+  // estado ni se usaba -- ver summarizeGlobalFreshness en
+  // lib/financialSnapshot.js.
+  const [marketProviderHealth, setMarketProviderHealth] = useState("OK");
   const [futuresEquity, setFuturesEquity] = useState({ total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] });
   const [updatedAt, setUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -530,6 +573,7 @@ export default function Dashboard() {
         setMarketData((prev) => mergeMarketData(prev, marketR.value.data));
         setMarketErrors(marketR.value.errors || []);
         setUpdatedAt(marketR.value.updatedAt);
+        setMarketProviderHealth(marketR.value.provider_health || "OK");
       }
       // Futures Equity: NUNCA se llama al setter en el caso "rejected"
       // -- el ultimo valor valido permanece en pantalla, marcado STALE
@@ -645,6 +689,13 @@ export default function Dashboard() {
 
   const withValue = enriched.filter((p) => p.value != null);
   const missing = enriched.filter((p) => p.value == null);
+  // Sprint P0.4 (Price Freshness UI, items 5/7/9): estado global
+  // discreto -- CACHED dentro de TTL nunca cuenta como degradacion (ver
+  // summarizeGlobalFreshness), solo STALE/STALE_RATE_LIMITED/missing.
+  const globalFreshness = useMemo(
+    () => summarizeGlobalFreshness(enriched, marketProviderHealth),
+    [enriched, marketProviderHealth]
+  );
   // Root cause real de P0.2 (item 3/16 del sprint): una posicion con
   // `type` no clasificado (ni stock/crypto/cash) nunca puede valuarse --
   // problema de DATOS, no de red. Se reporta aparte de `missing` para
@@ -832,6 +883,12 @@ export default function Dashboard() {
               <RefreshCw size={12} /> {loading ? "Actualizando…" : "Actualizar precios"}
             </button>
             <div>{updatedAt ? `Precios: ${new Date(updatedAt).toLocaleTimeString("es-MX")}` : "—"}</div>
+            {/* Sprint P0.4 (item 5): discreto, solo aparece si hay
+                degradacion real -- CACHED dentro de TTL nunca cuenta, ver
+                summarizeGlobalFreshness. */}
+            {globalFreshness.status !== "ALL_GOOD" && (
+              <div style={{ color: AMBER, marginTop: 2 }}>{freshnessStatusText(globalFreshness)}</div>
+            )}
           </div>
         </div>
 
@@ -884,6 +941,22 @@ export default function Dashboard() {
               ⚠ Patrimonio parcialmente valuado — algún componente de Futures no pudo valuarse a USD todavía.
             </div>
           )}
+          {/* Sprint P0.4 (items 8/9): mismo patron que el aviso de
+              Futures de arriba, para posiciones tradicionales. MISSING
+              (sin precio en absoluto, ya excluido del total) es mas
+              grave que STALE (con precio, pero es el ultimo conocido) --
+              se muestra como mucho un aviso a la vez, nunca los dos
+              apilados por el mismo numero. La cifra NUNCA cambia por
+              esto (sigue siendo LKG), solo se explica su estado. */}
+          {globalFreshness.missingCount > 0 ? (
+            <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
+              ⚠ Patrimonio parcialmente valuado — {globalFreshness.missingCount} {globalFreshness.missingCount === 1 ? "posición sin precio en vivo no se incluye" : "posiciones sin precio en vivo no se incluyen"} en el total todavía.
+            </div>
+          ) : globalFreshness.staleCount > 0 ? (
+            <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
+              Actualizado parcialmente — {globalFreshness.staleCount} {globalFreshness.staleCount === 1 ? "precio usa" : "precios usan"} su última cotización válida en vez de una en vivo ahora mismo.
+            </div>
+          ) : null}
           <GoalBar goal={primaryGoal} patrimonio={patrimonio} goalPct={goalPct} onNavigate={setTab} />
         </div>
 
@@ -1055,7 +1128,7 @@ export default function Dashboard() {
 
         {tab === "posiciones" && (
           <Panel title="Top Posiciones — con contexto de rango">
-            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} onOpenAsset={openAsset} />
+            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} missingRows={missing} patrimonio={patrimonio} onOpenAsset={openAsset} />
           </Panel>
         )}
 
@@ -1251,7 +1324,10 @@ function FuturesSection({ futuresEquity }) {
                   <div className="num" style={{ fontSize: 18, fontWeight: 700 }}>
                     {primaryBalance ? `${primaryBalance.equity_value} ${primaryBalance.ticker}` : "—"}
                   </div>
-                  <div style={{ fontSize: 12, color: MUTE }}>{acc.valuation_status === "OK" ? fmt$2(acc.value_usd) : "Valuación no disponible"}</div>
+                  <div style={{ fontSize: 12, color: MUTE }}>
+                    {acc.valuation_status === "OK" ? fmt$2(acc.value_usd) : "Valuación no disponible"}
+                    <PriceFreshnessDot market={primaryBalance ? { price_status: primaryBalance.price_status, price_source: primaryBalance.price_source, price_fetched_at: primaryBalance.price_fetched_at, price: primaryBalance.price_usd_per_unit } : null} />
+                  </div>
                 </div>
                 {primaryBalance?.available_balance_value != null && (
                   <div>
@@ -2209,7 +2285,18 @@ function RangeBar({ price, low, high, label, compact }) {
   );
 }
 
-function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
+// Sprint P0.4 (item 6): LIVE/CACHED = sin ruido (precio normal, nada
+// que decir). STALE/STALE_RATE_LIMITED = punto ambar discreto con
+// tooltip (title nativo, sin componente nuevo). DATA_UNAVAILABLE nunca
+// llega aqui -- esas filas se renderizan aparte, ver MissingPositionRow
+// mas abajo, con marcador explicito (nunca silencioso).
+function PriceFreshnessDot({ market }) {
+  const status = market?.price_status;
+  if (status !== "STALE" && status !== "STALE_RATE_LIMITED") return null;
+  return <span title={priceTooltip(market)} style={{ color: AMBER, marginLeft: 4, cursor: "help" }}>●</span>;
+}
+
+function RichPositionsTable({ rows, missingRows, patrimonio, onOpenAsset }) {
   // Sprint P4.1: MISMOS `rows`/`patrimonio` que la tabla de desktop --
   // solo cambia como se renderizan (responsive rendering, nunca dos
   // datasets distintos). Card por posicion: ticker, valor de mercado,
@@ -2237,12 +2324,18 @@ function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
                 <span style={{ color: p.gain >= 0 ? GREEN : RED }}>{p.gain != null ? fmt$2(p.gain) : "—"}</span>
               </div>
               <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
-                <span>Precio: {p.market?.price != null ? fmt$2(p.market.price) : "—"}</span>
+                <span>Precio: {p.market?.price != null ? fmt$2(p.market.price) : "—"}<PriceFreshnessDot market={p.market} /></span>
                 <span>Allocation: {allocPct != null ? `${allocPct.toFixed(1)}%` : "—"}</span>
               </div>
             </button>
           );
         })}
+        {(missingRows || []).map((p) => (
+          <div key={p.id} className="mc-card-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6, opacity: 0.75 }}>
+            <div><b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></div>
+            <div style={{ fontSize: 12, color: AMBER }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</div>
+          </div>
+        ))}
       </div>
     );
   }
@@ -2271,7 +2364,7 @@ function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
                 </button>
               </td>
               <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}</td>
+              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}<PriceFreshnessDot market={p.market} /></td>
               <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
                 {p.gain != null ? fmt$2(p.gain) : "—"}
               </td>
@@ -2282,6 +2375,18 @@ function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
               <td style={{ padding: "10px 6px" }}>
                 {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
               </td>
+            </tr>
+          ))}
+          {(missingRows || []).map((p) => (
+            <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}`, opacity: 0.75 }}>
+              <td style={{ padding: "10px 6px", color: MUTE }}>—</td>
+              <td style={{ padding: "10px 6px" }}>
+                <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                  <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
+                </button>
+              </td>
+              <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
+              <td colSpan={5} style={{ padding: "10px 6px", color: AMBER, fontSize: 12 }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</td>
             </tr>
           ))}
         </tbody>

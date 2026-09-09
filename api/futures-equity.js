@@ -11,23 +11,46 @@
 import { createClient } from "@supabase/supabase-js";
 import { getCryptoData, COINGECKO_FALLBACK_IDS } from "../lib/prices.js";
 import { valuateAccountEquity, selectLatestConfirmedSnapshot, selectLatestPositionSnapshot } from "../lib/reconciliationEngine.js";
+// Sprint P0.4 (Price Freshness + Request Volume Hardening) -- hallazgo
+// real del REQUEST MAP: este endpoint llamaba getCryptoData() DIRECTO,
+// sin pasar nunca por el cache-first + circuit breaker de P0.3
+// (lib/priceCache.js / lib/marketDataOrchestrator.js). Resultado: 2
+// llamadas CoinGecko en vivo GARANTIZADAS cada 60s (BTC + USDT),
+// 24/7, sin ningun TTL ni proteccion de rate-limit -- exactamente la
+// "causa raiz" que este sprint busca reducir. Cambio de ALCANCE
+// ACOTADO, confirmado con el usuario antes de tocar este archivo:
+// SOLO cambia el mecanismo de fetch/cache del precio USD por unidad.
+// selectLatestConfirmedSnapshot, valuateAccountEquity (formula) y
+// cualquier lectura/escritura de account_snapshots quedan IDENTICOS --
+// account snapshots esta en la lista NO TOCAR de este sprint, y no se
+// toca: solo se reusa la MISMA politica de precios que ya usa el
+// dashboard, nunca una formula nueva.
+import { createRateLimitBreaker, buildCacheWriteRow } from "../lib/priceCache.js";
+import { resolveTickerPrice } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h -- no excluye del total, solo marca is_stale
+const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h -- no excluye del total, solo marca is_stale (SNAPSHOT freshness -- ver item 10 del sprint P0.4: esto es la antiguedad del SNAPSHOT importado, nunca se mezcla con la antiguedad del PRECIO, ver price_status mas abajo)
 
-async function resolvePriceUsd(ticker, providerSymbols) {
+// Balances de cuentas futures son dinero real en una cuenta activa --
+// mismo criterio que una position tradicional (priority: "position",
+// TTL de 90s en horario/siempre para cripto, ver lib/priceCache.js).
+async function resolvePriceUsd(ticker, providerSymbols, cachedRow, now, breaker) {
   const coingeckoId = providerSymbols?.coingecko || COINGECKO_FALLBACK_IDS[ticker];
-  if (!coingeckoId) return null;
-  try {
-    const { price } = await getCryptoData(supabase, ticker, coingeckoId);
-    return typeof price === "number" ? price : null;
-  } catch {
-    return null; // nunca inventa un precio -- PRICE_UNAVAILABLE aguas abajo
+  if (!coingeckoId) return { price: null, status: "DATA_UNAVAILABLE", source: null, fetchedAt: null };
+  const result = await resolveTickerPrice({
+    item: { ticker, type: "crypto", coingeckoId, priority: "position" },
+    cachedRow, now, breaker,
+    fetchLive: () => getCryptoData(supabase, ticker, coingeckoId),
+  });
+  if (result.status === "LIVE") {
+    const { error } = await supabase.from("market_cache").upsert([buildCacheWriteRow(ticker, "crypto", result)], { onConflict: "ticker" });
+    if (error) result.cacheWriteFailed = true; // nunca tumba la respuesta principal, solo se pierde el beneficio de cache este ciclo
   }
+  return result; // .price null es DATA_UNAVAILABLE explicito -- nunca inventa un precio, mismo contrato que antes
 }
 
 export default async function handler(req, res) {
@@ -57,6 +80,18 @@ export default async function handler(req, res) {
     let totalValueUsd = 0;
     let isComplete = true;
 
+    // Breaker COMPARTIDO para toda la corrida (mismo patron que
+    // api/market-data.js): si el primer balance dispara un 429, los
+    // balances restantes de esta misma invocacion van directo a
+    // cache/STALE en vez de seguir golpeando CoinGecko. Lectura de
+    // market_cache por ticker (no en batch, a diferencia de
+    // market-data.js): los tickers de balances futures no se conocen
+    // hasta leer cada snapshot, y el volumen real aqui es minimo (2
+    // balances hoy) -- no se justifica la complejidad de un batch para
+    // este caso, ver item 4 del sprint (no sobrearquitectar).
+    const priceNow = new Date();
+    const priceBreaker = createRateLimitBreaker();
+
     for (const account of futuresAccounts || []) {
       const latest = selectLatestConfirmedSnapshot(allSnapshots, confirmedIdSet, account.id);
       if (!latest) continue; // cuenta futures sin snapshot confirmado todavia
@@ -74,10 +109,24 @@ export default async function handler(req, res) {
         const ticker = b.assets?.ticker ?? null;
         const equityValue = b.equity_value != null ? Number(b.equity_value) : null;
         const availableValue = b.available_balance_value != null ? Number(b.available_balance_value) : null;
-        const priceUsd = equityValue != null && ticker ? await resolvePriceUsd(ticker, b.assets?.provider_symbols) : null;
-        const valuation = valuateAccountEquity({ account_id: account.id, asset_id: b.asset_id, equity_value: equityValue, price_usd_per_unit: priceUsd });
 
-        balancesOut.push({ asset_id: b.asset_id, ticker, available_balance_value: availableValue, ...valuation });
+        let priceResult = { price: null, status: "DATA_UNAVAILABLE", source: null, fetchedAt: null };
+        if (equityValue != null && ticker) {
+          const { data: cachedRow } = await supabase
+            .from("market_cache").select("ticker, ai_price, ai_change_pct, ai_price_updated_at, high, low, market_cap, pe_ratio")
+            .eq("ticker", ticker).maybeSingle();
+          priceResult = await resolvePriceUsd(ticker, b.assets?.provider_symbols, cachedRow, priceNow, priceBreaker);
+        }
+        const valuation = valuateAccountEquity({ account_id: account.id, asset_id: b.asset_id, equity_value: equityValue, price_usd_per_unit: priceResult.price });
+
+        balancesOut.push({
+          asset_id: b.asset_id, ticker, available_balance_value: availableValue, ...valuation,
+          // PRICE freshness (P0.4 item 10) -- antiguedad de la COTIZACION
+          // de BTC/USDT, deliberadamente separada de `is_stale` de arriba
+          // (antiguedad del SNAPSHOT importado). Nunca se mezclan en un
+          // solo badge -- ver App.jsx FuturesSection.
+          price_status: priceResult.status, price_source: priceResult.source, price_fetched_at: priceResult.fetchedAt,
+        });
 
         if (valuation.status === "OK") {
           accountValueUsd += valuation.value_usd;
