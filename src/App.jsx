@@ -146,6 +146,72 @@ const TOOL_LABELS = {
 
 const STARS = ["", "★", "★★", "★★★", "★★★★", "★★★★★"];
 
+// Sprint P4.1 (Responsive Mobile Foundation). Un solo breakpoint (767px,
+// igual que src/responsive.css) -- "responsive rendering, no dos
+// datasets distintos": los componentes que lo usan reciben los MISMOS
+// props/datos, solo deciden como renderizarlos (tabla vs cards, orden
+// del hero). matchMedia + listener, sin polling ni resize handlers
+// manuales.
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)").matches : false
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 767px)");
+    const onChange = (e) => setIsMobile(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return isMobile;
+}
+
+// Fuente unica de la lista de tabs -- el nav de desktop y el menu "Más"
+// de mobile leen exactamente de aqui, nunca duplicada.
+const ALL_TABS = [
+  ["command", "Command Center"], ["moniai", "Moni AI"], ["resumen", "Resumen"], ["performance", "Performance"],
+  ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"],
+  ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"],
+  ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"],
+];
+
+// Los 5 destinos principales del bottom nav (mobile). El resto de tabs
+// vive detras de "Más" -- nunca se duplica la lista de tabs, ambos
+// (desktop nav y el menu de "Más") leen de ALL_TABS mas abajo.
+const PRIMARY_MOBILE_TABS = [
+  ["resumen", "Home", "🏠"],
+  ["posiciones", "Portfolio", "📊"],
+  ["__smart_import__", "Import", "📷"],
+  ["moniai", "Moni AI", "✨"],
+  ["__more__", "Más", "☰"],
+];
+
+function MobileBottomNav({ tab, onNavigate, onOpenSmartImport, moreOpen, onToggleMore }) {
+  return (
+    <nav className="mc-bottom-nav mc-mobile-only" aria-label="Navegación principal">
+      {PRIMARY_MOBILE_TABS.map(([key, label, icon]) => {
+        const isSmartImport = key === "__smart_import__";
+        const isMore = key === "__more__";
+        const active = isMore ? moreOpen : (!isSmartImport && tab === key);
+        return (
+          <button
+            key={key}
+            className={`mc-bottom-nav-item${active ? " active" : ""}`}
+            onClick={() => {
+              if (isSmartImport) { onOpenSmartImport(); return; }
+              if (isMore) { onToggleMore(); return; }
+              onNavigate(key);
+            }}
+          >
+            <span style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
+            <span>{label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 export default function Dashboard() {
   const [positions, setPositions] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
@@ -177,6 +243,7 @@ export default function Dashboard() {
   function openAsset(meta) { setAssetDetail(meta); }
   function closeAsset() { setAssetDetail(null); }
   const [showAdd, setShowAdd] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false); // Sprint P4.1: menu "Mas" del bottom nav mobile
   const [showSmartImport, setShowSmartImport] = useState(false);
 
   // ================== Sprint P0.1 -- Reliable Data Loading ==================
@@ -485,7 +552,12 @@ export default function Dashboard() {
         input, select { font-family: inherit; }
       `}</style>
 
-      <div style={{ borderBottom: `1px solid ${LINE}`, overflow: "hidden", whiteSpace: "nowrap", background: PANEL, padding: "8px 0" }}>
+      {/* Sprint P4.1: overflowX:auto en vez de overflow:hidden -- en mobile
+          esta franja ya no corta contenido de forma invisible, se puede
+          deslizar horizontalmente (unico scroll horizontal intencional
+          de todo el layout, para una lista de un solo renglon que no
+          tiene forma razonable de volverse "cards"). */}
+      <div style={{ borderBottom: `1px solid ${LINE}`, overflowX: "auto", whiteSpace: "nowrap", background: PANEL, padding: "8px 0" }}>
         <div style={{ display: "inline-flex", gap: 28, padding: "0 16px" }}>
           {enriched.length === 0 && <span style={{ color: MUTE, fontSize: 12 }}>Cargando posiciones…</span>}
           {enriched.map((p) => (
@@ -563,8 +635,8 @@ export default function Dashboard() {
 
 
         {!assetDetail && (
-        <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["command", "Command Center"], ["moniai", "Moni AI"], ["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+        <div className="mc-desktop-only" style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
+          {ALL_TABS.map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -610,10 +682,15 @@ export default function Dashboard() {
         )}
 
         {tab === "resumen" && (
-          <div style={{ display: "grid", gap: 14 }}>
-            <TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} />
+          // Sprint P4.1: jerarquia mobile-first via CSS order (mc-mobile-order-N,
+          // solo activo bajo 767px -- el orden de desktop, mas abajo, no cambia).
+          // Patrimonio Total/Base/Futures Equity y las cuentas de Futures ya
+          // viven ARRIBA de este bloque de tabs (hero + FuturesSection), asi
+          // que ya son lo primero que se ve al abrir, en cualquier viewport.
+          <div className="mc-order-flex" style={{ display: "grid", gap: 14 }}>
+            <div className="mc-mobile-order-1"><TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} /></div>
 
-            <div style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <div className="mc-mobile-order-2" style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <div style={{ fontSize: 12 }}>
                 <b style={{ color: GOLD }}>Moni AI</b>{" "}
                 {latestInsight?.content?.estado_general ? latestInsight.content.estado_general : "Tu Daily Brief y consultas en vivo viven en una sola pantalla."}
@@ -621,14 +698,16 @@ export default function Dashboard() {
               <button onClick={() => setTab("moniai")} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Abrir Moni AI →</button>
             </div>
 
-            <MarketPulseRow pulse={marketPulse} />
+            <div className="mc-mobile-order-3"><MarketPulseRow pulse={marketPulse} /></div>
 
-            <Panel title="Oportunidades — dentro y fuera de tu cartera">
-              <ScoredOpportunities rows={scoredOpportunities} />
-              <CtaLink label="Ver Top Posiciones" onClick={() => setTab("posiciones")} />
-            </Panel>
+            <div className="mc-mobile-order-5">
+              <Panel title="Oportunidades — dentro y fuera de tu cartera">
+                <ScoredOpportunities rows={scoredOpportunities} />
+                <CtaLink label="Ver Top Posiciones" onClick={() => setTab("posiciones")} />
+              </Panel>
+            </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 14 }}>
+            <div className="mc-mobile-order-6" style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 14 }}>
               <Panel title="Dónde está tu dinero">
                 {allocType.length === 0 ? <Empty /> : (
                   <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
@@ -668,34 +747,38 @@ export default function Dashboard() {
               </Panel>
             </div>
 
-            <Panel title="Qué cambió desde tu última visita">
-              {!cambiosRecientes ? (
-                <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay suficiente historial para comparar — vuelve mañana.</div>
-              ) : (
-                <div style={{ fontSize: 12, color: MUTE, lineHeight: 2 }}>
-                  <div>Desde {cambiosRecientes.baselineDate}:</div>
-                  <div>
-                    Patrimonio <b style={{ color: cambiosRecientes.deltaPatrimonio >= 0 ? GREEN : RED }}>
-                      {cambiosRecientes.deltaPatrimonio >= 0 ? "+" : ""}{fmt$2(cambiosRecientes.deltaPatrimonio)} ({fmtPct(cambiosRecientes.deltaPct)})
-                    </b>
+            <div className="mc-mobile-order-4">
+              <Panel title="Qué cambió desde tu última visita">
+                {!cambiosRecientes ? (
+                  <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay suficiente historial para comparar — vuelve mañana.</div>
+                ) : (
+                  <div style={{ fontSize: 12, color: MUTE, lineHeight: 2 }}>
+                    <div>Desde {cambiosRecientes.baselineDate}:</div>
+                    <div>
+                      Patrimonio <b style={{ color: cambiosRecientes.deltaPatrimonio >= 0 ? GREEN : RED }}>
+                        {cambiosRecientes.deltaPatrimonio >= 0 ? "+" : ""}{fmt$2(cambiosRecientes.deltaPatrimonio)} ({fmtPct(cambiosRecientes.deltaPct)})
+                      </b>
+                    </div>
+                    {cambiosRecientes.movers.map((m) => (
+                      <div key={m.id}>{m.ticker} <b style={{ color: (m.market.changePct || 0) >= 0 ? GREEN : RED }}>{fmtPct1(m.market.changePct)}</b></div>
+                    ))}
                   </div>
-                  {cambiosRecientes.movers.map((m) => (
-                    <div key={m.id}>{m.ticker} <b style={{ color: (m.market.changePct || 0) >= 0 ? GREEN : RED }}>{fmtPct1(m.market.changePct)}</b></div>
-                  ))}
-                </div>
-              )}
-              <CtaLink label="Ver Performance" onClick={() => setTab("performance")} />
-            </Panel>
+                )}
+                <CtaLink label="Ver Performance" onClick={() => setTab("performance")} />
+              </Panel>
+            </div>
 
-            <Panel title="Riesgo">
-              {patrimonio === 0 ? <Empty /> : (
-                <>
-                  <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
-                  <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
-                  <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
-                </>
-              )}
-            </Panel>
+            <div className="mc-mobile-order-7">
+              <Panel title="Riesgo">
+                {patrimonio === 0 ? <Empty /> : (
+                  <>
+                    <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
+                    <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
+                    <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
+                  </>
+                )}
+              </Panel>
+            </div>
           </div>
         )}
 
@@ -796,6 +879,36 @@ export default function Dashboard() {
           Precios de acciones vía Finnhub, cripto vía CoinGecko. Rango de referencia: 52 semanas (acciones) / histórico ATH-ATL (cripto). Informativo, no es asesoría de inversión.
         </div>
       </div>
+
+      {/* Sprint P4.1: menu "Más" (mobile) -- el resto de ALL_TABS, fuera de los 5 destinos principales del bottom nav. */}
+      {showMoreMenu && (
+        <div className="mc-mobile-only" style={{
+          position: "fixed", inset: 0, background: "rgba(10,14,23,0.92)", zIndex: 50,
+          display: "flex", flexDirection: "column", padding: 20, paddingBottom: "calc(var(--mc-bottom-nav-height) + 20px)", overflowY: "auto",
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: TXT }}>Más</div>
+            <button onClick={() => setShowMoreMenu(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 20, cursor: "pointer", minHeight: 44, minWidth: 44 }}>✕</button>
+          </div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {ALL_TABS.map(([key, label]) => (
+              <button key={key} onClick={() => { setTab(key); setShowMoreMenu(false); }} className="mc-touch-target" style={{
+                background: tab === key ? "#1A1710" : PANEL, border: `1px solid ${tab === key ? GOLD : LINE}`,
+                color: tab === key ? GOLD : TXT, borderRadius: 10, padding: "12px 16px", fontSize: 14, fontWeight: 600,
+                textAlign: "left", cursor: "pointer",
+              }}>{label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <MobileBottomNav
+        tab={tab}
+        moreOpen={showMoreMenu}
+        onNavigate={(key) => { setTab(key); setShowMoreMenu(false); }}
+        onOpenSmartImport={() => { setTab("gestionar"); setShowAdd(false); setShowSmartImport(true); setShowMoreMenu(false); }}
+        onToggleMore={() => setShowMoreMenu((s) => !s)}
+      />
     </div>
   );
 }
@@ -852,7 +965,7 @@ function FuturesSection({ futuresEquity }) {
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: TXT, marginBottom: 14, letterSpacing: 0.3 }}>Binance Futures</div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
         {futuresEquity.accounts.map((acc) => {
           const primaryBalance = acc.balances[0];
           const positions = positionsByAccount[acc.account_id] || [];
@@ -1828,6 +1941,42 @@ function RangeBar({ price, low, high, label, compact }) {
 }
 
 function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
+  // Sprint P4.1: MISMOS `rows`/`patrimonio` que la tabla de desktop --
+  // solo cambia como se renderizan (responsive rendering, nunca dos
+  // datasets distintos). Card por posicion: ticker, valor de mercado,
+  // PnL, precio, allocation -- exactamente lo pedido, tap abre el detalle
+  // (mismo onOpenAsset que ya usaba la tabla).
+  const isMobile = useIsMobile();
+  if (isMobile) {
+    return (
+      <div className="mc-card-list">
+        {rows.map((p) => {
+          const allocPct = patrimonio ? (p.value / patrimonio) * 100 : null;
+          return (
+            <button
+              key={p.id}
+              className="mc-card-row mc-touch-target"
+              style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}
+              onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div><b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></div>
+                <ConvictionStars value={p.thesis?.conviction} />
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 600 }}>
+                <span>{fmt$2(p.value)}</span>
+                <span style={{ color: p.gain >= 0 ? GREEN : RED }}>{p.gain != null ? fmt$2(p.gain) : "—"}</span>
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
+                <span>Precio: {p.market?.price != null ? fmt$2(p.market.price) : "—"}</span>
+                <span>Allocation: {allocPct != null ? `${allocPct.toFixed(1)}%` : "—"}</span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
   return (
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 760 }}>
@@ -4326,10 +4475,10 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
         {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button type="button" onClick={confirm} disabled={!canAttemptConfirm} style={{
+          <button type="button" className="mc-touch-target" onClick={confirm} disabled={!canAttemptConfirm} style={{
             background: canAttemptConfirm ? GOLD : LINE, color: canAttemptConfirm ? "#1A1305" : MUTE,
-            border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
-            cursor: canAttemptConfirm ? "pointer" : "not-allowed",
+            border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+            cursor: canAttemptConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
           }}>
             Confirmar importación
           </button>
@@ -4476,10 +4625,10 @@ function FuturesAccountSnapshotReview({ normalized, accounts, pin, importId, onD
       {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
 
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <button type="button" onClick={handleConfirm} disabled={!canConfirm} style={{
+        <button type="button" className="mc-touch-target" onClick={handleConfirm} disabled={!canConfirm} style={{
           background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
-          border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
-          cursor: canConfirm ? "pointer" : "not-allowed",
+          border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+          cursor: canConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
         }}>
           {confirming ? "Confirmando…" : "Confirmar"}
         </button>
@@ -4580,10 +4729,10 @@ function FuturesPositionSnapshotReview({ normalized, accounts, pin, importId, on
       {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
 
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <button type="button" onClick={handleConfirm} disabled={!canConfirm} style={{
+        <button type="button" className="mc-touch-target" onClick={handleConfirm} disabled={!canConfirm} style={{
           background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
-          border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
-          cursor: canConfirm ? "pointer" : "not-allowed",
+          border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+          cursor: canConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
         }}>
           {confirming ? "Confirmando…" : "Confirmar"}
         </button>
