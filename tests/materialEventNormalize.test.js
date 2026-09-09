@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   normalizeFmpEarnings, normalizeFmpPriceTarget, normalizeNewsArticle, normalizeSecFiling,
-  classifyByKeywords, EVENT_TYPE, CLASSIFICATION_METHOD,
+  normalizeFinnhubNews, classifyByKeywords, EVENT_TYPE, CLASSIFICATION_METHOD,
 } from "../lib/materialEventNormalize.js";
 
 // A. source válido → event normalizado
@@ -85,6 +85,40 @@ test("M - noticia sin title/headline nunca se clasifica con falsa confianza -- h
   const r = normalizeNewsArticle({ publishedDate: "2026-08-01T10:00:00Z" }, { asset_id: 29, ticker: "QCOM", provider: "fmp" });
   assert.equal(r.event_type, EVENT_TYPE.OTHER);
   assert.equal(r.requires_review, true);
+});
+
+// Sprint P3.1A.2 -- normalizeFinnhubNews, forma real confirmada de
+// Finnhub /company-news (datetime en SEGUNDOS unix, no ms, no ISO)
+test("Finnhub: datetime en segundos unix se convierte correctamente a ISO, nunca cae en 1970", () => {
+  const raw = { headline: "Company X launches new product line", datetime: 1735689600, source: "Reuters", url: "https://example.com/n1", id: 999, category: "company" };
+  const r = normalizeFinnhubNews(raw, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.published_at, "2025-01-01T00:00:00.000Z");
+  assert.notEqual(new Date(r.published_at).getFullYear(), 1970);
+});
+
+test("Finnhub: publisher se captura en facts, attributed_wire NUNCA se infiere del publisher", () => {
+  const raw = { headline: "Company X signs agreement with a customer", datetime: 1735689600, source: "Yahoo", url: "https://example.com/n2" };
+  const r = normalizeFinnhubNews(raw, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.facts.publisher, "Yahoo");
+  assert.equal(r.attributed_wire, null);
+});
+
+test("Finnhub: datetime ausente o no numerico -> published_at null, nunca inventado", () => {
+  const r1 = normalizeFinnhubNews({ headline: "x", source: "Yahoo" }, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r1.published_at, null);
+  const r2 = normalizeFinnhubNews({ headline: "x", datetime: "not-a-number", source: "Yahoo" }, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r2.published_at, null);
+});
+
+test("Finnhub: provider siempre 'finnhub', nunca heredado de otro lado", () => {
+  const r = normalizeFinnhubNews({ headline: "x", datetime: 1735689600 }, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.provider, "finnhub");
+});
+
+test("Finnhub: clasificacion por keywords funciona igual que para FMP (misma funcion compartida)", () => {
+  const r = normalizeFinnhubNews({ headline: "Qualcomm announces partnership with Amazon for AI data centers", datetime: 1735689600 }, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.event_type, EVENT_TYPE.MAJOR_CONTRACT);
+  assert.equal(r.classification_method, CLASSIFICATION_METHOD.RULE_BASED_KEYWORD);
 });
 
 test("todos los 13 tipos de la taxonomia aprobada existen y ninguno adicional se coló", () => {
