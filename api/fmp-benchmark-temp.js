@@ -23,6 +23,14 @@ import {
   computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
   computeInvested, computeTotalGain, unclassifiedPositions,
 } from "../lib/financialSnapshot.js";
+// Mismos bloques puros que usan api/market-data.js y api/futures-equity.js
+// -- se llaman DIRECTO en vez de por fetch interno porque Vercel
+// Deployment Protection (SSO del preview) bloquea con 401 cualquier
+// fetch de la funcion hacia si misma en el mismo deployment; llamar la
+// funcion en vez del endpoint evita el 401 sin reimplementar nada real.
+import { getStockData, getCryptoData, COINGECKO_FALLBACK_IDS } from "../lib/prices.js";
+import { mapWithConcurrency } from "../lib/aiPriceCache.js";
+import { valuateAccountEquity, selectLatestConfirmedSnapshot } from "../lib/reconciliationEngine.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -156,15 +164,92 @@ const CONFLICT_THRESHOLDS = { price: 2, marketCap: 15, pe: 15 };
 // independientes en un solo archivo temporal para no exceder el limite
 // de 12 funciones serverless de Vercel Hobby).
 //
-// READ-ONLY. Nunca escribe. Llama a los MISMOS endpoints internos que
-// usa la app real (/api/market-data, /api/futures-equity) via fetch
-// interno -- CERO reimplementacion de la logica de precios/futures, y
-// usa las MISMAS funciones puras de lib/financialSnapshot.js que
-// src/App.jsx -- CERO reimplementacion de la formula de totales.
+// READ-ONLY. Nunca escribe. Llama DIRECTO a las mismas funciones puras
+// de lib/prices.js + lib/reconciliationEngine.js que usan
+// api/market-data.js y api/futures-equity.js respectivamente (nunca
+// via fetch interno -- Vercel Deployment Protection intercepta con 401
+// cualquier request de la funcion hacia si misma en el mismo preview,
+// confirmado en vivo) -- CERO reimplementacion de la logica de
+// precios/futures, y usa las MISMAS funciones puras de
+// lib/financialSnapshot.js que src/App.jsx -- CERO reimplementacion de
+// la formula de totales.
+const MARKET_DATA_CONCURRENCY = 6; // misma politica que api/market-data.js
+const STALE_SNAPSHOT_MS = 24 * 60 * 60 * 1000; // mismo umbral que api/futures-equity.js
+
+async function computeMarketDataDirect(items) {
+  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+  const data = {};
+  const errors = [];
+  await mapWithConcurrency(items, MARKET_DATA_CONCURRENCY, async (item) => {
+    const ticker = item.ticker;
+    try {
+      if (item.type === "stock") {
+        data[ticker] = await getStockData(supabase, ticker, FINNHUB_KEY);
+      } else if (item.type === "crypto") {
+        const id = item.coingeckoId || COINGECKO_FALLBACK_IDS[ticker];
+        if (!id) throw new Error("no_coingecko_id");
+        data[ticker] = await getCryptoData(supabase, ticker, id);
+      }
+    } catch (e) {
+      errors.push(ticker);
+    }
+  });
+  return { data, errors };
+}
+
+async function computeFuturesEquityDirect() {
+  const { data: futuresAccounts } = await supabase.from("accounts").select("id, name, account_type, product_type").eq("account_type", "futures");
+  const accountIds = (futuresAccounts || []).map((a) => a.id);
+  const { data: allSnapshots } = accountIds.length
+    ? await supabase.from("account_snapshots").select("id, account_id, observed_at, source_import_id").in("account_id", accountIds)
+    : { data: [] };
+  const importIds = [...new Set((allSnapshots || []).map((s) => s.source_import_id))];
+  const { data: confirmedImports } = importIds.length
+    ? await supabase.from("smart_imports").select("id, status").in("id", importIds)
+    : { data: [] };
+  const confirmedIdSet = new Set((confirmedImports || []).filter((i) => i.status === "CONFIRMED").map((i) => i.id));
+
+  const warnings = [];
+  let totalValueUsd = 0;
+  let isComplete = true;
+
+  for (const account of futuresAccounts || []) {
+    const latest = selectLatestConfirmedSnapshot(allSnapshots, confirmedIdSet, account.id);
+    if (!latest) continue;
+    const { data: balances } = await supabase
+      .from("account_snapshot_balances")
+      .select("asset_id, equity_value, available_balance_value, assets(ticker, provider_symbols)")
+      .eq("account_snapshot_id", latest.id);
+
+    let accountValueUsd = 0;
+    for (const b of balances || []) {
+      const ticker = b.assets?.ticker ?? null;
+      const equityValue = b.equity_value != null ? Number(b.equity_value) : null;
+      let priceUsd = null;
+      if (equityValue != null && ticker) {
+        const coingeckoId = b.assets?.provider_symbols?.coingecko || COINGECKO_FALLBACK_IDS[ticker];
+        if (coingeckoId) {
+          try {
+            const r = await getCryptoData(supabase, ticker, coingeckoId);
+            priceUsd = typeof r.price === "number" ? r.price : null;
+          } catch { priceUsd = null; }
+        }
+      }
+      const valuation = valuateAccountEquity({ account_id: account.id, asset_id: b.asset_id, equity_value: equityValue, price_usd_per_unit: priceUsd });
+      if (valuation.status === "OK") accountValueUsd += valuation.value_usd;
+      else { isComplete = false; warnings.push(`${valuation.status}_${ticker ?? b.asset_id}_ACCOUNT_${account.id}`); }
+    }
+
+    const ageMs = Date.now() - new Date(latest.observed_at).getTime();
+    if (ageMs > STALE_SNAPSHOT_MS) warnings.push(`STALE_SNAPSHOT_ACCOUNT_${account.id}`);
+    totalValueUsd += accountValueUsd;
+  }
+
+  return { total_value_usd: totalValueUsd, is_complete: isComplete, warnings };
+}
+
 async function runReconciliation(req, res) {
   const financialRefreshId = `p02-recon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const base = `${proto}://${req.headers.host}`;
 
   const [{ data: positions, error: posErr }, { data: cashMovements, error: cmErr }] = await Promise.all([
     supabase.from("positions").select("*"),
@@ -181,11 +266,8 @@ async function runReconciliation(req, res) {
   const marketDataCall = (async () => {
     const t = Date.now();
     try {
-      const r = await fetch(`${base}/api/market-data`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
-      });
-      const json = await r.json();
-      return { ok: r.ok, status: r.status, json, duration_ms: Date.now() - t };
+      const json = await computeMarketDataDirect(items);
+      return { ok: true, status: 200, json, duration_ms: Date.now() - t };
     } catch (e) {
       return { ok: false, status: null, json: null, duration_ms: Date.now() - t, error: String(e.message || e) };
     }
@@ -194,9 +276,8 @@ async function runReconciliation(req, res) {
   const futuresEquityCall = (async () => {
     const t = Date.now();
     try {
-      const r = await fetch(`${base}/api/futures-equity`);
-      const json = await r.json();
-      return { ok: r.ok, status: r.status, json, duration_ms: Date.now() - t };
+      const json = await computeFuturesEquityDirect();
+      return { ok: true, status: 200, json, duration_ms: Date.now() - t };
     } catch (e) {
       return { ok: false, status: null, json: null, duration_ms: Date.now() - t, error: String(e.message || e) };
     }
@@ -208,7 +289,7 @@ async function runReconciliation(req, res) {
 
   const marketData = marketR.ok ? mergeMarketData({}, marketR.json.data || {}) : {};
   const marketErrors = marketR.ok ? (marketR.json.errors || []) : [];
-  const futuresEquity = futuresR.ok ? futuresR.json : { total_value_usd: 0, is_complete: false, accounts: [], positions: [], warnings: ["futures_equity_call_failed"] };
+  const futuresEquity = futuresR.ok ? futuresR.json : { total_value_usd: 0, is_complete: false, accounts: [], positions: [], warnings: ["futures_equity_call_failed", futuresR.error].filter(Boolean) };
 
   // ================== GRUPO CRITICO: commit unico (mismo principio que loadAll()) ==================
   const enriched = enrichPositions(positions, marketData, {});
