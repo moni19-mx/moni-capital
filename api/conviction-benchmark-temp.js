@@ -35,13 +35,24 @@ import {
   computeOverallConviction, computeConvictionConfidence, applyComponentDeltas,
 } from "../lib/convictionEngine.js";
 import { classifyReviewRequirement } from "../lib/convictionReview.js";
-import { requestThesisImpact, AI_NOT_ATTEMPTED } from "../lib/thesisImpactAi.js";
+import { requestThesisImpact, AI_NOT_ATTEMPTED, shouldInsertNeutralMarker } from "../lib/thesisImpactAi.js";
 import { callModel } from "../lib/aiGateway.js";
 import { tierScore } from "../lib/materialEventSources.js";
 import {
   CONVICTION_ENGINE_VERSION, CONVICTION_SCORING_POLICY_VERSION, CONVICTION_CONFIDENCE_POLICY_VERSION,
-  CONVICTION_WEIGHTS,
+  CONVICTION_WEIGHTS, FUNDAMENTAL_CONVICTION_POLICY_VERSION, LOW_COVERAGE_GUARD_POLICY_VERSION,
 } from "../lib/thesisConvictionVersioning.js";
+import {
+  UNKNOWN as FUND_UNKNOWN, seriesForConcept, classifyFactFreshness,
+  computeBusinessQuality, computeObservedGrowth, computeExecutionFromEarnings,
+  computeFinancialStrength, computeValuationFromPeg, classifyEvidenceSufficiency,
+} from "../lib/fundamentalConviction.js";
+
+// SEC EDGAR (10-K/10-Q) y el snapshot de mercado en market_cache son
+// evidencia real de mayor jerarquia posible (filing regulatorio /
+// precio de mercado real, no interpretacion) -- mismo tier numerico
+// que un Tier 1 real en material_event_sources (ver tierScore()).
+const FUNDAMENTAL_SOURCE_TIER_SCORE = 100;
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -120,6 +131,94 @@ async function fetchLatestConvictionHistory(assetId) {
   return data?.[0] || null;
 }
 
+// Micro-sprint P3.2.1 (Fundamental Conviction Coverage), items 1-9.
+// Componentes DETERMINISTICOS a partir de facts reales ya existentes
+// (sec_financials_normalized via api/sec-benchmark-temp.js, market_cache)
+// -- ningun provider nuevo, ningun fallback fabricado. Devuelve
+// {components, freshness} -- freshness clasifica cada componente
+// conocido como CURRENT/STALE segun el period_end/fecha real que lo
+// respalda (item 11/12), UNKNOWN si el componente mismo es UNKNOWN.
+async function computeFundamentalComponents(ticker) {
+  const nowIso = new Date().toISOString();
+
+  const { data: secRows, error: secErr } = await supabase
+    .from("sec_financials_normalized").select("canonical_concept, value, period_end, source").eq("ticker", ticker);
+  if (secErr) throw secErr;
+
+  const revenueSeries = seriesForConcept(secRows, "REVENUE");
+  const operatingIncomeSeries = seriesForConcept(secRows, "OPERATING_INCOME");
+  const fcfSeries = seriesForConcept(secRows, "FREE_CASH_FLOW");
+
+  const businessQuality = computeBusinessQuality(revenueSeries, operatingIncomeSeries);
+  const growth = computeObservedGrowth(revenueSeries);
+  const financialStrength = computeFinancialStrength(revenueSeries, fcfSeries);
+
+  const { data: cacheRow } = await supabase.from("market_cache").select("pe_ratio, updated_at").eq("ticker", ticker).maybeSingle();
+  const peRatio = cacheRow?.pe_ratio != null ? Number(cacheRow.pe_ratio) : FUND_UNKNOWN;
+  const growthFractionForPeg = growth.value !== FUND_UNKNOWN ? growth.observed_growth_pct / 100 : FUND_UNKNOWN;
+  const valuation = computeValuationFromPeg(peRatio, growthFractionForPeg);
+
+  const { data: earningsEvents, error: earnErr } = await supabase
+    .from("material_events").select("facts, occurred_at")
+    .eq("ticker", ticker).eq("event_type", "EARNINGS").eq("is_current", true)
+    .order("occurred_at", { ascending: false });
+  if (earnErr) throw earnErr;
+  const surprises = (earningsEvents || [])
+    .map((e) => {
+      const actual = e.facts?.eps_actual;
+      const estimated = e.facts?.eps_estimated;
+      if (typeof actual !== "number" || typeof estimated !== "number" || estimated === 0) return null;
+      return { surprisePct: (actual - estimated) / Math.abs(estimated), period_end: e.occurred_at };
+    })
+    .filter(Boolean);
+  const execution = computeExecutionFromEarnings(surprises);
+
+  const components = {
+    BUSINESS_QUALITY: businessQuality, GROWTH_TAM: growth, EXECUTION: execution,
+    FINANCIAL_STRENGTH: financialStrength, VALUATION: valuation,
+  };
+
+  const freshness = {
+    BUSINESS_QUALITY: businessQuality.period_end ? classifyFactFreshness(businessQuality.period_end, nowIso) : FUND_UNKNOWN,
+    GROWTH_TAM: growth.latest_period ? classifyFactFreshness(growth.latest_period, nowIso) : FUND_UNKNOWN,
+    FINANCIAL_STRENGTH: financialStrength.period_end ? classifyFactFreshness(financialStrength.period_end, nowIso) : FUND_UNKNOWN,
+    // market_cache es un snapshot casi en vivo (TTL de horas, ver
+    // lib/marketCache.js) -- CURRENT mientras el componente sea conocido.
+    VALUATION: valuation.value !== FUND_UNKNOWN ? "CURRENT" : FUND_UNKNOWN,
+    EXECUTION: surprises[0]?.period_end ? classifyFactFreshness(surprises[0].period_end, nowIso) : FUND_UNKNOWN,
+  };
+
+  return { components, freshness, market_cache_updated_at: cacheRow?.updated_at || null };
+}
+
+// Micro-sprint P3.2.1, item 10 (EVIDENCE STATE ACUMULATIVO). Corrige el
+// hallazgo real de P3.2: computar source_confidence solo con los tiers
+// de los eventos procesados EN ESTA CORRIDA hacia que confidence
+// bajara (59%->44%) cuando una corrida no traia eventos nuevos, aunque
+// la evidencia previa siguiera vigente. Aqui se relee TODA la
+// evidencia real y vigente que hoy respalda la tesis del asset --
+// reproducible en cada corrida, nunca acumulado en memoria entre
+// llamadas.
+async function fetchAccumulatedSourceTiers(assetId) {
+  const { data: effects, error } = await supabase
+    .from("thesis_dimension_effects").select("material_event_id")
+    .eq("asset_id", assetId).not("dimension_id", "is", null);
+  if (error) throw error;
+  const eventIds = [...new Set((effects || []).map((e) => e.material_event_id))];
+  if (eventIds.length === 0) return [];
+
+  const { data: events, error: evErr } = await supabase
+    .from("material_events").select("id, primary_source_id").in("id", eventIds);
+  if (evErr) throw evErr;
+  const sourceIds = [...new Set((events || []).map((e) => e.primary_source_id).filter(Boolean))];
+  if (sourceIds.length === 0) return [];
+
+  const { data: sources, error: srcErr } = await supabase
+    .from("event_sources").select("id, source_tier").in("id", sourceIds);
+  if (srcErr) throw srcErr;
+  return (sources || []).map((s) => tierScore(s.source_tier));
+}
+
 function buildImpactPrompt(event, dimensions) {
   return [
     "Eres el modulo de interpretacion de impacto de tesis de Moni Intelligence. Analiza si este evento REAL afecta alguna de las dimensiones REALES de la tesis de inversion listadas abajo.",
@@ -189,7 +288,6 @@ export default async function handler(req, res) {
       const eventResults = [];
       const allComponentDeltas = [];
       const allEvidenceRefs = [];
-      const allSourceTiers = [];
       let maxTriggeringMateriality = null;
       let anyInvalidated = false;
       let anyFailedAi = false;
@@ -233,7 +331,7 @@ export default async function handler(req, res) {
         // "evaluado contra toda la tesis, sin efecto en ninguna
         // dimension", distinto de "nunca evaluado" (FAILED/NOT_ATTEMPTED
         // nunca insertan marcador -- se reintentan en la proxima corrida).
-        if (effectRows.length === 0 && (aiResult.ai_status === "APPLIED" || aiResult.ai_status === "NEUTRAL")) {
+        if (shouldInsertNeutralMarker({ effectRowsCount: effectRows.length, aiStatus: aiResult.ai_status })) {
           effectRows.push({
             material_event_id: event.id, dimension_id: null, asset_id: assetId,
             effect: "NEUTRAL", confidence: null, evidence_refs: [{ material_event_id: event.id, headline: event.headline }],
@@ -251,11 +349,6 @@ export default async function handler(req, res) {
           allEvidenceRefs.push({ material_event_id: event.id, final_materiality_score: event.latest_materiality.final_materiality_score });
           maxTriggeringMateriality = Math.max(maxTriggeringMateriality ?? 0, event.latest_materiality.final_materiality_score);
         }
-        if (event.primary_source_id) {
-          const { data: srcRow } = await supabase.from("event_sources").select("source_tier").eq("id", event.primary_source_id).single();
-          if (srcRow?.source_tier != null) allSourceTiers.push(tierScore(srcRow.source_tier));
-        }
-
         eventResults.push({
           event_id: event.id, headline: event.headline, event_type: event.event_type,
           materiality: event.latest_materiality, ai_status: aiResult.ai_status,
@@ -263,7 +356,33 @@ export default async function handler(req, res) {
         });
       }
 
-      const newComponents = applyComponentDeltas(previousComponents, allComponentDeltas);
+      const aiComponents = applyComponentDeltas(previousComponents, allComponentDeltas);
+
+      // Micro-sprint P3.2.1 (items 1-9): "MAS EVIDENCIA, NO MAS OPINION".
+      // Los 5 componentes fundamentales se recalculan SIEMPRE desde facts
+      // reales vigentes (sec_financials_normalized + market_cache +
+      // material_events reales) y, cuando son conocidos, SOBRESCRIBEN
+      // cualquier valor previo (venga de un delta de AI anclado en el
+      // neutral o de una corrida anterior) -- evidencia real determinista
+      // pesa mas que una interpretacion de AI sin facts propios para ese
+      // mismo componente. Si el fundamental sigue UNKNOWN (dato real no
+      // disponible todavia, p.ej. AMD sin SEC data), el valor previo (AI o
+      // UNKNOWN) se conserva tal cual -- nunca se borra evidencia real por
+      // falta de una fuente nueva.
+      const fundamentals = await computeFundamentalComponents(ticker);
+      const newComponents = { ...aiComponents };
+      const fundamentalsApplied = [];
+      for (const key of Object.keys(fundamentals.components)) {
+        const fc = fundamentals.components[key];
+        if (fc.value !== FUND_UNKNOWN) {
+          newComponents[key] = {
+            ...fc, freshness: fundamentals.freshness[key], evidence_layer: "DETERMINISTIC_FUNDAMENTAL",
+            policy_version: FUNDAMENTAL_CONVICTION_POLICY_VERSION,
+          };
+          fundamentalsApplied.push(key);
+        }
+      }
+
       const overall = computeOverallConviction(newComponents);
 
       const riskChanged = allComponentDeltas.some((d) => d.component === "RISK");
@@ -274,8 +393,17 @@ export default async function handler(req, res) {
         return oldest == null ? days : Math.max(oldest, days);
       }, null);
       const invalidatedCount = dimensions.filter((d) => d.status === "INVALIDATED").length;
+
+      // Item 10 (EVIDENCE STATE ACUMULATIVO): confidence se calcula sobre
+      // TODA la evidencia real vigente (eventos ya interpretados en
+      // cualquier corrida anterior + esta, mas los componentes
+      // fundamentales conocidos), nunca solo sobre lo procesado en esta
+      // llamada HTTP -- una corrida sin eventos nuevos ya no debe hacer
+      // caer la confidence si la evidencia previa sigue vigente.
+      const accumulatedEventTiers = await fetchAccumulatedSourceTiers(assetId);
+      const fundamentalTiers = fundamentalsApplied.map(() => FUNDAMENTAL_SOURCE_TIER_SCORE);
       const confidence = computeConvictionConfidence({
-        sourceTierScores: allSourceTiers, coverage: overall.coverage,
+        sourceTierScores: [...accumulatedEventTiers, ...fundamentalTiers], coverage: overall.coverage,
         oldestUpdatedAtDaysAgo: oldestDimensionUpdate, invalidatedDimensionsReferenced: invalidatedCount,
       });
 
@@ -286,8 +414,24 @@ export default async function handler(req, res) {
         isPeriodicReview: false,
       });
 
+      // Item 14/21 (LOW COVERAGE GUARD): un delta numerico crudo con
+      // coverage/componentes insuficientes NUNCA se presenta como
+      // "Recommend X->Y" -- se marca explicitamente como evidencia
+      // insuficiente para siquiera proponer el cambio, y NUNCA crea una
+      // decision de revision (evita ensuciar la cola con recomendaciones
+      // que en realidad dicen "no se suficiente", no "la tesis es debil").
+      const evidenceSufficiency = classifyEvidenceSufficiency({
+        coverage: overall.coverage, componentsKnown: overall.components_known,
+      });
+      const hasNominalDelta = overall.status === "SCORED" && overall.proposed_conviction !== previousConviction;
+      let recommendationStatus;
+      if (overall.status === "DATA_UNAVAILABLE") recommendationStatus = "DATA_UNAVAILABLE";
+      else if (!hasNominalDelta) recommendationStatus = "NO_CHANGE";
+      else if (!evidenceSufficiency.sufficient) recommendationStatus = "INSUFFICIENT_EVIDENCE_FOR_CHANGE";
+      else recommendationStatus = "PROPOSED_CHANGE";
+
       let decisionId = null;
-      if (events.length > 0 && review.requires_user_review && overall.status === "SCORED" && overall.proposed_conviction !== previousConviction) {
+      if (events.length > 0 && review.requires_user_review && recommendationStatus === "PROPOSED_CHANGE") {
         const title = `Revisión de convicción: ${ticker} ${previousConviction ?? "?"} → ${overall.proposed_conviction}`;
         const { data: openDecisions } = await supabase.from("decisions").select("id, title").eq("status", "abierta").eq("type", "conviction_review").eq("ticker", ticker);
         const alreadyOpen = (openDecisions || []).find((d) => d.title === title);
@@ -296,7 +440,7 @@ export default async function handler(req, res) {
         } else {
           const { data: decisionRow, error: decErr } = await supabase.from("decisions").insert([{
             type: "conviction_review", ticker, priority: review.reasons.some((r) => r.includes("materiality_high")) ? "alta" : "media",
-            title, detail: `Razones: ${review.reasons.join(", ")}. Confidence: ${confidence.overall_confidence}%.`,
+            title, detail: `Razones: ${review.reasons.join(", ")}. Confidence: ${confidence.overall_confidence}%. Coverage: ${Math.round(overall.coverage * 100)}% (${overall.components_known}/${overall.components_total} componentes).`,
             status: "abierta", created_at: new Date().toISOString(),
           }]).select().single();
           if (decErr) throw decErr;
@@ -322,6 +466,7 @@ export default async function handler(req, res) {
         requires_user_review: review.requires_user_review,
         review_reasons: review.reasons,
         decision_id: decisionId,
+        recommendation_status: recommendationStatus,
         source: "ENGINE_PROPOSAL",
         engine_version: CONVICTION_ENGINE_VERSION,
         scoring_policy_version: CONVICTION_SCORING_POLICY_VERSION,
@@ -332,6 +477,10 @@ export default async function handler(req, res) {
       }]).select().single();
       if (histErr) throw histErr;
 
+      const knownKeys = Object.keys(newComponents).filter((k) => newComponents[k]?.value !== FUND_UNKNOWN && newComponents[k]?.value !== undefined);
+      const unknownKeys = Object.keys(CONVICTION_WEIGHTS).filter((k) => !knownKeys.includes(k));
+      const staleKeys = knownKeys.filter((k) => newComponents[k]?.freshness === "STALE");
+
       scoring.results.push({
         ticker, conviction_history_id: historyRow.id, dimensions_count: dimensions.length,
         events_processed: events.length, any_ai_failed: anyFailedAi,
@@ -339,6 +488,15 @@ export default async function handler(req, res) {
         deterministic_status: overall.status, known_score: overall.known_score, coverage: overall.coverage,
         component_scores: newComponents, overall_confidence: confidence.overall_confidence, confidence_breakdown: confidence,
         requires_user_review: review.requires_user_review, review_reasons: review.reasons, decision_id: decisionId,
+        recommendation_status: recommendationStatus, evidence_sufficiency: evidenceSufficiency,
+        low_coverage_guard_policy_version: LOW_COVERAGE_GUARD_POLICY_VERSION,
+        fundamentals_applied_this_run: fundamentalsApplied,
+        coverage_report: {
+          known_components: knownKeys, known_count: knownKeys.length,
+          unknown_components: unknownKeys, stale_components: staleKeys,
+          weighted_coverage_pct: Math.round(overall.coverage * 1000) / 10,
+          confidence_pct: confidence.overall_confidence,
+        },
         event_results: eventResults,
       });
     }
