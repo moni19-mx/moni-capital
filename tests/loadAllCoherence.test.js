@@ -158,6 +158,60 @@ test("L - dos invocaciones de loadAll disparadas casi simultaneamente (doble tri
   assert.deepEqual(h.state, last, "el estado final debe ser identico al ULTIMO commit atomico observado, nunca una mezcla entre commits");
 });
 
+// ================== N. Smart Import confirm + refresh simultaneo ==================
+// src/App.jsx: `onDone={() => { setShowSmartImport(false); loadAll(); }}`
+// -- Smart Import confirm dispara loadAll() con la MISMA funcion y el
+// MISMO contador de generacion que el polling de 60s y el boton
+// "Actualizar". No es un camino especial: se prueba aqui que, si el
+// polling ya esta a medio vuelo cuando el usuario confirma un Smart
+// Import (dispara un loadAll() nuevo), la confirmacion (mas nueva)
+// gana y el polling viejo se descarta sin corromper el estado.
+test("N - Smart Import confirm mientras el polling de 60s sigue en vuelo: la confirmacion (mas nueva) gana, el polling viejo no corrompe el total", async () => {
+  const pollingGate = deferred();
+  const h = makeHarness({
+    positions: () => pollingGate.promise, // el polling se queda colgado en `positions` (aun no hay Smart Import nuevo)
+    watchlist: async () => [],
+    cashMovements: async () => [],
+    marketData: async () => ({}),
+    futuresEquity: async () => ({ total_value_usd: 0 }),
+  });
+
+  const pollingRun = h.loadAll(); // ciclo de polling automatico, arranca primero
+  await new Promise((r) => setTimeout(r, 5));
+
+  // El usuario confirma un Smart Import -- loadAll() se dispara de
+  // nuevo, mismo latestRequestIdRef, con datos YA actualizados
+  // (posicion nueva real que el import acaba de insertar).
+  const smartImportFetchers = {
+    positions: async () => [{ ticker: "NVDA", type: "stock", shares: 2, cost_basis: 1000 }],
+    watchlist: async () => [],
+    cashMovements: async () => [],
+    marketData: async () => ({ NVDA: { price: 900 } }),
+    futuresEquity: async () => ({ total_value_usd: 0 }),
+  };
+  const smartImportConfirmRun = (async function loadAll() {
+    const myRequestId = ++h.latestRequestIdRef.current;
+    const [posR, wlR] = await Promise.allSettled([smartImportFetchers.positions(), smartImportFetchers.watchlist()]);
+    if (!isCurrentRequest(myRequestId, h.latestRequestIdRef.current)) return "superseded_before_critical";
+    const [cmR, marketR, futuresR] = await Promise.allSettled([smartImportFetchers.cashMovements(), smartImportFetchers.marketData(), smartImportFetchers.futuresEquity()]);
+    if (!isCurrentRequest(myRequestId, h.latestRequestIdRef.current)) return "superseded_after_critical";
+    if (posR.status === "fulfilled") h.state.positions = posR.value;
+    if (marketR.status === "fulfilled") h.state.marketData = mergeMarketData(h.state.marketData, marketR.value);
+    if (futuresR.status === "fulfilled") h.state.futuresEquity = futuresR.value;
+    return "committed";
+  })();
+
+  const smartImportResult = await smartImportConfirmRun;
+  assert.equal(smartImportResult, "committed");
+  assert.equal(h.state.positions[0].ticker, "NVDA", "la confirmacion de Smart Import (mas nueva) commiteo la posicion real nueva");
+
+  // Ahora se libera el polling viejo -- ya es obsoleto.
+  pollingGate.resolve([]); // el polling hubiera devuelto un portafolio VACIO si hubiera ganado -- corrupcion real si no se detecta
+  const pollingResult = await pollingRun;
+  assert.equal(pollingResult, "superseded_before_critical", "el polling viejo debe detectarse como superado y NUNCA commitear su portafolio vacio encima de la confirmacion real");
+  assert.equal(h.state.positions[0].ticker, "NVDA", "el estado sigue siendo el de la confirmacion de Smart Import -- nunca se corrompio a portafolio vacio");
+});
+
 // ================== M/N. fuente critica falla -> no flicker (LKG se conserva) ==================
 test("M - si marketData falla en un refresh posterior, positions/futuresEquity SI se actualizan pero marketData conserva su ultimo valor (merge, no reemplazo)", async () => {
   const h = makeHarness({

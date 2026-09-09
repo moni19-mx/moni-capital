@@ -16,6 +16,13 @@
 // Nunca devuelve ni loguea la API key en la respuesta ni en errores.
 
 import { createClient } from "@supabase/supabase-js";
+// Micro-sprint P0.2 (Financial Totals Correctness + Stability), cierre
+// final. Reutiliza la formula canonica unica -- CERO reimplementacion.
+import {
+  buildMarketDataItems, mergeMarketData, enrichPositions, computeCashValue,
+  computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
+  computeInvested, computeTotalGain, unclassifiedPositions,
+} from "../lib/financialSnapshot.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -142,14 +149,140 @@ function pctDiff(a, b) {
 
 const CONFLICT_THRESHOLDS = { price: 2, marketCap: 15, pe: 15 };
 
+// ================== Micro-sprint P0.2 (cierre final) ==================
+// Modo diagnostico separado (?pin=X&reconcile=true), sin relacion con
+// el proposito original de este archivo (benchmark FMP) -- mismo
+// patron ya usado en conviction-benchmark-temp.js (varios modos
+// independientes en un solo archivo temporal para no exceder el limite
+// de 12 funciones serverless de Vercel Hobby).
+//
+// READ-ONLY. Nunca escribe. Llama a los MISMOS endpoints internos que
+// usa la app real (/api/market-data, /api/futures-equity) via fetch
+// interno -- CERO reimplementacion de la logica de precios/futures, y
+// usa las MISMAS funciones puras de lib/financialSnapshot.js que
+// src/App.jsx -- CERO reimplementacion de la formula de totales.
+async function runReconciliation(req, res) {
+  const financialRefreshId = `p02-recon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const base = `${proto}://${req.headers.host}`;
+
+  const [{ data: positions, error: posErr }, { data: cashMovements, error: cmErr }] = await Promise.all([
+    supabase.from("positions").select("*"),
+    supabase.from("cash_movements").select("*"),
+  ]);
+  if (posErr) return res.status(500).json({ error: "positions_read_failed", detail: String(posErr.message || posErr) });
+  if (cmErr) return res.status(500).json({ error: "cash_movements_read_failed", detail: String(cmErr.message || cmErr) });
+
+  const items = buildMarketDataItems(positions, []); // watchlist vacio a proposito: no afecta ningun total, solo agregaria tickers extra al fetch
+
+  const criticalFetchStartedAt = new Date().toISOString();
+  const t0 = Date.now();
+
+  const marketDataCall = (async () => {
+    const t = Date.now();
+    try {
+      const r = await fetch(`${base}/api/market-data`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
+      });
+      const json = await r.json();
+      return { ok: r.ok, status: r.status, json, duration_ms: Date.now() - t };
+    } catch (e) {
+      return { ok: false, status: null, json: null, duration_ms: Date.now() - t, error: String(e.message || e) };
+    }
+  })();
+
+  const futuresEquityCall = (async () => {
+    const t = Date.now();
+    try {
+      const r = await fetch(`${base}/api/futures-equity`);
+      const json = await r.json();
+      return { ok: r.ok, status: r.status, json, duration_ms: Date.now() - t };
+    } catch (e) {
+      return { ok: false, status: null, json: null, duration_ms: Date.now() - t, error: String(e.message || e) };
+    }
+  })();
+
+  const [marketR, futuresR] = await Promise.all([marketDataCall, futuresEquityCall]);
+  const criticalFetchCompletedAt = new Date().toISOString();
+  const criticalFetchDurationMs = Date.now() - t0;
+
+  const marketData = marketR.ok ? mergeMarketData({}, marketR.json.data || {}) : {};
+  const marketErrors = marketR.ok ? (marketR.json.errors || []) : [];
+  const futuresEquity = futuresR.ok ? futuresR.json : { total_value_usd: 0, is_complete: false, accounts: [], positions: [], warnings: ["futures_equity_call_failed"] };
+
+  // ================== GRUPO CRITICO: commit unico (mismo principio que loadAll()) ==================
+  const enriched = enrichPositions(positions, marketData, {});
+  const unclassified = unclassifiedPositions(positions);
+  const cashValue = computeCashValue(cashMovements);
+  const stocksValue = computeStocksValue(enriched);
+  const cryptoValue = computeCryptoValue(enriched);
+  const patrimonioBase = computePatrimonioBase(enriched, cashValue);
+  const futuresEquityUsd = futuresEquity.total_value_usd || 0;
+  const patrimonioTotal = computePatrimonio(patrimonioBase, futuresEquityUsd);
+  const invested = computeInvested(enriched, cashValue);
+  const pnlTotal = computeTotalGain(patrimonioTotal, invested);
+
+  const financialCommitAt = new Date().toISOString();
+
+  const stockBreakdown = enriched
+    .filter((p) => p.type === "stock")
+    .map((p) => ({
+      ticker: p.ticker,
+      shares: Number(p.shares),
+      price_used: p.market?.price ?? null,
+      price_status: p.value == null ? "MISSING" : (marketErrors.includes(p.ticker) ? "LAST_KNOWN_GOOD" : "LIVE"),
+      market_value: p.value,
+    }))
+    .sort((a, b) => (b.market_value ?? -1) - (a.market_value ?? -1));
+
+  const missingStocks = enriched.filter((p) => p.type === "stock" && p.value == null).map((p) => p.ticker);
+
+  return res.status(200).json({
+    ok: true,
+    computed_at: financialCommitAt,
+    financial_refresh_id: financialRefreshId,
+    critical_fetch_started_at: criticalFetchStartedAt,
+    critical_fetch_completed_at: criticalFetchCompletedAt,
+    financial_commit_at: financialCommitAt,
+    performance: {
+      market_data_duration_ms: marketR.duration_ms,
+      futures_equity_duration_ms: futuresR.duration_ms,
+      critical_financial_refresh_duration_ms: criticalFetchDurationMs,
+      note: "time_to_first_valid_financial_view / time_to_coherent_refresh son metricas de percepcion del navegador -- no medibles desde un endpoint stateless server-side; estas son las duraciones reales del lado servidor que las determinan.",
+    },
+    stocks_value: Math.round(stocksValue * 100) / 100,
+    crypto_value: Math.round(cryptoValue * 100) / 100,
+    cash_value: Math.round(cashValue * 100) / 100,
+    patrimonio_base: Math.round(patrimonioBase * 100) / 100,
+    futures_equity: Math.round(futuresEquityUsd * 100) / 100,
+    patrimonio_total: Math.round(patrimonioTotal * 100) / 100,
+    invested_total: Math.round(invested * 100) / 100,
+    pnl_total: Math.round(pnlTotal * 100) / 100,
+    source_statuses: {
+      positions_count: positions.length,
+      cash_movements_count: cashMovements.length,
+      market_data: { ok: marketR.ok, http_status: marketR.status, errors: marketErrors },
+      futures_equity: { ok: futuresR.ok, http_status: futuresR.status, is_complete: futuresEquity.is_complete, warnings: futuresEquity.warnings || [] },
+      unclassified_positions: unclassified.map((p) => ({ id: p.id, ticker: p.ticker, type: p.type })),
+      missing_price_stocks: missingStocks,
+    },
+    stock_breakdown: stockBreakdown,
+  });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
-  const { pin, tickers, cryptoTickers } = req.query || {};
+  const { pin, tickers, cryptoTickers, reconcile } = req.query || {};
 
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
   }
+
+  if (reconcile === "true") {
+    return runReconciliation(req, res);
+  }
+
   if (!tickers && !cryptoTickers) {
     return res.status(400).json({ error: "missing_params", detail: "usa ?tickers=MSFT,AMZN,...&cryptoTickers=BTCUSD,ETHUSD,..." });
   }

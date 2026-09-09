@@ -514,6 +514,7 @@ export default function Dashboard() {
       // solo, y marketData/futuresEquity llegaban en un commit aparte y
       // mas tardio, asi que Total Acciones/Patrimonio se pintaban de
       // forma incompleta (solo cash, sin acciones/futures) en el medio.
+      const criticalFetchStartedAt = Date.now();
       const [cmR, marketR, futuresR] = await Promise.allSettled([cashMovementsP, marketDataP, futuresEquityP]);
       if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada mientras esperabamos el grupo critico
 
@@ -542,6 +543,29 @@ export default function Dashboard() {
         nowCritical
       );
       setSourceMeta((prev) => ({ ...prev, ...metaCritical }));
+
+      // Sprint P0.2, item 7 (evidencia de coherent refresh): modo
+      // diagnostico minimo, apagado por defecto -- solo activo con
+      // ?diag=financial en la URL o localStorage.mc_financial_diag=1.
+      // Nunca corre en uso normal, no reemplaza la instrumentacion
+      // server-side del endpoint de reconciliacion (api/fmp-benchmark-temp.js?reconcile=true).
+      if (typeof window !== "undefined") {
+        try {
+          const diagOn = new URLSearchParams(window.location.search).get("diag") === "financial"
+            || window.localStorage.getItem("mc_financial_diag") === "1";
+          if (diagOn) {
+            console.log("[P0.2 coherent-refresh]", {
+              financial_refresh_id: myRequestId,
+              critical_fetch_started_at: new Date(criticalFetchStartedAt).toISOString(),
+              critical_fetch_completed_at: nowCritical,
+              financial_commit_at: new Date().toISOString(),
+              critical_fetch_duration_ms: Date.now() - criticalFetchStartedAt,
+              positions_status: posR.status, cash_movements_status: cmR.status,
+              market_data_status: marketR.status, futures_equity_status: futuresR.status,
+            });
+          }
+        } catch (e) { /* diagnostico nunca debe romper loadAll() */ }
+      }
 
       // Unico caso de error bloqueante real: positions nunca tuvo datos
       // validos Y este intento tambien fallo. Cualquier otro fallo se
