@@ -517,12 +517,129 @@ async function fetchEventForScoring(eventId) {
   return { eventRow, primaryTier, evidenceRefs };
 }
 
+// Sprint P3.1B.1 (Reglas 4, 6, 7, 8, 9, 10). Corre el scoring real
+// (deterministico + AI opcional) sobre una lista de material_events ids
+// YA CONOCIDOS -- reusada tanto por la corrida normal (score=true sobre
+// eventos recien tocados por ingest=true) como por el modo score_only
+// (Regla 3: separa a proposito el momento de VER los facts reales
+// -- corrida 1, sin score -- del momento de puntuarlos -- corrida 2,
+// score_only sobre los mismos event_ids exactos -- para que la
+// clasificacion humana EXPECTED se documente sobre los facts reales
+// SIN haber visto todavia el score del engine). Nunca reescribe una
+// materiality_scores existente -- cada llamada es una fila nueva.
+async function scoreEventIds(eventIds, shouldAiTest) {
+  const positionContextCache = {};
+  const scoredForAi = [];
+  for (const eventId of eventIds) {
+    const { eventRow, primaryTier, evidenceRefs } = await fetchEventForScoring(eventId);
+    if (!positionContextCache[eventRow.ticker]) {
+      positionContextCache[eventRow.ticker] = await fetchPositionContext(eventRow.ticker);
+    }
+    const deterministicResult = computeDeterministicForEvent(eventRow, positionContextCache[eventRow.ticker], primaryTier);
+    scoredForAi.push({ eventId, eventRow, deterministicResult, evidenceRefs });
+  }
+
+  // Regla 10: hasta 3 candidatos reales para AI live -- uno LOW, uno
+  // MEDIUM, uno HIGH SI EXISTE (nunca fabricado si no hay un HIGH real
+  // en esta muestra).
+  const aiCandidateIds = new Set();
+  if (shouldAiTest) {
+    for (const level of ["LOW", "MEDIUM", "HIGH"]) {
+      const match = scoredForAi.find((s) =>
+        s.deterministicResult.det.status === "SCORED" &&
+        deriveMaterialityLevel(s.deterministicResult.det.score) === level &&
+        !aiCandidateIds.has(s.eventId)
+      );
+      if (match) aiCandidateIds.add(match.eventId);
+    }
+  }
+
+  const results = [];
+  for (const item of scoredForAi) {
+    const runAi = shouldAiTest && aiCandidateIds.has(item.eventId);
+    let aiResult = { ...AI_NOT_ATTEMPTED };
+    let modelProvider = null;
+    let modelName = null;
+    if (runAi) {
+      const capture = {};
+      const callModelFn = async (promptContext) => {
+        const result = await callModel({
+          system: "Respondes UNICAMENTE con un objeto JSON valido, sin texto adicional, sin backticks de markdown.",
+          messages: [{ role: "user", content: promptContext }],
+          authContext: { authenticated: true },
+          maxTokens: 400,
+        });
+        capture.provider = result.usage?.provider || null;
+        capture.model = result.usage?.model || null;
+        return result.content || null;
+      };
+      const promptText = buildAiAdjustmentPrompt(item.eventRow, item.deterministicResult);
+      aiResult = await requestAiAdjustment(callModelFn, promptText);
+      modelProvider = capture.provider;
+      modelName = capture.model;
+    }
+    const persisted = await persistScore(
+      item.eventRow, item.deterministicResult,
+      { ...aiResult, model_provider: modelProvider, model_name: modelName },
+      item.evidenceRefs
+    );
+    results.push({
+      materiality_score_id: persisted.id,
+      event_id: item.eventId,
+      ticker: item.eventRow.ticker,
+      event_type: item.eventRow.event_type,
+      headline: item.eventRow.headline,
+      facts: item.eventRow.facts,
+      ai_test_attempted_for_this_event: runAi,
+      deterministic_status: item.deterministicResult.det.status,
+      deterministic_score: item.deterministicResult.det.status === "SCORED" ? item.deterministicResult.det.score : null,
+      deterministic_components: {
+        FINANCIAL_SCALE: item.deterministicResult.financial,
+        STRATEGIC_RELEVANCE: item.deterministicResult.strategic,
+        TIMELINE_URGENCY: item.deterministicResult.timeline,
+        SOURCE_STRENGTH: item.deterministicResult.source,
+      },
+      portfolio_relevance: item.deterministicResult.portfolioRelevance,
+      ai_status: aiResult.ai_status,
+      ai_adjustment: aiResult.adjustment,
+      ai_adjustment_reason: aiResult.reason,
+      ai_interpretation: aiResult.interpretation,
+      ai_model_provider: modelProvider,
+      ai_model_name: modelName,
+      final_materiality_score: persisted.final_materiality_score,
+      materiality_level: persisted.materiality_level,
+      overall_confidence: persisted.overall_confidence,
+    });
+  }
+  return results;
+}
+
 export default async function handler(req, res) {
   const {
     pin, tickers, ingest, earnings_tickers, score, ai_test, max_ingest, max_earnings_ingest,
+    score_only, event_ids,
   } = req.query || {};
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
+  }
+
+  // Sprint P3.1B.1 (Regla 3 -- ground truth humano ANTES de ver el
+  // score). Modo separado, deliberadamente sin tocar Finnhub: puntua
+  // SOLO los material_events ids ya conocidos (de una corrida previa
+  // con ingest=true, sin score) -- para que la clasificacion EXPECTED
+  // se documente sobre los facts reales ya vistos, nunca sobre un lote
+  // distinto de noticias que pudo cambiar entre una corrida y la otra.
+  if (score_only === "true") {
+    const idList = (event_ids || "").split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n));
+    if (idList.length === 0) {
+      return res.status(400).json({ error: "score_only_requires_event_ids", detail: "pasa event_ids=101,102,103 (los ids reales devueltos por una corrida previa con ingest=true)" });
+    }
+    try {
+      const results = await scoreEventIds(idList, ai_test === "true");
+      return res.status(200).json({ ok: true, mode: "score_only", ai_test_attempted: ai_test === "true", results });
+    } catch (err) {
+      return res.status(500).json({ error: "score_only_failed", detail: String(err.message || err) });
+    }
   }
 
   const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
@@ -672,89 +789,7 @@ export default async function handler(req, res) {
         ...ingestion.results.filter((r) => r.event_id).map((r) => r.event_id),
         ...earningsIngestion.results.filter((r) => r.event_id).map((r) => r.event_id),
       ])];
-
-      const positionContextCache = {};
-      const scoredForAi = [];
-      for (const eventId of touchedEventIds) {
-        const { eventRow, primaryTier, evidenceRefs } = await fetchEventForScoring(eventId);
-        if (!positionContextCache[eventRow.ticker]) {
-          positionContextCache[eventRow.ticker] = await fetchPositionContext(eventRow.ticker);
-        }
-        const deterministicResult = computeDeterministicForEvent(eventRow, positionContextCache[eventRow.ticker], primaryTier);
-        scoredForAi.push({ eventId, eventRow, deterministicResult, evidenceRefs });
-      }
-
-      // Regla 10: hasta 3 candidatos reales para AI live -- uno LOW, uno
-      // MEDIUM, uno HIGH SI EXISTE (nunca fabricado si no hay un HIGH
-      // real en esta muestra).
-      const aiCandidateIds = new Set();
-      if (shouldAiTest) {
-        for (const level of ["LOW", "MEDIUM", "HIGH"]) {
-          const match = scoredForAi.find((s) =>
-            s.deterministicResult.det.status === "SCORED" &&
-            deriveMaterialityLevel(s.deterministicResult.det.score) === level &&
-            !aiCandidateIds.has(s.eventId)
-          );
-          if (match) aiCandidateIds.add(match.eventId);
-        }
-      }
-
-      for (const item of scoredForAi) {
-        const runAi = shouldAiTest && aiCandidateIds.has(item.eventId);
-        let aiResult = { ...AI_NOT_ATTEMPTED };
-        let modelProvider = null;
-        let modelName = null;
-        if (runAi) {
-          const capture = {};
-          const callModelFn = async (promptContext) => {
-            const result = await callModel({
-              system: "Respondes UNICAMENTE con un objeto JSON valido, sin texto adicional, sin backticks de markdown.",
-              messages: [{ role: "user", content: promptContext }],
-              authContext: { authenticated: true },
-              maxTokens: 400,
-            });
-            capture.provider = result.usage?.provider || null;
-            capture.model = result.usage?.model || null;
-            return result.content || null;
-          };
-          const promptText = buildAiAdjustmentPrompt(item.eventRow, item.deterministicResult);
-          aiResult = await requestAiAdjustment(callModelFn, promptText);
-          modelProvider = capture.provider;
-          modelName = capture.model;
-        }
-        const persisted = await persistScore(
-          item.eventRow, item.deterministicResult,
-          { ...aiResult, model_provider: modelProvider, model_name: modelName },
-          item.evidenceRefs
-        );
-        scoring.results.push({
-          materiality_score_id: persisted.id,
-          event_id: item.eventId,
-          ticker: item.eventRow.ticker,
-          event_type: item.eventRow.event_type,
-          headline: item.eventRow.headline,
-          facts: item.eventRow.facts,
-          ai_test_attempted_for_this_event: runAi,
-          deterministic_status: item.deterministicResult.det.status,
-          deterministic_score: item.deterministicResult.det.status === "SCORED" ? item.deterministicResult.det.score : null,
-          deterministic_components: {
-            FINANCIAL_SCALE: item.deterministicResult.financial,
-            STRATEGIC_RELEVANCE: item.deterministicResult.strategic,
-            TIMELINE_URGENCY: item.deterministicResult.timeline,
-            SOURCE_STRENGTH: item.deterministicResult.source,
-          },
-          portfolio_relevance: item.deterministicResult.portfolioRelevance,
-          ai_status: aiResult.ai_status,
-          ai_adjustment: aiResult.adjustment,
-          ai_adjustment_reason: aiResult.reason,
-          ai_interpretation: aiResult.interpretation,
-          ai_model_provider: modelProvider,
-          ai_model_name: modelName,
-          final_materiality_score: persisted.final_materiality_score,
-          materiality_level: persisted.materiality_level,
-          overall_confidence: persisted.overall_confidence,
-        });
-      }
+      scoring.results = await scoreEventIds(touchedEventIds, shouldAiTest);
     }
 
     return res.status(200).json({
