@@ -33,20 +33,26 @@ test("B - FINANCIAL_SCALE: registro real-shaped de Finnhub /stock/earnings (actu
 });
 
 // ================== C. TIMELINE_URGENCY con input real-shaped ==================
-test("C - TIMELINE_URGENCY: earnings_date real-shaped (periodo ya ocurrido) -> already_effective_or_past, nunca UNKNOWN", () => {
+// P3.1B.2: el bug real encontrado aqui en P3.1B.1 (un earnings_date
+// pasado SIEMPRE devolvia urgencia=100, sin importar hace cuanto) ya
+// esta corregido -- este mismo test ahora verifica el comportamiento
+// nuevo (disclosure decay) en vez del bug.
+test("C - TIMELINE_URGENCY: earnings_date real-shaped (periodo ocurrido hace ~71 dias) -> disclosure decay, nunca UNKNOWN ni 100 fijo", () => {
   const raw = { symbol: "QCOM", period: "2026-06-30", year: 2026, quarter: 3, actual: 2.62, estimate: 2.51 };
   const normalized = normalizeFinnhubEarnings(raw, { asset_id: 29, ticker: "QCOM" });
-  const result = computeTimelineUrgency(normalized.facts, "2026-09-09T00:00:00.000Z");
+  const result = computeTimelineUrgency(normalized.event_type, normalized.facts, "2026-09-09T00:00:00.000Z");
   assert.notEqual(result.value, "UNKNOWN");
-  assert.equal(result.method, "already_effective_or_past");
-  assert.equal(result.value, 100);
-  assert.ok(result.days_until < 0, "un earnings_date pasado debe dar days_until negativo -- confirma que esto es freshness del dato, no urgencia futura real");
+  assert.equal(result.method, "disclosure_decay");
+  assert.equal(result.bucket, "MEDIUM_TERM_DISCLOSURE");
+  assert.equal(result.value, 30);
+  assert.notEqual(result.value, 100, "bug real corregido en P3.1B.2: ya no es 100 fijo solo por haber ocurrido");
+  assert.ok(result.days_since_published > 0, "un earnings_date pasado debe dar days_since_published positivo");
 });
 
 test("C - TIMELINE_URGENCY: noticia de texto libre (Finnhub company-news) sin fecha estructurada -> UNKNOWN honesto", () => {
   const raw = { headline: "Qualcomm signs new agreement with major customer", datetime: 1735689600, source: "Reuters", url: "https://example.com" };
   const normalized = normalizeFinnhubNews(raw, { asset_id: 29, ticker: "QCOM" });
-  const result = computeTimelineUrgency(normalized.facts, "2026-09-09T00:00:00.000Z");
+  const result = computeTimelineUrgency(normalized.event_type, normalized.facts, "2026-09-09T00:00:00.000Z");
   assert.equal(result.value, "UNKNOWN");
 });
 

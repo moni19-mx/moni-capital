@@ -15,10 +15,12 @@ test("A - 'Semiconductores' (tema, español) y 'semiconductor' (headline, ingles
 test("A - computeStrategicRelevance: tema en español + headline en ingles SI suma el overlap ahora (bug corregido)", () => {
   const r = computeStrategicRelevance(
     { headline_raw: "Qualcomm and other semiconductor names rally on chip demand" },
-    { isActivePosition: true, tema: "Semiconductores IA", sector: "Semiconductores" }
+    { tema: "Semiconductores IA", sector: "Semiconductores" }
   );
   assert.ok(r.evidence.some((e) => e.startsWith("canonical_tag_overlap")));
-  assert.equal(r.value, 60); // active_position(20) + classified_as(20) + canonical_tag_overlap(20)
+  // P3.1B.2: classified_as(40) + canonical_tag_overlap(60) -- ya no
+  // incluye isActivePosition (esa señal es portfolio, no company).
+  assert.equal(r.value, 100);
 });
 
 test("A - 'Energia' (español) y 'energy' (ingles) resuelven al mismo tag", () => {

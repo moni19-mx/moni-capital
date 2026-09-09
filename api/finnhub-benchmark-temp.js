@@ -38,7 +38,7 @@ import {
 // Sprint P3.1B.1 (Materiality Real-World Validation)
 import {
   computeFinancialScale, computeStrategicRelevance, computeTimelineUrgency,
-  computeSourceStrength, computeDeterministicScore, classifyPortfolioRelevance,
+  computeSourceStrength, computeEntityRelevance, computeDeterministicScore, classifyPortfolioRelevance,
 } from "../lib/materialityEngine.js";
 import { computeFinalMateriality, deriveMaterialityLevel } from "../lib/materialityFormula.js";
 import { requestAiAdjustment, AI_NOT_ATTEMPTED } from "../lib/materialityAiAdjustment.js";
@@ -365,9 +365,11 @@ async function ingestEarningsRecord(record, assetId, ticker, now) {
   return ingestNormalizedEvent(normalized, assetId, ticker, now, FINNHUB_TIER, "finnhub");
 }
 
-// ================== Sprint P3.1B.1: scoring real ==================
-// Datos REALES de positions/thesis (nunca hardcodeados) -- misma forma
-// que computeStrategicRelevance()/classifyPortfolioRelevance() esperan.
+// ================== Sprint P3.1B.1: scoring real (extendido en
+// P3.1B.2 con companyName, para ENTITY_RELEVANCE) ==================
+// Datos REALES de positions/thesis/assets (nunca hardcodeados) -- misma
+// forma que computeStrategicRelevance()/classifyPortfolioRelevance()/
+// computeEntityRelevance() esperan.
 async function fetchPositionContext(ticker) {
   const { data: posRows, error: posErr } = await supabase
     .from("positions")
@@ -387,33 +389,50 @@ async function fetchPositionContext(ticker) {
     conviction = (thesisRows && thesisRows[0] && typeof thesisRows[0].conviction === "number") ? thesisRows[0].conviction : null;
   }
 
+  const { data: assetRows, error: assetErr } = await supabase
+    .from("assets").select("ticker, name").eq("ticker", ticker);
+  if (assetErr) throw assetErr;
+  const companyName = (assetRows && assetRows[0] && assetRows[0].name) || null;
+
   return {
     isActivePosition,
     tema: pos.tema || null,
     sector: pos.sector || null,
     strategic_role: pos.strategic_role || null,
     conviction,
+    companyName,
   };
 }
 
-// Corre los 4 componentes deterministicos + el score final SIN AI --
-// puramente el pipeline de lib/materialityEngine.js/materialityFormula.js
-// contra un material_events row REAL. Nunca decide el nivel de
-// materialidad por su cuenta -- deriveMaterialityLevel() es la unica
-// fuente de esa regla, ya versionada.
+// Corre los 4 componentes deterministicos + ENTITY_RELEVANCE + el score
+// final SIN AI -- puramente el pipeline de
+// lib/materialityEngine.js/materialityFormula.js contra un
+// material_events row REAL. Nunca decide el nivel de materialidad por
+// su cuenta -- deriveMaterialityLevel() es la unica fuente de esa
+// regla, ya versionada.
+//
+// P3.1B.2: STRATEGIC_RELEVANCE ya NO recibe isActivePosition/conviction
+// (esos solo alimentan classifyPortfolioRelevance, mas abajo) --
+// computeStrategicRelevance() es COMPANY-level, nunca portfolio-level.
+// TIMELINE_URGENCY ahora es event-type-aware. ENTITY_RELEVANCE es nuevo:
+// degrada la cobertura efectiva si el ticker/nombre real de la empresa
+// no aparece en el headline (defensa contra ticker noise del proveedor).
 function computeDeterministicForEvent(eventRow, positionContext, primaryEvidenceTier) {
   const financial = computeFinancialScale(eventRow.event_type, eventRow.facts, {});
-  const strategic = computeStrategicRelevance(eventRow.facts, positionContext);
-  const timeline = computeTimelineUrgency(eventRow.facts, new Date().toISOString());
+  const strategic = computeStrategicRelevance(eventRow.facts, {
+    tema: positionContext.tema, sector: positionContext.sector, strategic_role: positionContext.strategic_role,
+  });
+  const timeline = computeTimelineUrgency(eventRow.event_type, eventRow.facts, new Date().toISOString());
   const source = computeSourceStrength(primaryEvidenceTier);
+  const entityRelevance = computeEntityRelevance(eventRow.ticker, positionContext.companyName, eventRow.facts);
   const det = computeDeterministicScore({
     FINANCIAL_SCALE: financial, STRATEGIC_RELEVANCE: strategic,
     TIMELINE_URGENCY: timeline, SOURCE_STRENGTH: source,
-  });
+  }, { entityRelevanceLevel: entityRelevance.level });
   const portfolioRelevance = classifyPortfolioRelevance({
     isActivePosition: positionContext.isActivePosition, conviction: positionContext.conviction,
   });
-  return { financial, strategic, timeline, source, det, portfolioRelevance };
+  return { financial, strategic, timeline, source, entityRelevance, det, portfolioRelevance };
 }
 
 // Prompt real para el ajuste de AI (Regla 10) -- acotado explicitamente
@@ -421,7 +440,7 @@ function computeDeterministicForEvent(eventRow, positionContext, primaryEvidence
 // instruccion de "calcular" un numero financiero -- solo interpreta lo
 // que el score deterministico ya resolvio y puede matizarlo, acotado.
 function buildAiAdjustmentPrompt(eventRow, deterministicResult) {
-  const { financial, strategic, timeline, source, det } = deterministicResult;
+  const { financial, strategic, timeline, source, entityRelevance, det } = deterministicResult;
   return [
     "Eres el modulo de ajuste de materialidad de Moni Intelligence. NUNCA calculas un score desde cero -- solo puedes proponer un AJUSTE ACOTADO entre -15 y +15 sobre un score deterministico que ya existe.",
     "",
@@ -435,6 +454,8 @@ function buildAiAdjustmentPrompt(eventRow, deterministicResult) {
     `- STRATEGIC_RELEVANCE: ${JSON.stringify(strategic)}`,
     `- TIMELINE_URGENCY: ${JSON.stringify(timeline)}`,
     `- SOURCE_STRENGTH: ${JSON.stringify(source)}`,
+    `- ENTITY_RELEVANCE: ${JSON.stringify(entityRelevance)}`,
+    `- Evidence coverage: ${det.status === "SCORED" ? Math.round(det.coverage * 100) + "%" : "N/A"}`,
     `- Score deterministico final: ${det.status === "SCORED" ? det.score : "DATA_UNAVAILABLE"}`,
     "",
     "Responde EXCLUSIVAMENTE un objeto JSON con esta forma exacta, sin texto fuera del JSON:",
@@ -444,7 +465,7 @@ function buildAiAdjustmentPrompt(eventRow, deterministicResult) {
 }
 
 async function persistScore(eventRow, deterministicResult, aiResult, evidenceRefs) {
-  const { financial, strategic, timeline, source, det, portfolioRelevance } = deterministicResult;
+  const { financial, strategic, timeline, source, entityRelevance, det, portfolioRelevance } = deterministicResult;
   const finalScore = det.status === "SCORED"
     ? computeFinalMateriality(det.score, aiResult.adjustment)
     : null;
@@ -456,8 +477,10 @@ async function persistScore(eventRow, deterministicResult, aiResult, evidenceRef
       deterministic_score: det.status === "SCORED" ? det.score : null,
       deterministic_components: {
         FINANCIAL_SCALE: financial, STRATEGIC_RELEVANCE: strategic,
-        TIMELINE_URGENCY: timeline, SOURCE_STRENGTH: source,
+        TIMELINE_URGENCY: timeline, SOURCE_STRENGTH: source, ENTITY_RELEVANCE: entityRelevance,
         weights_used: det.weights_used, components_known: det.components_known, components_total: det.components_total,
+        known_score: det.known_score, coverage: det.coverage, effective_coverage: det.effective_coverage,
+        entity_relevance_penalty_applied: det.entity_relevance_penalty_applied,
       },
       ai_status: aiResult.ai_status,
       ai_adjustment: aiResult.adjustment,
@@ -593,11 +616,15 @@ async function scoreEventIds(eventIds, shouldAiTest) {
       ai_test_attempted_for_this_event: runAi,
       deterministic_status: item.deterministicResult.det.status,
       deterministic_score: item.deterministicResult.det.status === "SCORED" ? item.deterministicResult.det.score : null,
+      known_score: item.deterministicResult.det.known_score,
+      coverage: item.deterministicResult.det.coverage,
+      effective_coverage: item.deterministicResult.det.effective_coverage,
       deterministic_components: {
         FINANCIAL_SCALE: item.deterministicResult.financial,
         STRATEGIC_RELEVANCE: item.deterministicResult.strategic,
         TIMELINE_URGENCY: item.deterministicResult.timeline,
         SOURCE_STRENGTH: item.deterministicResult.source,
+        ENTITY_RELEVANCE: item.deterministicResult.entityRelevance,
       },
       portfolio_relevance: item.deterministicResult.portfolioRelevance,
       ai_status: aiResult.ai_status,

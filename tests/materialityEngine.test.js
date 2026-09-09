@@ -20,10 +20,16 @@ test("A - 4 componentes conocidos producen un score ponderado sin renormalizar",
   assert.equal(r.components_known, 4);
   // 80*0.35 + 60*0.25 + 50*0.15 + 100*0.25 = 28+15+7.5+25 = 75.5 -> 76
   assert.equal(r.score, 76);
+  // coverage=1 (4/4 conocidos) -> el coverage adjustment (P3.1B.2) es
+  // sqrt(1)=1, CERO cambio de comportamiento con evidencia completa.
+  assert.equal(r.coverage, 1);
+  assert.equal(r.known_score, r.score);
 });
 
-// B. 1 UNKNOWN -> renormalizacion correcta
-test("B - 1 componente UNKNOWN se excluye y renormaliza, nunca cuenta como 0", () => {
+// B. 1 UNKNOWN -> renormalizacion correcta ENTRE los conocidos (known_score),
+// pero el score FINAL (P3.1B.2) ademas se amortigua por evidence coverage --
+// nunca se "expande" a la misma escala que con evidencia completa.
+test("B - 1 componente UNKNOWN se excluye y renormaliza (known_score), nunca cuenta como 0; el score final refleja coverage<1", () => {
   const components = {
     FINANCIAL_SCALE: { value: UNKNOWN },
     STRATEGIC_RELEVANCE: { value: 60 },
@@ -33,16 +39,20 @@ test("B - 1 componente UNKNOWN se excluye y renormaliza, nunca cuenta como 0", (
   const r = computeDeterministicScore(components);
   assert.equal(r.status, "SCORED");
   assert.equal(r.components_known, 3);
-  // pesos originales 0.25+0.15+0.25=0.65 -> renormalizados a 1.0
-  // score = (60*0.25 + 50*0.15 + 100*0.25) / 0.65 = (15+7.5+25)/0.65 = 73.08 -> 73
-  assert.equal(r.score, 73);
+  // pesos originales 0.25+0.15+0.25=0.65 -> renormalizados a 1.0 para known_score
+  // known_score = (60*0.25 + 50*0.15 + 100*0.25) / 0.65 = (15+7.5+25)/0.65 = 73.08 -> 73
+  assert.equal(r.known_score, 73);
+  assert.equal(r.coverage, 0.65);
+  // score final = known_score(73.0769...) * sqrt(0.65) = 58.9 -> 59 -- coverage<1 SI reduce el final
+  assert.equal(r.score, 59);
+  assert.ok(r.score < r.known_score, "coverage<1 debe amortiguar el score final respecto al known_score");
   assert.ok(!("FINANCIAL_SCALE" in r.weights_used));
   const sumWeights = Object.values(r.weights_used).reduce((a, b) => a + b, 0);
-  assert.ok(Math.abs(sumWeights - 1) < 0.01, "pesos renormalizados deben sumar ~1.0");
+  assert.ok(Math.abs(sumWeights - 1) < 0.01, "pesos renormalizados (para known_score) deben sumar ~1.0");
 });
 
-// C. varios UNKNOWN -> renormalizacion correcta
-test("C - 2 componentes UNKNOWN se excluyen ambos, renormaliza entre los 2 restantes", () => {
+// C. varios UNKNOWN -> renormalizacion correcta entre los conocidos, coverage aun mas bajo
+test("C - 2 componentes UNKNOWN: known_score renormaliza entre los 2 restantes, coverage=0.40 amortigua mas el score final", () => {
   const components = {
     FINANCIAL_SCALE: { value: UNKNOWN },
     STRATEGIC_RELEVANCE: { value: UNKNOWN },
@@ -53,8 +63,11 @@ test("C - 2 componentes UNKNOWN se excluyen ambos, renormaliza entre los 2 resta
   assert.equal(r.status, "SCORED");
   assert.equal(r.components_known, 2);
   // pesos 0.15+0.25=0.40 renormalizados: TIMELINE=0.375, SOURCE=0.625
-  // score = 50*0.375 + 100*0.625 = 18.75+62.5 = 81.25 -> 81
-  assert.equal(r.score, 81);
+  // known_score = 50*0.375 + 100*0.625 = 18.75+62.5 = 81.25 -> 81
+  assert.equal(r.known_score, 81);
+  assert.equal(r.coverage, 0.4);
+  // score final = 81.25 * sqrt(0.4) = 51.39 -> 51
+  assert.equal(r.score, 51);
 });
 
 // D. todos UNKNOWN -> DATA_UNAVAILABLE, no 0
@@ -102,41 +115,85 @@ test("STRATEGIC_RELEVANCE: sin ningun contexto de posicion -> UNKNOWN", () => {
   assert.equal(r.value, UNKNOWN);
 });
 
-test("STRATEGIC_RELEVANCE: posicion activa + tema clasificado + overlap de keyword en headline suma los 3 puntos deterministicos", () => {
+test("STRATEGIC_RELEVANCE: tema clasificado + overlap real de tag canonico en headline suma classified_as + overlap (P3.1B.2: sin active_position)", () => {
   const r = computeStrategicRelevance(
     { headline_raw: "Qualcomm anuncia expansion en Semiconductores IA" },
-    { isActivePosition: true, tema: "Semiconductores IA", sector: "Semiconductores" }
+    { tema: "Semiconductores IA", sector: "Semiconductores" }
   );
-  assert.ok(r.value >= 40, "deberia sumar al menos active_position + classified_as");
-  assert.ok(r.evidence.includes("active_position"));
+  assert.equal(r.value, 100, "classified_as(40) + canonical_tag_overlap(60) = 100");
+  assert.ok(r.evidence.some((e) => e.startsWith("classified_as")));
+  assert.ok(r.evidence.some((e) => e.startsWith("canonical_tag_overlap")));
+});
+
+test("I - STRATEGIC_RELEVANCE (company materiality) NO cambia por isActivePosition/conviction -- esos campos, si vienen en el contexto, se ignoran por completo (fix de contaminacion P3.1B.2)", () => {
+  const withoutOwnership = computeStrategicRelevance(
+    { headline_raw: "titular neutro" },
+    { tema: "Semiconductores IA" }
+  );
+  const withOwnershipFlagsIgnored = computeStrategicRelevance(
+    { headline_raw: "titular neutro" },
+    { tema: "Semiconductores IA", isActivePosition: true, conviction: 5 }
+  );
+  assert.deepEqual(withoutOwnership, withOwnershipFlagsIgnored);
 });
 
 test("STRATEGIC_RELEVANCE: nunca inventa relevancia -- headline sin overlap real de keyword no suma ese punto", () => {
   const withOverlap = computeStrategicRelevance(
     { headline_raw: "algo sobre semiconductores hoy" },
-    { isActivePosition: true, tema: "Semiconductores IA" }
+    { tema: "Semiconductores IA" }
   );
   const withoutOverlap = computeStrategicRelevance(
     { headline_raw: "un titular totalmente ajeno sin relacion" },
-    { isActivePosition: true, tema: "Semiconductores IA" }
+    { tema: "Semiconductores IA" }
   );
   assert.ok(withOverlap.value > withoutOverlap.value);
 });
 
-// TIMELINE_URGENCY vs freshness -- N
+// TIMELINE_URGENCY vs freshness -- N (P3.1B.2: firma ahora es
+// (eventType, facts, now) -- ver Regla 5/6 del sprint de calibracion)
 test("N - TIMELINE_URGENCY es distinto de freshness: sin fecha relevante en facts -> UNKNOWN, NUNCA 'publicado hoy = 100'", () => {
-  const r = computeTimelineUrgency({ headline_raw: "publicado justo ahora" }, NOW);
+  const r = computeTimelineUrgency("MAJOR_CONTRACT", { headline_raw: "publicado justo ahora" }, NOW);
   assert.equal(r.value, UNKNOWN);
 });
 
-test("TIMELINE_URGENCY: fecha efectiva real dentro de 30 dias produce urgencia alta", () => {
-  const r = computeTimelineUrgency({ effective_date: "2026-09-20" }, NOW);
-  assert.equal(r.value, 80);
+test("TIMELINE_URGENCY (deadline proximity): fecha efectiva real dentro de 30 dias produce urgencia alta", () => {
+  const r = computeTimelineUrgency("MAJOR_CONTRACT", { effective_date: "2026-09-20" }, NOW);
+  assert.equal(r.method, "deadline_proximity");
+  assert.equal(r.value, 75);
 });
 
-test("TIMELINE_URGENCY: fecha efectiva lejana (mas de 180 dias) produce urgencia baja", () => {
-  const r = computeTimelineUrgency({ effective_date: "2027-12-01" }, NOW);
+test("TIMELINE_URGENCY (deadline proximity): fecha efectiva lejana (mas de 180 dias) produce urgencia baja", () => {
+  const r = computeTimelineUrgency("MAJOR_CONTRACT", { effective_date: "2027-12-01" }, NOW);
   assert.equal(r.value, 20);
+  assert.equal(r.bucket, "DISTANT_FUTURE");
+});
+
+// P3.1B.2 -- Regla 7 del sprint de calibracion: bug real corregido
+// (P3.1B.1). Antes, CUALQUIER fecha ya pasada devolvia urgencia=100,
+// sin importar hace cuanto -- un earnings de ayer y uno de hace 250
+// dias puntuaban identico. Ahora, para EARNINGS/GUIDANCE (disclosure
+// decay), la urgencia decae con los dias transcurridos.
+test("F - TIMELINE_URGENCY (disclosure decay): EARNINGS de hace 250 dias produce urgencia BAJA, no 100", () => {
+  const r = computeTimelineUrgency("EARNINGS", { earnings_date: "2025-12-31" }, "2026-09-08T00:00:00Z");
+  assert.equal(r.method, "disclosure_decay");
+  assert.equal(r.bucket, "STALE_DISCLOSURE");
+  assert.ok(r.value <= 20, `earnings de hace ~250 dias deberia ser urgencia baja, obtuvo ${r.value}`);
+  assert.notEqual(r.value, 100, "bug real corregido: ya NO es 100 solo por haber ocurrido");
+});
+
+test("G - TIMELINE_URGENCY (disclosure decay): EARNINGS recien publicado (hace 2 dias) produce urgencia ALTA", () => {
+  const r = computeTimelineUrgency("EARNINGS", { earnings_date: "2026-09-07" }, "2026-09-09T00:00:00Z");
+  assert.equal(r.bucket, "RECENT_DISCLOSURE");
+  assert.ok(r.value >= 80, `earnings de hace 2 dias deberia ser urgencia alta, obtuvo ${r.value}`);
+});
+
+test("H - freshness (discovered_at reciente) y urgency (deadline lejano) son ejes independientes -- un evento fresco sobre un contrato a 18 meses tiene freshness ALTA pero urgency BAJA/MEDIA", () => {
+  const urgency = computeTimelineUrgency("MAJOR_CONTRACT", { effective_date: "2028-03-09" }, "2026-09-09T00:00:00Z");
+  assert.ok(urgency.value <= 45, `contrato a 18 meses deberia tener urgencia baja/media, obtuvo ${urgency.value}`);
+  // freshness es un eje SEPARADO (lib/materialEventTemporal.js, sobre
+  // discovered_at/published_at) -- esta funcion nunca lo calcula ni lo
+  // necesita; confirmar que ambos conceptos viven en modulos distintos
+  // es en si mismo la prueba de que no se mezclan.
 });
 
 // O. Tier 1 promotion mejora source confidence (via SOURCE_STRENGTH, mismo tierScore)
