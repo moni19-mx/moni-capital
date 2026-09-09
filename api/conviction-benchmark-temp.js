@@ -379,7 +379,20 @@ export const config = { maxDuration: 60 };
 export default async function handler(req, res) {
   const { pin, migrate_tickers, score_tickers, ai_test, max_events, opportunities } = req.query || {};
   if (!pin || pin !== process.env.MONI_PIN) {
-    return res.status(401).json({ error: "invalid_pin" });
+    // DIAGNOSTICO TEMPORAL (autorizado explicitamente) -- troubleshooting
+    // de un invalid_pin persistente contra multiples valores probados.
+    // Nunca expone el PIN real ni el enviado, solo metadata no sensible
+    // (definido/longitud) para distinguir "el env var no llega a la
+    // funcion" de "el valor guardado difiere del que se escribe en la
+    // URL". Revertir una vez resuelto -- no es parte del contrato normal.
+    return res.status(401).json({
+      error: "invalid_pin",
+      diagnostic: {
+        env_pin_defined: typeof process.env.MONI_PIN === "string",
+        env_pin_length: typeof process.env.MONI_PIN === "string" ? process.env.MONI_PIN.length : null,
+        submitted_pin_length: typeof pin === "string" ? pin.length : 0,
+      },
+    });
   }
 
   if (opportunities === "true") {
