@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   normalizeFmpEarnings, normalizeFmpPriceTarget, normalizeNewsArticle, normalizeSecFiling,
-  normalizeFinnhubNews, classifyByKeywords, EVENT_TYPE, CLASSIFICATION_METHOD,
+  normalizeFinnhubNews, normalizeFinnhubEarnings, classifyByKeywords, EVENT_TYPE, CLASSIFICATION_METHOD,
 } from "../lib/materialEventNormalize.js";
 
 // A. source válido → event normalizado
@@ -119,6 +119,33 @@ test("Finnhub: clasificacion por keywords funciona igual que para FMP (misma fun
   const r = normalizeFinnhubNews({ headline: "Qualcomm announces partnership with Amazon for AI data centers", datetime: 1735689600 }, { asset_id: 29, ticker: "QCOM" });
   assert.equal(r.event_type, EVENT_TYPE.MAJOR_CONTRACT);
   assert.equal(r.classification_method, CLASSIFICATION_METHOD.RULE_BASED_KEYWORD);
+});
+
+// P3.1B.1 -- Finnhub /stock/earnings (estructurado, EARNINGS real via
+// endpoint dedicado, no FMP que ya se confirmo PLAN_BLOCKED en P3.1A.1).
+test("Finnhub earnings valido se normaliza con event_type EARNINGS, classification_method structured_field, eps real", () => {
+  const raw = { symbol: "QCOM", period: "2026-06-30", year: 2026, quarter: 3, actual: 2.62, estimate: 2.51, surprise: 0.11, surprisePercent: 4.38 };
+  const r = normalizeFinnhubEarnings(raw, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.event_type, EVENT_TYPE.EARNINGS);
+  assert.equal(r.classification_method, CLASSIFICATION_METHOD.STRUCTURED_FIELD);
+  assert.equal(r.facts.eps_actual, 2.62);
+  assert.equal(r.facts.eps_estimated, 2.51);
+  assert.equal(r.facts.earnings_date, "2026-06-30");
+  assert.equal(r.occurred_at, "2026-06-30");
+});
+
+test("Finnhub earnings: revenue_actual/estimated SIEMPRE UNKNOWN (el endpoint no los trae) -- nunca inventados", () => {
+  const raw = { symbol: "QCOM", period: "2026-06-30", year: 2026, quarter: 3, actual: 2.62, estimate: 2.51 };
+  const r = normalizeFinnhubEarnings(raw, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.facts.revenue_actual, "UNKNOWN");
+  assert.equal(r.facts.revenue_estimated, "UNKNOWN");
+});
+
+test("Finnhub earnings: actual/estimate ausentes o no numericos -> UNKNOWN, nunca 0 ni null silencioso", () => {
+  const raw = { symbol: "QCOM", period: "2026-06-30", year: 2026, quarter: 3, actual: null, estimate: null };
+  const r = normalizeFinnhubEarnings(raw, { asset_id: 29, ticker: "QCOM" });
+  assert.equal(r.facts.eps_actual, "UNKNOWN");
+  assert.equal(r.facts.eps_estimated, "UNKNOWN");
 });
 
 test("todos los 13 tipos de la taxonomia aprobada existen y ninguno adicional se coló", () => {
