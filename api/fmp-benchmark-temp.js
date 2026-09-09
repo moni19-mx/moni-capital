@@ -31,6 +31,10 @@ import {
 import { getStockData, getCryptoData, COINGECKO_FALLBACK_IDS } from "../lib/prices.js";
 import { mapWithConcurrency } from "../lib/aiPriceCache.js";
 import { valuateAccountEquity, selectLatestConfirmedSnapshot } from "../lib/reconciliationEngine.js";
+// Micro-sprint P0.3 (Market Price Cache + Provider Resilience) --
+// misma politica cache-first + circuit breaker que la app real.
+import { createRateLimitBreaker } from "../lib/priceCache.js";
+import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -176,25 +180,57 @@ const CONFLICT_THRESHOLDS = { price: 2, marketCap: 15, pe: 15 };
 const MARKET_DATA_CONCURRENCY = 6; // misma politica que api/market-data.js
 const STALE_SNAPSHOT_MS = 24 * 60 * 60 * 1000; // mismo umbral que api/futures-equity.js
 
+// Micro-sprint P0.3: MISMA politica cache-first + circuit breaker que
+// api/market-data.js real (via lib/marketDataOrchestrator.js) -- para
+// que este endpoint de reconciliacion demuestre fielmente el ahorro
+// real de llamadas, no una version distinta que siempre pide todo en
+// vivo.
 async function computeMarketDataDirect(items) {
   const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+  const now = new Date();
+  const tickers = [...new Set(items.map((i) => i.ticker))];
+  const { data: cachedRows } = await supabase
+    .from("market_cache")
+    .select("ticker, ai_price, ai_change_pct, ai_price_updated_at, high, low, market_cap, pe_ratio")
+    .in("ticker", tickers);
+  const cacheByTicker = {};
+  (cachedRows || []).forEach((r) => { cacheByTicker[r.ticker] = r; });
+
   const data = {};
   const errors = [];
+  const results = [];
+  const breaker = createRateLimitBreaker();
+
   await mapWithConcurrency(items, MARKET_DATA_CONCURRENCY, async (item) => {
     const ticker = item.ticker;
-    try {
-      if (item.type === "stock") {
-        data[ticker] = await getStockData(supabase, ticker, FINNHUB_KEY);
-      } else if (item.type === "crypto") {
+    const cachedRow = cacheByTicker[ticker] || null;
+    const fetchLive = async () => {
+      if (item.type === "stock") return getStockData(supabase, ticker, FINNHUB_KEY);
+      if (item.type === "crypto") {
         const id = item.coingeckoId || COINGECKO_FALLBACK_IDS[ticker];
         if (!id) throw new Error("no_coingecko_id");
-        data[ticker] = await getCryptoData(supabase, ticker, id);
+        return getCryptoData(supabase, ticker, id);
       }
-    } catch (e) {
-      errors.push(ticker);
+      throw new Error("unknown_asset_type");
+    };
+    const result = await resolveTickerPrice({ item, cachedRow, now, breaker, fetchLive });
+    results.push({ ticker, ...result });
+    if (result.status === "LIVE") {
+      supabase.from("market_cache").upsert(
+        [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
+        { onConflict: "ticker" }
+      ).then(() => {}, () => {});
     }
+    if (result.status === "DATA_UNAVAILABLE") { errors.push(ticker); return; }
+    data[ticker] = {
+      price: result.price, changePct: result.changePct, high: result.high, low: result.low,
+      marketCap: result.marketCap, peRatio: result.peRatio,
+      price_status: result.status, price_source: result.source, price_fetched_at: result.fetchedAt,
+    };
   });
-  return { data, errors };
+
+  const providerHealth = summarizeProviderHealth(results, breaker);
+  return { data, errors, provider_health: providerHealth, per_ticker: results };
 }
 
 async function computeFuturesEquityDirect() {
@@ -311,12 +347,26 @@ async function runReconciliation(req, res) {
       ticker: p.ticker,
       shares: Number(p.shares),
       price_used: p.market?.price ?? null,
-      price_status: p.value == null ? "MISSING" : (marketErrors.includes(p.ticker) ? "LAST_KNOWN_GOOD" : "LIVE"),
+      price_status: p.value == null ? "MISSING" : (p.market?.price_status || "LIVE"),
+      price_source: p.market?.price_source ?? null,
+      price_fetched_at: p.market?.price_fetched_at ?? null,
       market_value: p.value,
     }))
     .sort((a, b) => (b.market_value ?? -1) - (a.market_value ?? -1));
 
   const missingStocks = enriched.filter((p) => p.type === "stock" && p.value == null).map((p) => p.ticker);
+
+  // Micro-sprint P0.3: evidencia real de cache-hit-ratio/llamadas vivas
+  // ahorradas -- ver items 8/9 del reporte final.
+  const perTicker = marketR.ok ? (marketR.json.per_ticker || []) : [];
+  const priceCacheStats = {
+    live_calls: perTicker.filter((r) => r.status === "LIVE").length,
+    cache_hits: perTicker.filter((r) => r.status === "CACHED").length,
+    stale_served: perTicker.filter((r) => r.status === "STALE" || r.status === "STALE_RATE_LIMITED").length,
+    data_unavailable: perTicker.filter((r) => r.status === "DATA_UNAVAILABLE").length,
+    total_requested: perTicker.length,
+    provider_health: marketR.ok ? (marketR.json.provider_health || null) : null,
+  };
 
   return res.status(200).json({
     ok: true,
@@ -331,6 +381,7 @@ async function runReconciliation(req, res) {
       critical_financial_refresh_duration_ms: criticalFetchDurationMs,
       note: "time_to_first_valid_financial_view / time_to_coherent_refresh son metricas de percepcion del navegador -- no medibles desde un endpoint stateless server-side; estas son las duraciones reales del lado servidor que las determinan.",
     },
+    price_cache_stats: priceCacheStats,
     stocks_value: Math.round(stocksValue * 100) / 100,
     crypto_value: Math.round(cryptoValue * 100) / 100,
     cash_value: Math.round(cashValue * 100) / 100,
