@@ -33,7 +33,7 @@ import { mapWithConcurrency } from "../lib/aiPriceCache.js";
 import { valuateAccountEquity, selectLatestConfirmedSnapshot } from "../lib/reconciliationEngine.js";
 // Micro-sprint P0.3 (Market Price Cache + Provider Resilience) --
 // misma politica cache-first + circuit breaker que la app real.
-import { createRateLimitBreaker } from "../lib/priceCache.js";
+import { createRateLimitBreaker, buildCacheWriteRow } from "../lib/priceCache.js";
 import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
@@ -214,18 +214,24 @@ async function computeMarketDataDirect(items) {
       throw new Error("unknown_asset_type");
     };
     const result = await resolveTickerPrice({ item, cachedRow, now, breaker, fetchLive });
-    results.push({ ticker, ...result });
     if (result.status === "LIVE") {
-      // Bugfix real de P0.3 (ver api/market-data.js): await obligatorio,
-      // un upsert fire-and-forget puede quedar cortado a medias si
-      // Vercel congela el entorno apenas el handler responde.
-      try {
-        await supabase.from("market_cache").upsert(
-          [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
-          { onConflict: "ticker" }
-        );
-      } catch (e) { /* el cache nunca debe tumbar la respuesta principal */ }
+      // 2 bugfixes reales de P0.3 (ver api/market-data.js para el
+      // detalle completo): (1) await obligatorio -- fire-and-forget
+      // puede quedar cortado a medias en un handler serverless; (2)
+      // `type` es NOT NULL en market_cache y Postgres lo exige incluso
+      // en la fila candidata de un ON CONFLICT DO UPDATE, aunque el
+      // UPDATE nunca lo toque -- confirmado con SQL directo, fallaba
+      // SIEMPRE sin este campo.
+      const { error: cacheWriteError } = await supabase.from("market_cache").upsert(
+        [buildCacheWriteRow(ticker, item.type, result)],
+        { onConflict: "ticker" }
+      );
+      if (cacheWriteError) result.cacheWriteFailed = true;
     }
+    // El push va DESPUES del bloque de arriba a proposito -- results[]
+    // debe reflejar cacheWriteFailed si aplico (un push antes, con
+    // spread, congela una copia y pierde la mutacion posterior).
+    results.push({ ticker, ...result });
     if (result.status === "DATA_UNAVAILABLE") { errors.push(ticker); return; }
     data[ticker] = {
       price: result.price, changePct: result.changePct, high: result.high, low: result.low,
@@ -371,6 +377,7 @@ async function runReconciliation(req, res) {
     data_unavailable: perTicker.filter((r) => r.status === "DATA_UNAVAILABLE").length,
     total_requested: perTicker.length,
     provider_health: marketR.ok ? (marketR.json.provider_health || null) : null,
+    cache_write_failures: perTicker.filter((r) => r.cacheWriteFailed).length,
   };
 
   return res.status(200).json({

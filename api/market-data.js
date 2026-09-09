@@ -14,7 +14,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { getStockData, getCryptoData, COINGECKO_FALLBACK_IDS } from "../lib/prices.js";
 import { mapWithConcurrency } from "../lib/aiPriceCache.js";
-import { createRateLimitBreaker } from "../lib/priceCache.js";
+import { createRateLimitBreaker, buildCacheWriteRow } from "../lib/priceCache.js";
 import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
@@ -77,24 +77,34 @@ export default async function handler(req, res) {
       results.push(result);
 
       if (result.status === "LIVE") {
-        // Bugfix real de P0.3 (encontrado en la corrida en vivo): un
+        // Bugfix real #1 de P0.3 (encontrado en la corrida en vivo): un
         // upsert fire-and-forget (sin await) puede quedar cortado a
         // medias -- Vercel puede congelar/terminar el entorno de
         // ejecucion en cuanto el handler manda la respuesta y retorna,
-        // ANTES de que la promesa suelta termine de escribir. Se
-        // confirmo en produccion: 38 precios "LIVE" en una corrida, 0
-        // cache_hits en la siguiente (el cache nunca habia llegado a
-        // Supabase). Ahora se espera (await) DENTRO del worker de cada
-        // ticker -- mapWithConcurrency ya espera a que todos los
-        // workers terminen antes de que el handler responda, asi que
-        // esto SI garantiza que el cache quede escrito. Un fallo de
-        // escritura sigue sin tumbar la respuesta (try/catch propio).
-        try {
-          await supabase.from("market_cache").upsert(
-            [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
-            { onConflict: "ticker" }
-          );
-        } catch (e) { /* el cache nunca debe tumbar la respuesta principal */ }
+        // ANTES de que la promesa suelta termine de escribir. Ahora se
+        // espera (await) DENTRO del worker de cada ticker --
+        // mapWithConcurrency ya espera a que todos los workers terminen
+        // antes de que el handler responda, asi que esto SI garantiza
+        // que el cache quede escrito (si no falla por otra razon).
+        //
+        // Bugfix real #2 de P0.3 (encontrado DESPUES del fix #1, con
+        // una prueba SQL directa): `type` es NOT NULL en market_cache y
+        // no tenia default. Postgres valida las columnas NOT NULL de la
+        // fila candidata de un INSERT ANTES de siquiera evaluar el
+        // ON CONFLICT DO UPDATE -- asi que el upsert fallaba SIEMPRE
+        // (fila nueva o existente, da igual) por no incluir `type`,
+        // aunque el UPDATE en si nunca lo hubiera tocado. Confirmado
+        // con SQL directo: el mismo upsert sin `type` falla incluso
+        // sobre una fila YA EXISTENTE con `type='stock'`. Supabase-js
+        // tampoco lanza (`.upsert()` resuelve `{data,error}`, nunca
+        // rechaza por un error de base de datos) -- por eso el
+        // try/catch nunca lo detectaba; ahora se revisa `error`
+        // explicitamente.
+        const { error: cacheWriteError } = await supabase.from("market_cache").upsert(
+          [buildCacheWriteRow(ticker, item.type, result)],
+          { onConflict: "ticker" }
+        );
+        if (cacheWriteError) result.cacheWriteFailed = true; // el cache nunca debe tumbar la respuesta principal, pero se registra para provider_health
       }
 
       if (result.status === "DATA_UNAVAILABLE") {

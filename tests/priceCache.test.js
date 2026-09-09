@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import {
   MARKET_OPEN_TTL_MS, MARKET_CLOSED_TTL_MS, CRYPTO_TTL_MS,
   isLikelyMarketOpen, computeTtlMs, isCacheFresh, classifyPriceStatus,
-  createRateLimitBreaker, tripBreaker, isBreakerTripped,
+  createRateLimitBreaker, tripBreaker, isBreakerTripped, buildCacheWriteRow,
 } from "../lib/priceCache.js";
 import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
 import { ProviderRateLimitError, ProviderAuthError } from "../lib/prices.js";
@@ -246,6 +246,33 @@ test("M - PWA cache policy: /api/market-data sigue siendo network-only (sin camb
 // para cuando mapWithConcurrency() resuelve, TODAS las escrituras ya
 // se aplicaron -- nunca se puede "responder antes de escribir".
 import { mapWithConcurrency } from "../lib/aiPriceCache.js";
+
+// ================== REGRESION real #2: `type` NOT NULL en el upsert de cache ==================
+// Bug real encontrado con una prueba SQL directa contra Supabase en
+// produccion (2026-09-09): market_cache.type es NOT NULL sin default.
+// Un upsert (INSERT ... ON CONFLICT DO UPDATE) que omite `type` falla
+// SIEMPRE con "null value in column type violates not-null constraint"
+// -- Postgres valida las columnas NOT NULL de la fila candidata del
+// INSERT antes de evaluar el conflicto, AUNQUE la fila ya exista con
+// `type` poblado y el UPDATE resultante nunca la fuera a tocar.
+// Confirmado en vivo: el mismo upsert sin `type` fallaba incluso sobre
+// MSFT (ya tenia type='stock'). buildCacheWriteRow() es ahora el UNICO
+// lugar que arma este payload -- este test fija que SIEMPRE incluya
+// `type`, para que el bug no pueda reaparecer si otro call site
+// construye el upsert a mano.
+test("REGRESION - buildCacheWriteRow SIEMPRE incluye `type` (el campo NOT NULL real que causaba el fallo silencioso)", () => {
+  const row = buildCacheWriteRow("MSFT", "stock", { price: 492.19, changePct: 0.5, fetchedAt: "2026-09-09T16:00:00Z" });
+  assert.equal(row.ticker, "MSFT");
+  assert.equal(row.type, "stock", "REGRESION: sin `type` el upsert real falla con 23502 not-null violation, confirmado con SQL directo");
+  assert.equal(row.ai_price, 492.19);
+  assert.equal(row.ai_change_pct, 0.5);
+  assert.equal(row.ai_price_updated_at, "2026-09-09T16:00:00Z");
+});
+
+test("REGRESION - buildCacheWriteRow funciona igual para crypto (type='crypto')", () => {
+  const row = buildCacheWriteRow("BTC", "crypto", { price: 60000, changePct: 1.2, fetchedAt: "2026-09-09T16:00:00Z" });
+  assert.equal(row.type, "crypto");
+});
 
 test("REGRESION - un write awaiteado DENTRO del worker esta garantizado completo cuando mapWithConcurrency() resuelve (el patron correcto, ya no fire-and-forget)", async () => {
   const store = {};
