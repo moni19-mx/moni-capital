@@ -1,50 +1,19 @@
 // public/sw.js
-// Sprint P4.2 (PWA Foundation). Service worker minimo, escrito a mano
-// (sin vite-plugin-pwa/Workbox) para que TODA la logica de que se
-// cachea y que no quepa en un solo archivo auditable, en vez de
-// depender de la configuracion implicita de runtime caching de una
-// libreria. Justificacion: el requisito no-negociable de este sprint es
-// "REAL FINANCIAL DATA > CONVENIENCE" -- ningun endpoint dinamico
-// (Supabase REST, /api/*) puede quedar cacheado nunca. Auditar "el
-// service worker nunca toca /api/ ni /rest/v1/" es mas simple sobre un
-// archivo propio de ~80 lineas que sobre una config de Workbox con
-// estrategias de runtime caching generadas.
-//
-// Las 4 estrategias de abajo replican exactamente la logica pura y
-// probada de lib/pwaCacheStrategy.js (ver tests/pwaCacheStrategy.test.js)
-// -- un service worker no puede importar ese modulo directamente sin
-// convertir el registro a type:"module" con menos soporte de navegador,
-// asi que la logica se duplica aqui a proposito, en la forma mas
-// literal posible, para que un diff entre ambos archivos sea trivial de
-// revisar.
+// Sprint P4.2 (PWA Foundation), actualizado en Sprint P4.2.1 (Cache
+// Policy Parity). Service worker minimo, escrito a mano (sin
+// vite-plugin-pwa/Workbox). La politica de que se cachea y que no --
+// antes duplicada aqui a mano -- ahora vive en un unico lugar:
+// public/pwa-cache-policy.js, cargado con importScripts() (la forma
+// nativa de un service worker CLASICO de compartir codigo, soportada en
+// todos los navegadores -- se evita to type:"module" a proposito, sin
+// soporte confiable en iOS Safari). Este archivo nunca vuelve a decidir
+// por si mismo si una ruta es cacheable: solo ejecuta la estrategia que
+// resolveCacheStrategy() ya decidio.
+
+importScripts("/pwa-cache-policy.js");
 
 const CACHE_VERSION = "moni-capital-shell-v1";
 
-const NEVER_CACHE_PREFIXES = ["/api/", "/rest/v1/", "/auth/v1/"];
-
-function isNeverCachePath(pathname) {
-  return NEVER_CACHE_PREFIXES.some((p) => pathname.startsWith(p));
-}
-function isAppShellPath(pathname) {
-  return pathname === "/" || pathname === "/index.html";
-}
-function isImmutableBuildAsset(pathname) {
-  return pathname.startsWith("/assets/");
-}
-function isStaticShellAsset(pathname) {
-  return (
-    pathname.startsWith("/icons/") ||
-    pathname === "/manifest.webmanifest" ||
-    pathname === "/favicon.ico"
-  );
-}
-
-// No self.skipWaiting() automatico en install: un SW nuevo se queda
-// "waiting" hasta que la app, con el usuario ya avisado por el banner
-// "Hay una nueva version" (ver src/App.jsx), mande el postMessage
-// SKIP_WAITING de abajo. Evita reemplazar el SW activo (y su version de
-// JS/CSS) mientras el usuario esta a mitad de un flujo como Smart
-// Import.
 self.addEventListener("install", () => {
   // Intencionalmente vacio: nada que precachear en install. El app
   // shell (index.html + /assets/*) se cachea de forma perezosa la
@@ -68,29 +37,17 @@ self.addEventListener("message", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  if (req.method !== "GET") return; // POST/PUT/DELETE (todas las escrituras) nunca pasan por el SW
+  if (req.method !== "GET") return; // POST/PUT/PATCH/DELETE (todas las escrituras) nunca pasan por el SW
 
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return; // nunca intercepta terceros (Binance, FMP, etc.)
+  if (url.origin !== self.location.origin) return; // nunca intercepta terceros (Supabase, Binance, FMP, Google Fonts, etc.)
 
-  const pathname = url.pathname;
+  const strategy = self.MoniPwaPolicy.resolveCacheStrategy(url.pathname, { mode: req.mode });
 
-  // Financiero/dinamico: dejar pasar tal cual, jamas tocar Cache API.
-  if (isNeverCachePath(pathname)) return;
-
-  if (isAppShellPath(pathname)) {
-    event.respondWith(networkFirst(req));
-    return;
-  }
-  if (isImmutableBuildAsset(pathname)) {
-    event.respondWith(cacheFirst(req));
-    return;
-  }
-  if (isStaticShellAsset(pathname)) {
-    event.respondWith(staleWhileRevalidate(req));
-    return;
-  }
-  // Default seguro: cualquier ruta no reconocida no se cachea.
+  if (strategy === "network-only") return; // financiero/desconocido: dejar pasar tal cual, jamas tocar Cache API
+  if (strategy === "network-first") { event.respondWith(networkFirst(req)); return; }
+  if (strategy === "cache-first") { event.respondWith(cacheFirst(req)); return; }
+  if (strategy === "stale-while-revalidate") { event.respondWith(staleWhileRevalidate(req)); return; }
 });
 
 async function networkFirst(req) {
