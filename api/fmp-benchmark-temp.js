@@ -33,8 +33,8 @@ import { mapWithConcurrency } from "../lib/aiPriceCache.js";
 import { valuateAccountEquity, selectLatestConfirmedSnapshot } from "../lib/reconciliationEngine.js";
 // Micro-sprint P0.3 (Market Price Cache + Provider Resilience) --
 // misma politica cache-first + circuit breaker que la app real.
-import { createRateLimitBreaker, buildCacheWriteRow } from "../lib/priceCache.js";
-import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
+import { createRateLimitBreaker, buildCacheWriteRow, computeTtlMs, MAX_STALE_AGE_MS, isBreakerTripped } from "../lib/priceCache.js";
+import { resolveTickerPrice, summarizeProviderHealthDetailed } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -199,11 +199,17 @@ async function computeMarketDataDirect(items) {
   const data = {};
   const errors = [];
   const results = [];
-  const breaker = createRateLimitBreaker();
+  // Price Truth POST-review: breakers independientes por proveedor --
+  // este endpoint debe reflejar EXACTAMENTE el mismo fix que
+  // api/market-data.js (ver ese archivo para el detalle del bug real:
+  // un breaker compartido dejaba que un 429 de CoinGecko cortara
+  // tambien los tickers de Finnhub del mismo batch).
+  const breakers = { finnhub: createRateLimitBreaker(), coingecko: createRateLimitBreaker() };
 
   await mapWithConcurrency(items, MARKET_DATA_CONCURRENCY, async (item) => {
     const ticker = item.ticker;
     const cachedRow = cacheByTicker[ticker] || null;
+    const providerBreaker = item.type === "crypto" ? breakers.coingecko : breakers.finnhub;
     const fetchLive = async () => {
       if (item.type === "stock") return getStockData(supabase, ticker, FINNHUB_KEY);
       if (item.type === "crypto") {
@@ -213,7 +219,8 @@ async function computeMarketDataDirect(items) {
       }
       throw new Error("unknown_asset_type");
     };
-    const result = await resolveTickerPrice({ item, cachedRow, now, breaker, fetchLive });
+    const result = await resolveTickerPrice({ item, cachedRow, now, breaker: providerBreaker, fetchLive });
+    result.provider = item.type === "crypto" ? "coingecko" : "finnhub";
     if (result.status === "LIVE") {
       // 2 bugfixes reales de P0.3 (ver api/market-data.js para el
       // detalle completo): (1) await obligatorio -- fire-and-forget
@@ -231,7 +238,31 @@ async function computeMarketDataDirect(items) {
     // El push va DESPUES del bloque de arriba a proposito -- results[]
     // debe reflejar cacheWriteFailed si aplico (un push antes, con
     // spread, congela una copia y pierde la mutacion posterior).
-    results.push({ ticker, ...result });
+    //
+    // Price Truth POST-review: trace completo por ticker (pedido
+    // explicito del usuario para poder diagnosticar casos como
+    // ETH/LINK/SOL/USDT sin adivinar) -- cached_row_found/cached_price/
+    // cached_age_seconds/normal_ttl_ms/max_stale_age_ms se calculan aqui
+    // con los MISMOS valores que resolveTickerPrice ya uso (nunca se
+    // reimplementa la decision, solo se expone la evidencia).
+    const ttlMsForTrace = computeTtlMs(item.type, now, item.priority || "position");
+    results.push({
+      ticker, ...result,
+      trace: {
+        provider: result.provider,
+        cached_row_found: !!cachedRow,
+        cached_price: cachedRow?.ai_price ?? null,
+        cached_age_seconds: cachedRow?.ai_price_updated_at ? Math.round((now.getTime() - new Date(cachedRow.ai_price_updated_at).getTime()) / 1000) : null,
+        normal_ttl_ms: ttlMsForTrace,
+        max_stale_age_ms: MAX_STALE_AGE_MS,
+        breaker_tripped_after_this_ticker: isBreakerTripped(providerBreaker),
+        live_attempted: result.live_attempted ?? null,
+        live_error: result.live_error ?? null,
+        final_price: result.price ?? null,
+        final_price_status: result.status,
+        final_reason: result.reason ?? null,
+      },
+    });
     if (result.status === "DATA_UNAVAILABLE") { errors.push(ticker); return; }
     data[ticker] = {
       price: result.price, changePct: result.changePct, high: result.high, low: result.low,
@@ -240,8 +271,12 @@ async function computeMarketDataDirect(items) {
     };
   });
 
-  const providerHealth = summarizeProviderHealth(results, breaker);
-  return { data, errors, provider_health: providerHealth, per_ticker: results };
+  const providerHealthDetailed = summarizeProviderHealthDetailed(results, breakers);
+  return {
+    data, errors, provider_health: providerHealthDetailed.aggregate,
+    finnhub_status: providerHealthDetailed.finnhub_status, coingecko_status: providerHealthDetailed.coingecko_status,
+    per_ticker: results,
+  };
 }
 
 async function computeFuturesEquityDirect() {
@@ -414,10 +449,67 @@ async function runReconciliation(req, res) {
   });
 }
 
+// Price Truth POST-review, item "WARM-UP": modo READ-ONLY, CERO llamada
+// a Finnhub/CoinGecko -- solo reporta, por ticker, el estado actual de
+// cache y que accion haria un warm-up real. Pedido explicitamente por
+// el usuario ANTES de ejecutar nada en vivo ("dry-run primero").
+// Universo: el mismo que usa el dashboard real (positions+watchlist,
+// via buildMarketDataItems) MAS los assets que Futures necesita y que
+// buildMarketDataItems nunca incluye (USDT hoy) -- se reportan por
+// separado para no mezclar los dos universos (item explicito del
+// usuario).
+async function runWarmupDryRun(req, res) {
+  const [{ data: positions }, { data: watchlist }] = await Promise.all([
+    supabase.from("positions").select("*"),
+    supabase.from("watchlist").select("*"),
+  ]);
+  const dashboardItems = buildMarketDataItems(positions || [], watchlist || []);
+
+  // USDT: necesario para valuar USD-M, nunca aparece en positions/watchlist.
+  const futuresOnlyItems = [{ ticker: "USDT", type: "crypto", priority: "position" }];
+
+  const allTickers = [...new Set([...dashboardItems, ...futuresOnlyItems].map((i) => i.ticker))];
+  const { data: cachedRows } = await supabase
+    .from("market_cache")
+    .select("ticker, ai_price, ai_price_updated_at")
+    .in("ticker", allTickers);
+  const cacheByTicker = {};
+  (cachedRows || []).forEach((r) => { cacheByTicker[r.ticker] = r; });
+  const now = new Date();
+
+  function planFor(item) {
+    const row = cacheByTicker[item.ticker] || null;
+    const hasLkg = !!row && row.ai_price != null;
+    const provider = item.type === "crypto" ? "coingecko" : "finnhub";
+    const currentCacheState = !row
+      ? "NEVER_CACHED"
+      : hasLkg
+        ? `LKG_PRESENT (age_seconds=${Math.round((now.getTime() - new Date(row.ai_price_updated_at).getTime()) / 1000)})`
+        : "ROW_EXISTS_NO_PRICE";
+    // Plan: solo se propone refrescar tickers SIN LKG hoy -- warm-up no
+    // es para "refrescar todo", es para cerrar el gap real (20 tickers
+    // sin LKG jamas, ver auditoria de cache coverage). Un ticker que YA
+    // tiene LKG se deja en paz (se refresca solo via el poll normal).
+    const plannedAction = hasLkg ? "SKIP_ALREADY_HAS_LKG" : "FETCH_LIVE_AND_CACHE";
+    return { ticker: item.ticker, type: item.type, provider, current_cache_state: currentCacheState, planned_action: plannedAction };
+  }
+
+  const dashboardPlan = dashboardItems.map(planFor);
+  const futuresPlan = futuresOnlyItems.map(planFor);
+
+  res.status(200).json({
+    ok: true,
+    mode: "DRY_RUN",
+    note: "CERO llamadas a Finnhub/CoinGecko en este modo -- solo lectura de market_cache. Ejecutar el warm-up real es un paso separado, no automatico.",
+    dashboard_universe: { total: dashboardPlan.length, to_fetch: dashboardPlan.filter((p) => p.planned_action === "FETCH_LIVE_AND_CACHE").length, plan: dashboardPlan },
+    futures_only_universe: { total: futuresPlan.length, to_fetch: futuresPlan.filter((p) => p.planned_action === "FETCH_LIVE_AND_CACHE").length, plan: futuresPlan },
+  });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
-  const { pin, tickers, cryptoTickers, reconcile } = req.query || {};
+  const { pin, tickers, cryptoTickers, reconcile, warmup } = req.query || {};
 
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
@@ -425,6 +517,10 @@ export default async function handler(req, res) {
 
   if (reconcile === "true") {
     return runReconciliation(req, res);
+  }
+
+  if (warmup === "dryrun") {
+    return runWarmupDryRun(req, res);
   }
 
   if (!tickers && !cryptoTickers) {

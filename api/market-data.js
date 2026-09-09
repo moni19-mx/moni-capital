@@ -15,7 +15,7 @@ import { createClient } from "@supabase/supabase-js";
 import { getStockData, getCryptoData, COINGECKO_FALLBACK_IDS } from "../lib/prices.js";
 import { mapWithConcurrency } from "../lib/aiPriceCache.js";
 import { createRateLimitBreaker, buildCacheWriteRow } from "../lib/priceCache.js";
-import { resolveTickerPrice, summarizeProviderHealth } from "../lib/marketDataOrchestrator.js";
+import { resolveTickerPrice, summarizeProviderHealthDetailed } from "../lib/marketDataOrchestrator.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -53,15 +53,19 @@ export default async function handler(req, res) {
     const data = {};
     const errors = [];
     const results = [];
-    // UN breaker compartido por TODA la corrida -- si Finnhub responde
-    // 429 para un ticker, los tickers restantes de este mismo batch
-    // dejan de intentar vivo (van directo a cache/STALE/DATA_UNAVAILABLE)
-    // en vez de seguir golpeando un proveedor que ya dijo que pare.
-    const breaker = createRateLimitBreaker();
+    // Price Truth POST-review (bug real reportado por el usuario):
+    // breakers INDEPENDIENTES por proveedor -- antes un solo breaker
+    // compartido significaba que un 429 de CoinGecko (5 tickers cripto)
+    // cortaba tambien los 42 tickers de Finnhub en el MISMO batch, sin
+    // relacion real entre los dos proveedores. Ahora un 429 de
+    // CoinGecko solo afecta a los tickers cripto restantes de esta
+    // corrida; Finnhub sigue intentando en vivo normalmente, y viceversa.
+    const breakers = { finnhub: createRateLimitBreaker(), coingecko: createRateLimitBreaker() };
 
     await mapWithConcurrency(items, CONCURRENCY, async (item) => {
       const ticker = item.ticker;
       const cachedRow = cacheByTicker[ticker] || null;
+      const providerBreaker = item.type === "crypto" ? breakers.coingecko : breakers.finnhub;
 
       const fetchLive = async () => {
         if (item.type === "stock") return getStockData(supabase, ticker, FINNHUB_KEY);
@@ -73,7 +77,8 @@ export default async function handler(req, res) {
         throw new Error("unknown_asset_type");
       };
 
-      const result = await resolveTickerPrice({ item, cachedRow, now, breaker, fetchLive });
+      const result = await resolveTickerPrice({ item, cachedRow, now, breaker: providerBreaker, fetchLive });
+      result.provider = item.type === "crypto" ? "coingecko" : "finnhub";
       results.push(result);
 
       if (result.status === "LIVE") {
@@ -121,10 +126,19 @@ export default async function handler(req, res) {
       };
     });
 
-    const providerHealth = summarizeProviderHealth(results, breaker);
+    // provider_health se mantiene como STRING (contrato sin cambios para
+    // App.jsx::summarizeGlobalFreshness) -- finnhub_status/coingecko_status
+    // son ADITIVOS, para UI futura que quiera distinguir cual proveedor
+    // especifico esta degradado.
+    const providerHealthDetailed = summarizeProviderHealthDetailed(results, breakers);
 
     res.setHeader("Cache-Control", "s-maxage=20, stale-while-revalidate=40");
-    res.status(200).json({ data, errors, updatedAt: now.toISOString(), provider_health: providerHealth });
+    res.status(200).json({
+      data, errors, updatedAt: now.toISOString(),
+      provider_health: providerHealthDetailed.aggregate,
+      finnhub_status: providerHealthDetailed.finnhub_status,
+      coingecko_status: providerHealthDetailed.coingecko_status,
+    });
   } catch (err) {
     res.status(500).json({ error: "market_data_failed", detail: String(err) });
   }
