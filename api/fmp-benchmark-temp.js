@@ -294,6 +294,17 @@ async function computeFuturesEquityDirect() {
   const warnings = [];
   let totalValueUsd = 0;
   let isComplete = true;
+  // Price Truth POST-review (item 2, trace de USDT): este mirror
+  // llamaba getCryptoData() DIRECTO, igual que el bug real que ya se
+  // corrigio en api/futures-equity.js -- nunca se actualizo este
+  // diagnostico para reflejar el mismo fix, asi que su trace hubiera
+  // sido enganoso (nunca podia mostrar STALE, solo OK/PRICE_UNAVAILABLE).
+  // Ahora reusa EXACTAMENTE la misma resolveTickerPrice + cache +
+  // breaker que la app real -- cero formula nueva, valuateAccountEquity
+  // sigue siendo la unica formula financiera, sin tocar.
+  const futuresBreaker = createRateLimitBreaker();
+  const futuresNow = new Date();
+  const traceByTicker = {};
 
   for (const account of futuresAccounts || []) {
     const latest = selectLatestConfirmedSnapshot(allSnapshots, confirmedIdSet, account.id);
@@ -311,10 +322,41 @@ async function computeFuturesEquityDirect() {
       if (equityValue != null && ticker) {
         const coingeckoId = b.assets?.provider_symbols?.coingecko || COINGECKO_FALLBACK_IDS[ticker];
         if (coingeckoId) {
-          try {
-            const r = await getCryptoData(supabase, ticker, coingeckoId);
-            priceUsd = typeof r.price === "number" ? r.price : null;
-          } catch { priceUsd = null; }
+          const { data: cachedRow } = await supabase
+            .from("market_cache")
+            .select("ticker, ai_price, ai_change_pct, ai_price_updated_at, high, low, market_cap, pe_ratio")
+            .eq("ticker", ticker).maybeSingle();
+          const ttlMsForTrace = computeTtlMs("crypto", futuresNow, "position");
+          const result = await resolveTickerPrice({
+            item: { ticker, type: "crypto", coingeckoId, priority: "position" },
+            cachedRow, now: futuresNow, breaker: futuresBreaker,
+            fetchLive: () => getCryptoData(supabase, ticker, coingeckoId),
+          });
+          if (result.status === "LIVE") {
+            const { error: cacheWriteError } = await supabase.from("market_cache").upsert(
+              [buildCacheWriteRow(ticker, "crypto", result)], { onConflict: "ticker" }
+            );
+            if (cacheWriteError) result.cacheWriteFailed = true;
+          }
+          priceUsd = typeof result.price === "number" ? result.price : null;
+          traceByTicker[ticker] = {
+            provider: "coingecko",
+            coingecko_id: coingeckoId,
+            cached_row_found: !!cachedRow,
+            cached_price: cachedRow?.ai_price ?? null,
+            cached_age_seconds: cachedRow?.ai_price_updated_at ? Math.round((futuresNow.getTime() - new Date(cachedRow.ai_price_updated_at).getTime()) / 1000) : null,
+            normal_ttl_ms: ttlMsForTrace,
+            max_stale_age_ms: MAX_STALE_AGE_MS,
+            breaker_tripped_after_this_ticker: isBreakerTripped(futuresBreaker),
+            live_attempted: result.live_attempted ?? null,
+            live_error: result.live_error ?? null,
+            fallback_selected: result.status === "STALE" || result.status === "STALE_RATE_LIMITED" ? "cache_stale" : (result.status === "LIVE" ? "none" : "none_available"),
+            final_price: result.price ?? null,
+            final_price_status: result.status,
+            final_reason: result.reason ?? null,
+          };
+        } else {
+          traceByTicker[ticker] = { provider: "coingecko", coingecko_id: null, final_price: null, final_price_status: "DATA_UNAVAILABLE", final_reason: "no_coingecko_id" };
         }
       }
       const valuation = valuateAccountEquity({ account_id: account.id, asset_id: b.asset_id, equity_value: equityValue, price_usd_per_unit: priceUsd });
@@ -327,7 +369,7 @@ async function computeFuturesEquityDirect() {
     totalValueUsd += accountValueUsd;
   }
 
-  return { total_value_usd: totalValueUsd, is_complete: isComplete, warnings };
+  return { total_value_usd: totalValueUsd, is_complete: isComplete, warnings, trace_by_ticker: traceByTicker };
 }
 
 async function runReconciliation(req, res) {
@@ -464,6 +506,7 @@ async function runReconciliation(req, res) {
     stock_breakdown: stockBreakdown,
     crypto_breakdown: cryptoBreakdown,
     trace_by_ticker: traceByTicker,
+    futures_trace_by_ticker: futuresEquity.trace_by_ticker || {},
   });
 }
 
