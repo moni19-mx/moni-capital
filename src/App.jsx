@@ -15,6 +15,11 @@ import {
 import {
   sbSelectAll, fetchMarketDataBatch, fetchFuturesEquity, fetchMarketPulse,
 } from "../lib/dataFetchers.js";
+// Sprint P1.2 (Smart Import Futures Confirm): mismas funciones puras que
+// usa el servidor para clasificar balances de cuenta Futures -- una sola
+// fuente de verdad, el preview de confirmacion nunca puede mostrar algo
+// distinto de lo que el backend realmente va a decidir.
+import { classifyBalanceForPersistence } from "../lib/futuresImportNormalize.js";
 import {
   initialSourceMeta, resolveAllSourceMeta, isCriticalInitialFailure, isCurrentRequest,
 } from "../lib/dataSourceState.js";
@@ -3779,6 +3784,11 @@ const SMART_IMPORT_ERROR_MESSAGES = {
   TARGET_TRANSACTION_CHANGED: "La transacción relacionada cambió mientras tanto — vuelve a intentar.",
   DUPLICATE_IDENTITY_AT_CONFIRM: "Esta operación ya está registrada con esos mismos datos.",
   POSITION_NOT_FOUND_AT_CONFIRM: "No encontramos la posición para actualizar.",
+  // Sprint P1.2 (Smart Import Futures Confirm)
+  ACCOUNT_TYPE_MISMATCH: "La cuenta seleccionada no es una cuenta de Futures.",
+  INSUFFICIENT_SNAPSHOT_DATA: "No hay suficiente información en esta captura para confirmarla.",
+  COIN_M_NOTIONAL_NOT_SUPPORTED: "COIN-M no soporta notional todavía — solo tamaño en el activo nativo.",
+  STALE_POSITION_MATCH: "La posición cambió desde que se analizó esta captura — vuelve a intentar.",
 };
 
 function humanWarning(code) {
@@ -4042,6 +4052,11 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
       setImportData({
         import_id: row.id,
         status: row.status,
+        // document_type nunca fue columna de smart_imports -- solo vive
+        // en raw_extraction.document_type (persistido, inmutable). Sin
+        // esto, recargar un import de Futures por id perdia la
+        // distincion y caia en la vista de compra/venta.
+        document_type: row.raw_extraction?.document_type ?? null,
         normalized_extraction: row.normalized_extraction,
         proposed_changes: row.proposed_changes,
         warnings: row.normalized_extraction?.warnings || [],
@@ -4117,7 +4132,29 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
     );
   }
 
-  // ================== REVIEW ==================
+  // ================== REVIEW -- Futures (Sprint P1.2) ==================
+  // Rama completamente separada de la de compra/venta: la forma de
+  // normalized_extraction no tiene nada en comun (normalized.asset/.type
+  // vs normalized.balances / normalized.normalized_facts), intentar
+  // reusar el render de abajo mostraria campos vacios sin explicacion.
+  if (state === "REVIEW" && normalized && importData?.document_type === "FUTURES_ACCOUNT_SNAPSHOT") {
+    return (
+      <FuturesAccountSnapshotReview
+        normalized={normalized} accounts={accounts} pin={pin} importId={importData.import_id}
+        onDone={onDone} onCancel={onCancel}
+      />
+    );
+  }
+  if (state === "REVIEW" && normalized && importData?.document_type === "FUTURES_POSITION_SNAPSHOT") {
+    return (
+      <FuturesPositionSnapshotReview
+        normalized={normalized} accounts={accounts} pin={pin} importId={importData.import_id}
+        onDone={onDone} onCancel={onCancel}
+      />
+    );
+  }
+
+  // ================== REVIEW -- compra/venta ==================
   if (state === "REVIEW" && normalized) {
     const warnings = normalized.warnings || [];
     const overall = normalized.overall_import_confidence;
@@ -4305,6 +4342,257 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   }
 
   return null;
+}
+
+// ================== Sprint P1.2: Futures REVIEW/CONFIRM ==================
+// Cambio minimo compatible con la UI actual -- mismo cardStyle/inputStyle
+// que el resto de Smart Import, sin rediseño mobile. Cada componente es
+// autonomo: confirma, muestra su propio SUCCESS/ERROR inline, y solo
+// llama a onDone() cuando el usuario cierra con "Listo".
+const futuresCardStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24 };
+const futuresRowStyle = { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${LINE}`, fontSize: 13 };
+
+function FuturesFieldRow({ label, value, color }) {
+  return (
+    <div style={futuresRowStyle}>
+      <span style={{ fontSize: 12, color: MUTE }}>{label}</span>
+      <span style={{ color: color || TXT }}>{value != null && value !== "" ? String(value) : "—"}</span>
+    </div>
+  );
+}
+
+function FuturesConfirmSuccess({ title, lines, onDone }) {
+  return (
+    <div style={{ ...futuresCardStyle, border: `1px solid ${GREEN}` }}>
+      <div style={{ fontSize: 15, fontWeight: 700, color: GREEN, marginBottom: 10 }}>{title}</div>
+      <div style={{ fontSize: 13, color: TXT, display: "grid", gap: 6, marginBottom: 16 }}>
+        {lines.map((l, i) => <div key={i}>{l}</div>)}
+      </div>
+      <button type="button" onClick={onDone} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+        Listo
+      </button>
+    </div>
+  );
+}
+
+function FuturesAccountSnapshotReview({ normalized, accounts, pin, importId, onDone, onCancel }) {
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null);
+  const [accountEdit, setAccountEdit] = useState(null);
+
+  const accountId = accountEdit ?? normalized.account?.account_id ?? null;
+  const account = accountId != null ? accounts.find((a) => a.id === accountId) : null;
+  const accountUnresolved = accountId == null;
+
+  const balances = normalized.balances || [];
+  const classified = balances.map((b) => ({ ...b, _class: classifyBalanceForPersistence(b) }));
+  const toPersist = classified.filter((b) => b._class === "PERSIST");
+  const toIgnore = classified.filter((b) => b._class === "IGNORE");
+  const toReview = classified.filter((b) => b._class === "REVIEW");
+
+  const blockers = [];
+  if (accountUnresolved) blockers.push("Falta identificar la cuenta.");
+  if (toReview.length > 0) blockers.push(`${toReview.length} balance(s) no tienen equity resuelto — no se puede confirmar hasta corregirlo.`);
+  if (toPersist.length === 0) blockers.push("No hay ningún balance con datos suficientes para guardar.");
+  const canConfirm = blockers.length === 0 && !confirming;
+
+  async function handleConfirm() {
+    setConfirming(true); setErrorInfo(null);
+    try {
+      const userEdits = accountEdit != null ? { "0": { account_id: accountEdit } } : {};
+      const data = await callSmartImport({ pin, action: "confirm", import_id: importId, user_edits: userEdits });
+      setResult(data);
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null, detail: e.data?.detail });
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <FuturesConfirmSuccess
+        title={result.already_confirmed ? "Esta importación ya estaba confirmada" : "Snapshot de cuenta confirmado"}
+        lines={[
+          `Cuenta: ${account?.name || accountId}`,
+          `${toPersist.length} balance(s) guardados`,
+          "El patrimonio se actualizará con este snapshot como el más reciente.",
+        ]}
+        onDone={onDone}
+      />
+    );
+  }
+
+  return (
+    <div style={futuresCardStyle}>
+      <div style={{ fontSize: 14, fontWeight: 700, color: TXT, marginBottom: 14 }}>
+        Revisión — Snapshot de cuenta Futures ({normalized.account?.product_type || "—"})
+      </div>
+
+      <div style={{ display: "grid", gap: 0, marginBottom: 16 }}>
+        <div style={futuresRowStyle}>
+          <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
+          {accountUnresolved ? (
+            <select style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 10px", fontSize: 13 }}
+              value={accountEdit ?? ""} onChange={(e) => setAccountEdit(e.target.value ? Number(e.target.value) : null)}>
+              <option value="">Sin identificar</option>
+              {accounts.filter((a) => a.account_type === "futures").map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          ) : (
+            <span onClick={() => setAccountEdit(accountId)} style={{ cursor: "pointer", color: TXT }} title="Click para cambiar">{account?.name || accountId}</span>
+          )}
+        </div>
+        <FuturesFieldRow label="Observado" value={normalized.observed_at ? new Date(normalized.observed_at).toLocaleString("es-MX") : "Se usará la hora de esta importación"} />
+      </div>
+
+      <div style={{ background: "#161c2e", border: `1px solid ${LINE}`, borderRadius: 8, padding: 14, marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: GOLD, marginBottom: 8 }}>Balances a guardar ({toPersist.length})</div>
+        {toPersist.length === 0 && <div style={{ fontSize: 12, color: MUTE }}>Ninguno todavía.</div>}
+        {toPersist.map((b, i) => (
+          <div key={i} style={futuresRowStyle}>
+            <span style={{ color: MUTE }}>{b.asset_symbol}</span>
+            <span>Equity: <b style={{ color: GOLD }}>{b.equity_value}</b> ({b.equity_source_type})</span>
+          </div>
+        ))}
+      </div>
+
+      {toIgnore.length > 0 && (
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 12 }}>
+          Ignorados (sin saldo relevante): {toIgnore.map((b) => b.asset_symbol).join(", ")}
+        </div>
+      )}
+      {toReview.length > 0 && (
+        <div style={{ fontSize: 12, color: RED, background: "#2A1414", border: `1px solid ${RED}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+          Sin equity resuelto: {toReview.map((b) => b.asset_symbol).join(", ")} — revisa la captura.
+        </div>
+      )}
+      {(normalized.warnings || []).length > 0 && (
+        <div style={{ marginBottom: 12, display: "grid", gap: 4 }}>
+          {(normalized.warnings || []).map((w) => <div key={w} style={{ fontSize: 12, color: AMBER }}>• {w}</div>)}
+        </div>
+      )}
+      {blockers.map((b, i) => <div key={i} style={{ fontSize: 12, color: RED, marginBottom: 6 }}>• {b}</div>)}
+      {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button type="button" onClick={handleConfirm} disabled={!canConfirm} style={{
+          background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
+          border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
+          cursor: canConfirm ? "pointer" : "not-allowed",
+        }}>
+          {confirming ? "Confirmando…" : "Confirmar"}
+        </button>
+        <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "10px 16px", fontSize: 13, cursor: "pointer" }}>
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FuturesPositionSnapshotReview({ normalized, accounts, pin, importId, onDone, onCancel }) {
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null);
+  const [accountEdit, setAccountEdit] = useState(null);
+
+  const facts = normalized.normalized_facts || {};
+  const accountId = accountEdit ?? normalized.account?.account_id ?? null;
+  const account = accountId != null ? accounts.find((a) => a.id === accountId) : null;
+  const accountUnresolved = accountId == null;
+
+  const decision = normalized.identity_result?.decision;
+  const decisionOk = decision === "NEW_POSITION" || decision === "MATCH_EXISTING_HIGH";
+
+  const blockers = [];
+  if (accountUnresolved) blockers.push("Falta identificar la cuenta.");
+  if (!decisionOk) blockers.push(`No se puede confirmar automáticamente (${decision || "identidad no determinada"}) — revisa manualmente.`);
+  const canConfirm = blockers.length === 0 && !confirming;
+
+  async function handleConfirm() {
+    setConfirming(true); setErrorInfo(null);
+    try {
+      const userEdits = accountEdit != null ? { "0": { account_id: accountEdit } } : {};
+      const data = await callSmartImport({ pin, action: "confirm", import_id: importId, user_edits: userEdits });
+      setResult(data);
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null, detail: e.data?.detail });
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <FuturesConfirmSuccess
+        title={result.already_confirmed ? "Esta importación ya estaba confirmada" : "Snapshot de posición confirmado"}
+        lines={[
+          `${facts.instrument || "—"} · ${facts.side === "long" ? "LONG" : "SHORT"}`,
+          `Cuenta: ${account?.name || accountId}`,
+          result.position_operation === "NEW_POSITION" ? "Posición nueva creada" : "Posición existente actualizada",
+        ]}
+        onDone={onDone}
+      />
+    );
+  }
+
+  return (
+    <div style={futuresCardStyle}>
+      <div style={{ fontSize: 14, fontWeight: 700, color: TXT, marginBottom: 14 }}>
+        Revisión — Snapshot de posición Futures
+      </div>
+
+      <div style={{ display: "grid", gap: 0, marginBottom: 16 }}>
+        <div style={futuresRowStyle}>
+          <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
+          {accountUnresolved ? (
+            <select style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 10px", fontSize: 13 }}
+              value={accountEdit ?? ""} onChange={(e) => setAccountEdit(e.target.value ? Number(e.target.value) : null)}>
+              <option value="">Sin identificar</option>
+              {accounts.filter((a) => a.account_type === "futures").map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          ) : (
+            <span onClick={() => setAccountEdit(accountId)} style={{ cursor: "pointer", color: TXT }} title="Click para cambiar">{account?.name || accountId}</span>
+          )}
+        </div>
+        <FuturesFieldRow label="Instrumento" value={facts.instrument} />
+        <FuturesFieldRow label="Side" value={facts.side === "long" ? "LONG" : facts.side === "short" ? "SHORT" : "—"} color={facts.side === "long" ? GREEN : facts.side === "short" ? RED : TXT} />
+        <FuturesFieldRow label="Leverage" value={facts.leverage != null ? `${facts.leverage}x` : null} />
+        <FuturesFieldRow label="Margin mode" value={facts.margin_mode} />
+        <FuturesFieldRow label="Tamaño (nativo)" value={facts.position_quantity_value != null ? `${facts.position_quantity_value} ${facts.position_quantity_unit || ""}` : null} />
+        <FuturesFieldRow label="Notional" value={facts.notional_value != null ? `${facts.notional_value} ${facts.price_currency || ""}` : "Pendiente de verificación"} />
+        <FuturesFieldRow label="Entry" value={facts.entry_price} />
+        <FuturesFieldRow label="Mark" value={facts.mark_price} />
+        <FuturesFieldRow label="Liquidation" value={facts.liquidation_price} />
+        <FuturesFieldRow label="PnL no realizado" value={facts.unrealized_pnl_value} color={facts.unrealized_pnl_value >= 0 ? GREEN : RED} />
+        <FuturesFieldRow label="ROI" value={facts.roi_pct != null ? `${facts.roi_pct}%` : null} color={facts.roi_pct >= 0 ? GREEN : RED} />
+        <FuturesFieldRow label="Unit semantics" value={facts.unit_semantics_status} color={facts.unit_semantics_status === "VERIFIED" ? GREEN : AMBER} />
+        <FuturesFieldRow label="Resultado de identidad" value={decision} color={decisionOk ? GREEN : RED} />
+      </div>
+
+      {(normalized.warnings || []).length > 0 && (
+        <div style={{ marginBottom: 12, display: "grid", gap: 4 }}>
+          {(normalized.warnings || []).map((w) => <div key={w} style={{ fontSize: 12, color: AMBER }}>• {w}</div>)}
+        </div>
+      )}
+      {blockers.map((b, i) => <div key={i} style={{ fontSize: 12, color: RED, marginBottom: 6 }}>• {b}</div>)}
+      {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button type="button" onClick={handleConfirm} disabled={!canConfirm} style={{
+          background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
+          border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
+          cursor: canConfirm ? "pointer" : "not-allowed",
+        }}>
+          {confirming ? "Confirmando…" : "Confirmar"}
+        </button>
+        <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "10px 16px", fontSize: 13, cursor: "pointer" }}>
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function ConvictionStars({ value }) {
