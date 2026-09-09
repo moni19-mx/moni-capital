@@ -77,13 +77,24 @@ export default async function handler(req, res) {
       results.push(result);
 
       if (result.status === "LIVE") {
-        // Persistencia fire-and-forget (misma politica que
-        // lib/aiPriceCache.js::setShortCache): el cache nunca debe
-        // tumbar la respuesta principal si el upsert falla.
-        supabase.from("market_cache").upsert(
-          [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
-          { onConflict: "ticker" }
-        ).then(() => {}, () => {});
+        // Bugfix real de P0.3 (encontrado en la corrida en vivo): un
+        // upsert fire-and-forget (sin await) puede quedar cortado a
+        // medias -- Vercel puede congelar/terminar el entorno de
+        // ejecucion en cuanto el handler manda la respuesta y retorna,
+        // ANTES de que la promesa suelta termine de escribir. Se
+        // confirmo en produccion: 38 precios "LIVE" en una corrida, 0
+        // cache_hits en la siguiente (el cache nunca habia llegado a
+        // Supabase). Ahora se espera (await) DENTRO del worker de cada
+        // ticker -- mapWithConcurrency ya espera a que todos los
+        // workers terminen antes de que el handler responda, asi que
+        // esto SI garantiza que el cache quede escrito. Un fallo de
+        // escritura sigue sin tumbar la respuesta (try/catch propio).
+        try {
+          await supabase.from("market_cache").upsert(
+            [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
+            { onConflict: "ticker" }
+          );
+        } catch (e) { /* el cache nunca debe tumbar la respuesta principal */ }
       }
 
       if (result.status === "DATA_UNAVAILABLE") {

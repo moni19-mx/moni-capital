@@ -216,10 +216,15 @@ async function computeMarketDataDirect(items) {
     const result = await resolveTickerPrice({ item, cachedRow, now, breaker, fetchLive });
     results.push({ ticker, ...result });
     if (result.status === "LIVE") {
-      supabase.from("market_cache").upsert(
-        [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
-        { onConflict: "ticker" }
-      ).then(() => {}, () => {});
+      // Bugfix real de P0.3 (ver api/market-data.js): await obligatorio,
+      // un upsert fire-and-forget puede quedar cortado a medias si
+      // Vercel congela el entorno apenas el handler responde.
+      try {
+        await supabase.from("market_cache").upsert(
+          [{ ticker, ai_price: result.price, ai_change_pct: result.changePct, ai_price_updated_at: result.fetchedAt }],
+          { onConflict: "ticker" }
+        );
+      } catch (e) { /* el cache nunca debe tumbar la respuesta principal */ }
     }
     if (result.status === "DATA_UNAVAILABLE") { errors.push(ticker); return; }
     data[ticker] = {

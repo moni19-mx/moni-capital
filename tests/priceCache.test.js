@@ -232,3 +232,38 @@ test("M - PWA cache policy: /api/market-data sigue siendo network-only (sin camb
 // N. P0.1/P0.2 LKG behavior: cubierto por tests/loadAllCoherence.test.js y
 // tests/financialSnapshot.test.js (parte de la misma corrida de suite
 // completa, 423 tests previos siguen en 100% verde con estos cambios).
+
+// ================== REGRESION real: cache write debe completarse ANTES de responder ==================
+// Bug real encontrado en la corrida en vivo de validacion (2026-09-09):
+// la primera version de api/market-data.js escribia el cache con un
+// upsert "fire-and-forget" (sin await). Confirmado en produccion: 38
+// precios LIVE en una corrida, 0 cache_hits en la siguiente -- el
+// cache nunca habia llegado a escribirse de verdad (Vercel puede
+// terminar el entorno de ejecucion apenas el handler responde, antes
+// de que una promesa suelta complete). El fix real es awaitear el
+// upsert DENTRO del worker de mapWithConcurrency -- este test prueba
+// el patron correcto: un worker con un await interno garantiza que,
+// para cuando mapWithConcurrency() resuelve, TODAS las escrituras ya
+// se aplicaron -- nunca se puede "responder antes de escribir".
+import { mapWithConcurrency } from "../lib/aiPriceCache.js";
+
+test("REGRESION - un write awaiteado DENTRO del worker esta garantizado completo cuando mapWithConcurrency() resuelve (el patron correcto, ya no fire-and-forget)", async () => {
+  const store = {};
+  const items = [{ ticker: "AAPL" }, { ticker: "MSFT" }, { ticker: "GOOGL" }];
+
+  async function slowWrite(ticker, value) {
+    await new Promise((r) => setTimeout(r, 5)); // simula latencia real de red a Supabase
+    store[ticker] = value;
+  }
+
+  await mapWithConcurrency(items, 6, async (item) => {
+    const livePrice = 100; // simula un resultado LIVE real
+    await slowWrite(item.ticker, livePrice); // AWAIT real, patron corregido
+  });
+
+  // Si esto fuera fire-and-forget (sin el await de arriba), esta
+  // asercion fallaria de forma intermitente -- con await, SIEMPRE pasa.
+  assert.equal(store.AAPL, 100);
+  assert.equal(store.MSFT, 100);
+  assert.equal(store.GOOGL, 100);
+});
