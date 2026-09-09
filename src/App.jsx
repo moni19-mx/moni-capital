@@ -30,6 +30,7 @@ import {
   computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
   computeInvested, computeTotalGain, unclassifiedPositions, summarizeGlobalFreshness,
   computePortfolioWeights, computeNetWorthWeights, computePatrimonioBreakdown, computeConcentration,
+  reconstructTraditionalMarketValue,
 } from "../lib/financialSnapshot.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
@@ -726,8 +727,16 @@ export default function Dashboard() {
   const latestInsight = aiInsights.find((i) => i.scope === "today") || null;
   const insightIsFresh = latestInsight?.based_on_hash === dailyBriefHash;
   const invested = computeInvested(enriched, cashValue);
-  const totalGain = computeTotalGain(patrimonio, invested);
-  const totalPct = invested ? totalGain / invested : 0;
+  // Financial Correctness fix (bug real encontrado en produccion): antes
+  // esto era computeTotalGain(patrimonio, invested) -- `patrimonio` es
+  // TOTAL_NET_WORTH (incluye Futures Equity), `invested` nunca incluyo
+  // Futures. Resultado: el 100% de Futures Equity se contaba como
+  // ganancia. Fix de un argumento -- ver lib/financialSnapshot.js para
+  // el contrato completo (TRADITIONAL_PNL/TOTAL_PNL_STATUS/etc). Nombres
+  // explicitos a proposito -- "total" ya no puede volver a colarse aqui
+  // por error de variable.
+  const traditionalPnl = computeTotalGain(patrimonioBase, invested);
+  const traditionalReturnPct = invested ? traditionalPnl / invested : 0;
 
   const snapshotPosted = useRef(false);
   useEffect(() => {
@@ -972,8 +981,8 @@ export default function Dashboard() {
           </div>
           <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap", alignItems: "baseline" }}>
             <Metric label="Capital invertido" value={fmt$2(invested)} />
-            <Metric label="Ganancia / Pérdida (portafolio tradicional)" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
-            <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
+            <Metric label="Ganancia / Pérdida (portafolio tradicional)" value={fmt$2(traditionalPnl)} color={traditionalPnl >= 0 ? GREEN : RED} icon={traditionalPnl >= 0 ? TrendingUp : TrendingDown} />
+            <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(traditionalReturnPct)} color={traditionalPnl >= 0 ? GREEN : RED} />
             <Metric label="Patrimonio Base (sin Futures)" value={fmt$2(patrimonioBase)} />
             {futuresEquityUsd > 0 && <Metric label="Futures Equity" value={fmt$2(futuresEquityUsd)} color={GOLD} />}
           </div>
@@ -1195,7 +1204,7 @@ export default function Dashboard() {
 
         {tab === "wealth" && (
           <WealthTab
-            patrimonio={patrimonio} invested={invested} totalGain={totalGain} totalPct={totalPct}
+            patrimonio={patrimonio} invested={invested} traditionalPnl={traditionalPnl} traditionalReturnPct={traditionalReturnPct}
             stocksValue={stocksValue} cryptoValue={cryptoValue} cashValue={cashValue}
             withValue={withValue} top5={top5} top1Pct={top1Pct} top3Pct={top3Pct} concColor={concColor}
             concentrationPartial={concentrationPartial} portfolioWeightById={portfolioWeightById}
@@ -2285,6 +2294,28 @@ function CashMovementForm({ onDone }) {
   );
 }
 
+// Financial Correctness fix (Performance ≠ solo presentación): antes
+// esto comparaba `last.patrimonio - first.patrimonio` -- `patrimonio`
+// incluye Futures Equity desde 2026-09-08, asi que los ultimos 2
+// snapshots reales quedaron contaminados (salto de ~+10,131 en un solo
+// dia, que nunca fue ganancia de mercado real). El fix NO edita ni
+// reescribe ninguna fila de `snapshots` -- reconstructTraditionalMarketValue()
+// deriva el valor tradicional de cada fila desde stocks_value/
+// crypto_value/cash_value, columnas que YA existian sin cambios desde
+// el primer snapshot real. Cero migracion de schema.
+//
+// Gap real, documentado, NO resuelto en este sprint (aprobado
+// explicitamente no implementar todavia): esto sigue siendo un cambio
+// de VALOR simple (NET_WORTH_CHANGE), no un retorno de inversion
+// ajustado por flujos externos (INVESTMENT_RETURN) -- un deposito o
+// retiro de efectivo durante el periodo mueve este numero sin que sea
+// ganancia/perdida real. Moni SI tiene `cash_movements` con fecha real
+// (evidencia real: -5,200 en retiros entre 2026-08-12 y 2026-09-07,
+// dentro del periodo de snapshots actual) -- la metrica de abajo NUNCA
+// se le llama "Rendimiento" a proposito, para no reclamar una precision
+// que no tiene todavia. Ver reporte del sprint para la comparacion
+// Simple/Modified-Dietz/TWR y la recomendacion (Modified Dietz, sin
+// implementar aqui).
 function PerformanceTab({ snapshots }) {
   if (!snapshots || snapshots.length === 0) {
     return <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay historial — vuelve mañana. Cada día que abras el sitio se guarda una "foto" de tu patrimonio.</div>;
@@ -2292,22 +2323,28 @@ function PerformanceTab({ snapshots }) {
 
   const first = snapshots[0];
   const last = snapshots[snapshots.length - 1];
-  const change = last.patrimonio - first.patrimonio;
-  const changePct = first.patrimonio ? change / first.patrimonio : 0;
+  const firstTraditional = reconstructTraditionalMarketValue(first);
+  const lastTraditional = reconstructTraditionalMarketValue(last);
+  const change = lastTraditional - firstTraditional;
+  const changePct = firstTraditional ? change / firstTraditional : 0;
 
   const chartData = snapshots.map((s) => ({
     date: s.date,
-    Patrimonio: Number(s.patrimonio),
+    "Patrimonio Total": Number(s.patrimonio),
+    "Valor Tradicional": reconstructTraditionalMarketValue(s),
     Invertido: Number(s.invested),
   }));
 
   return (
     <div>
       <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 24 }}>
-        <Metric label={`Primer registro (${first.date})`} value={fmt$2(Number(first.patrimonio))} />
-        <Metric label={`Hoy (${last.date})`} value={fmt$2(Number(last.patrimonio))} />
-        <Metric label="Cambio del período" value={fmt$2(change)} color={change >= 0 ? GREEN : RED} icon={change >= 0 ? TrendingUp : TrendingDown} />
-        <Metric label="Rendimiento del período" value={fmtPct(changePct)} color={change >= 0 ? GREEN : RED} />
+        <Metric label={`Primer registro (${first.date})`} value={fmt$2(firstTraditional)} />
+        <Metric label={`Hoy (${last.date})`} value={fmt$2(lastTraditional)} />
+        <Metric label="Cambio de valor del período (portafolio tradicional)" value={fmt$2(change)} color={change >= 0 ? GREEN : RED} icon={change >= 0 ? TrendingUp : TrendingDown} />
+        <Metric label="Patrimonio Total hoy (incluye Futures)" value={fmt$2(Number(last.patrimonio))} />
+      </div>
+      <div style={{ fontSize: 11, color: MUTE, marginBottom: 16 }}>
+        No ajustado por depósitos/retiros de efectivo — es cambio de valor, no rendimiento de inversión. Si depositaste o retiraste dinero en este período, este número lo mezcla.
       </div>
 
       {snapshots.length < 3 ? (
@@ -2322,12 +2359,13 @@ function PerformanceTab({ snapshots }) {
           <XAxis dataKey="date" stroke={MUTE} fontSize={11} />
           <YAxis stroke={MUTE} fontSize={11} tickFormatter={fmt$} width={70} />
           <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
-          <Line type="monotone" dataKey="Patrimonio" stroke={GOLD} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="Patrimonio Total" stroke={GOLD} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="Valor Tradicional" stroke={GREEN} strokeWidth={2} dot={false} />
           <Line type="monotone" dataKey="Invertido" stroke={MUTE} strokeWidth={1.5} strokeDasharray="4 4" dot={false} />
         </LineChart>
       </ResponsiveContainer>
       <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>
-        Se guarda un registro por día (la primera vez que abres el sitio ese día). Línea dorada = patrimonio total, línea punteada = capital invertido.
+        Se guarda un registro por día (la primera vez que abres el sitio ese día). Línea dorada = Patrimonio Total (incluye Futures), línea verde = Valor Tradicional (sin Futures), línea punteada = capital invertido.
       </div>
     </div>
   );
@@ -2984,7 +3022,7 @@ function RebalanceTargetForm({ onDone, onCancel }) {
 }
 
 function WealthTab({
-  patrimonio, invested, totalGain, totalPct, stocksValue, cryptoValue, cashValue,
+  patrimonio, invested, traditionalPnl, traditionalReturnPct, stocksValue, cryptoValue, cashValue,
   withValue, top5, top1Pct, top3Pct, concColor, concentrationPartial, portfolioWeightById,
   allocType, snapshots, goal, goalPct,
   transactions, cashMovements, onOpenAsset,
@@ -3036,9 +3074,9 @@ function WealthTab({
     <div style={{ display: "grid", gap: 16 }}>
       <Panel title="1. Patrimonio Total">
         <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
-          <Metric label="Patrimonio actual" value={fmt$2(patrimonio)} />
-          <Metric label="Rendimiento total" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
-          <Metric label="Ganancia/Pérdida total" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} />
+          <Metric label="Patrimonio actual (Total Net Worth)" value={fmt$2(patrimonio)} />
+          <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(traditionalReturnPct)} color={traditionalPnl >= 0 ? GREEN : RED} />
+          <Metric label="Ganancia/Pérdida (portafolio tradicional)" value={fmt$2(traditionalPnl)} color={traditionalPnl >= 0 ? GREEN : RED} />
         </div>
         {snapshots.length < 5 && (
           <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>El historial de largo plazo apenas empieza a acumularse — se vuelve más útil con cada semana que pasa.</div>
@@ -3138,7 +3176,7 @@ function WealthTab({
           <Metric label="Aportes netos (Efectivo)" value={fmt$2(cashValue)} />
           <Metric label="Costo vigente de posiciones" value={fmt$2(costoVigente)} />
           <Metric label="Valor actual de posiciones" value={fmt$2(valorActual)} />
-          <Metric label="Ganancia/Pérdida (posiciones)" value={fmt$2(gananciaPosiciones)} color={gananciaPosiciones >= 0 ? GREEN : RED} />
+          <Metric label="Ganancia/Pérdida (solo posiciones, sin efectivo)" value={fmt$2(gananciaPosiciones)} color={gananciaPosiciones >= 0 ? GREEN : RED} />
           <Metric label="Dividendos recibidos" value={fmt$2(dividendosTotal)} color={GOLD} />
           <Metric label="Retiros" value={fmt$2(retirosTotal)} />
           <Metric label="Intereses" value="No tengo ese dato registrado todavía." />
