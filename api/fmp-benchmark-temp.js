@@ -567,6 +567,104 @@ async function runWarmupDryRun(req, res) {
   });
 }
 
+// Price Truth POST-review, item "RESIDUAL WATCHLIST WARM-UP": modo LIVE,
+// autorizado EXPLICITAMENTE por el usuario para exactamente estos 8
+// tickers watchlist-only sin LKG jamas -- nunca posiciones, nunca USDT,
+// nunca crypto, nunca un ticker que ya tenga LKG (se verifica en vivo
+// contra market_cache, no se asume la lista del dry-run anterior).
+// Lista hardcodeada a proposito (no derivada de watchlist/positions) --
+// es la unica forma de garantizar que este modo JAMAS toque un ticker
+// fuera de lo autorizado, sin importar que cambie el watchlist real.
+const WARMUP_LIVE_ALLOWED_TICKERS = ["ASML.AS", "CEG", "CRCL", "LWLG", "NOC", "SERV", "SNDK", "TE"];
+const WARMUP_LIVE_SPACING_MS = 2000; // ~1 llamada cada ~2s, requisito explicito del usuario
+
+async function runWarmupLive(req, res) {
+  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+  // Breaker propio de esta corrida -- si Finnhub responde 429 en
+  // cualquier ticker, se detiene el resto INMEDIATAMENTE (sin retry
+  // agresivo): resolveTickerPrice ya no intenta en vivo una vez que el
+  // breaker esta tripped, y aqui ademas se marca el resto como SKIPPED
+  // explicito en vez de dejarlos pasar por otro intento fallido.
+  const breaker = createRateLimitBreaker();
+  const results = [];
+  let stoppedEarly = false;
+
+  // Se lee el estado REAL de market_cache para estos 8 tickers antes de
+  // tocar nada -- nunca se asume que un ticker sigue sin LKG solo porque
+  // el dry-run anterior lo reporto asi.
+  const { data: cachedRows } = await supabase
+    .from("market_cache")
+    .select("ticker, ai_price, ai_price_updated_at")
+    .in("ticker", WARMUP_LIVE_ALLOWED_TICKERS);
+  const cacheByTicker = {};
+  (cachedRows || []).forEach((r) => { cacheByTicker[r.ticker] = r; });
+
+  for (let i = 0; i < WARMUP_LIVE_ALLOWED_TICKERS.length; i++) {
+    const ticker = WARMUP_LIVE_ALLOWED_TICKERS[i];
+    const cachedRow = cacheByTicker[ticker] || null;
+    const hasLkg = !!cachedRow && cachedRow.ai_price != null;
+
+    if (hasLkg) {
+      results.push({ ticker, provider: "finnhub", result: "SKIPPED", reason: "already_has_lkg", price: cachedRow.ai_price, cached_at: cachedRow.ai_price_updated_at, market_cache_verified: true });
+      continue;
+    }
+
+    if (stoppedEarly) {
+      results.push({ ticker, provider: "finnhub", result: "SKIPPED", reason: "stopped_after_429_rate_limited", price: null, cached_at: null, market_cache_verified: false });
+      continue;
+    }
+
+    const now = new Date();
+    const result = await resolveTickerPrice({
+      item: { ticker, type: "stock", priority: "position" },
+      cachedRow: null, now, breaker,
+      fetchLive: () => getStockData(supabase, ticker, FINNHUB_KEY),
+    });
+
+    if (result.status === "LIVE") {
+      // Nunca sobreescribe con NULL: solo se llega aqui si getStockData
+      // devolvio un numero > 0 (getStockData ya lanza "no_quote" si no).
+      const { error: cacheWriteError } = await supabase.from("market_cache").upsert(
+        [buildCacheWriteRow(ticker, "stock", result)], { onConflict: "ticker" }
+      );
+      let verifyRow = null;
+      if (!cacheWriteError) {
+        const { data } = await supabase.from("market_cache").select("ticker, ai_price, ai_price_updated_at").eq("ticker", ticker).maybeSingle();
+        verifyRow = data;
+      }
+      const verified = !cacheWriteError && !!verifyRow && verifyRow.ai_price === result.price;
+      results.push({
+        ticker, provider: "finnhub",
+        result: cacheWriteError ? "FAILED" : "SUCCESS",
+        reason: cacheWriteError ? `cache_write_failed: ${cacheWriteError.message}` : null,
+        price: result.price, cached_at: verifyRow?.ai_price_updated_at ?? null,
+        market_cache_verified: verified,
+      });
+    } else {
+      // Sin LKG previo + live fallo -> DATA_UNAVAILABLE, CERO escritura
+      // (nada que sobreescribir, no existia precio valido antes). Caso
+      // ASML.AS explicito del usuario: si Finnhub devuelve "no_quote"
+      // (simbolo invalido/no soportado), se reporta el error exacto tal
+      // cual, SIN improvisar otro simbolo.
+      results.push({ ticker, provider: "finnhub", result: "FAILED", reason: result.live_error || result.reason || "unknown", price: null, cached_at: null, market_cache_verified: false });
+    }
+
+    if (isBreakerTripped(breaker)) stoppedEarly = true;
+
+    if (i < WARMUP_LIVE_ALLOWED_TICKERS.length - 1 && !stoppedEarly) {
+      await sleep(WARMUP_LIVE_SPACING_MS);
+    }
+  }
+
+  res.status(200).json({
+    ok: true,
+    mode: "LIVE_WARMUP",
+    allowed_tickers: WARMUP_LIVE_ALLOWED_TICKERS,
+    stopped_early: stoppedEarly,
+    results,
+  });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
@@ -582,6 +680,10 @@ export default async function handler(req, res) {
 
   if (warmup === "dryrun") {
     return runWarmupDryRun(req, res);
+  }
+
+  if (warmup === "live") {
+    return runWarmupLive(req, res);
   }
 
   if (!tickers && !cryptoTickers) {
