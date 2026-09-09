@@ -6,7 +6,23 @@
 > sin conviction, sin opportunities, sin alerts, sin UI de noticias, sin
 > Daily Brief intelligence — eso es P3.1B en adelante.
 
-## 0. Provider fact-check — BLOQUEADO EN ESTE ENTORNO
+## 0. Provider fact-check — CERRADO EN MICRO-SPRINT P3.1A.1
+
+> **Actualización**: este punto quedó bloqueado en la sesión original de
+> P3.1A (egress del sandbox) pero se cerró con evidencia real en el
+> micro-sprint **P3.1A.1** — ver
+> `docs/intelligence/P3.1A.1-REAL-PROVIDER-FACT-CHECK.md` para la matriz
+> completa. Resumen: SEC EDGAR confirmado real y funcionando de punta a
+> punta; FMP `news/stock`/`earnings` confirmado bloqueado por plan (para
+> cualquier ticker); FMP fundamentals disponible para AAPL pero
+> reproduciblemente bloqueado (402) para QCOM específicamente, sin causa
+> determinada; Finnhub sin probar (sin benchmark existente). Decisión
+> final: **BLOCKED P3.1B parcial** — ver ese documento para el detalle y
+> el camino recomendado. El resto de esta sección queda como registro
+> histórico de por qué no se pudo cerrar dentro de la sesión original de
+> P3.1A.
+
+## 0. Provider fact-check — BLOQUEADO EN ESTE ENTORNO (registro histórico, ver actualización arriba)
 
 **No se pudo verificar empíricamente el acceso real a FMP/Finnhub/SEC
 EDGAR desde esta sesión.** No es un hallazgo de "plan insuficiente" —
