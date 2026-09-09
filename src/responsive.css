@@ -30,8 +30,14 @@
   .mc-mobile-only { display: initial; }
   .mc-desktop-only { display: none !important; }
 
-  /* Espacio para que el bottom nav fijo nunca tape contenido real. */
-  body { padding-bottom: var(--mc-bottom-nav-height); }
+  /* Espacio para que el bottom nav fijo nunca tape contenido real.
+     Sprint P4.2: + safe-area-inset-bottom para el home indicator de
+     iPhone (notch/Dynamic Island) en modo standalone/PWA -- sin esto,
+     el ultimo item real de la pagina queda parcialmente tapado por la
+     barra de gestos del sistema. env() con fallback 0px es un no-op en
+     navegadores/dispositivos sin safe-area (Android, desktop, iPhone
+     mas viejos). */
+  body { padding-bottom: calc(var(--mc-bottom-nav-height) + env(safe-area-inset-bottom, 0px)); }
 }
 
 /* ================== Bottom navigation (mobile) ================== */
@@ -51,6 +57,12 @@
   z-index: 40;
   border-top: 1px solid var(--mc-line);
   background: var(--mc-panel);
+  /* Sprint P4.2: el nav en si tambien necesita el padding, no solo el
+     body -- los botones deben quedar arriba del home indicator, no
+     debajo de el (fondo del nav se extiende hasta bottom:0 igual, solo
+     el contenido interactivo se corre hacia arriba). */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  box-sizing: content-box;
 }
 @media (max-width: 767px) {
   .mc-bottom-nav { display: flex; }
@@ -99,3 +111,15 @@
 
 /* ================== Touch targets ================== */
 .mc-touch-target { min-height: 44px; }
+
+/* ================== Standalone (PWA instalada) ================== */
+/* Sprint P4.2. apple-mobile-web-app-status-bar-style=black-translucent
+   (index.html) hace que el status bar de iOS se dibuje ENCIMA del
+   contenido en vez de empujarlo -- sin esto, el header queda debajo del
+   reloj/bateria en standalone. Solo aplica en standalone: en Safari
+   normal (pestaña de navegador) el status bar ya no es parte del
+   viewport de la pagina, agregar este padding ahi correria el header
+   sin necesidad. */
+@media (display-mode: standalone) {
+  body { padding-top: env(safe-area-inset-top, 0px); }
+}

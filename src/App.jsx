@@ -166,6 +166,82 @@ function useIsMobile() {
   return isMobile;
 }
 
+// Sprint P4.2 (PWA Foundation). Estado de conectividad real del
+// navegador. Nunca decide nada financiero -- solo permite que el banner
+// de error ya existente (loadError, Sprint P0.1) aclare "sin conexion"
+// en vez de un mensaje HTTP generico cuando corresponde.
+function useOnlineStatus() {
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator !== "undefined" ? navigator.onLine : true
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onOnline = () => setIsOnline(true);
+    const onOffline = () => setIsOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+  return isOnline;
+}
+
+// Sprint P4.2. Escucha el CustomEvent que src/main.jsx dispara cuando
+// hay un service worker nuevo instalado y esperando. Nunca hace reload
+// solo -- eso lo decide el usuario con el boton del banner (ver render
+// de updateAvailable mas abajo), que llama a
+// window.__moniApplyServiceWorkerUpdate().
+function useSwUpdateAvailable() {
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onUpdate = () => setUpdateAvailable(true);
+    window.addEventListener("moni:sw-update-available", onUpdate);
+    return () => window.removeEventListener("moni:sw-update-available", onUpdate);
+  }, []);
+  return updateAvailable;
+}
+
+// Sprint P4.2. Captura beforeinstallprompt (Chrome/Android) para poder
+// mostrar un CTA propio "Instalar Moni Capital" en vez del mini-infobar
+// del navegador. Safari/iOS nunca dispara este evento -- ahi
+// canInstall queda siempre false a proposito (ver InstallCTA: en iOS se
+// muestra una ayuda manual en su lugar, nunca un boton que no funciona).
+function useInstallPrompt() {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onBeforeInstall = (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+    const onInstalled = () => setDeferredPrompt(null);
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+  return deferredPrompt;
+}
+
+function isStandaloneDisplay() {
+  if (typeof window === "undefined") return false;
+  return (
+    window.matchMedia?.("(display-mode: standalone)")?.matches ||
+    window.navigator.standalone === true // iOS Safari
+  );
+}
+
+function isIosSafari() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  return /iPhone|iPad|iPod/.test(ua) && /Safari/.test(ua) && !/CriOS|FxiOS/.test(ua);
+}
+
 // Fuente unica de la lista de tabs -- el nav de desktop y el menu "Más"
 // de mobile leen exactamente de aqui, nunca duplicada.
 const ALL_TABS = [
@@ -212,6 +288,96 @@ function MobileBottomNav({ tab, onNavigate, onOpenSmartImport, moreOpen, onToggl
   );
 }
 
+// Sprint P4.2. Banner discreto para el flujo "hay una version nueva".
+// Nunca recarga solo -- el click llama a
+// window.__moniApplyServiceWorkerUpdate(), que dispara SKIP_WAITING en
+// el service worker en espera; el reload real ocurre en el listener
+// "controllerchange" de src/main.jsx, una unica vez.
+function SwUpdateBanner({ onUpdate }) {
+  return (
+    <div
+      className="mc-touch-target"
+      style={{
+        position: "sticky", top: 0, zIndex: 50, background: GOLD, color: NAVY_BG,
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+        padding: "8px 12px", fontSize: 13, fontWeight: 700,
+      }}
+    >
+      Hay una nueva versión de Moni Capital
+      <button
+        onClick={onUpdate}
+        className="mc-touch-target"
+        style={{ background: NAVY_BG, color: GOLD, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+      >
+        Actualizar
+      </button>
+    </div>
+  );
+}
+
+// Sprint P4.2. CTA de instalacion discreto. Android/Chrome: usa el
+// beforeinstallprompt real capturado por useInstallPrompt(). iOS
+// Safari: nunca dispara ese evento, asi que se muestra una ayuda manual
+// (Compartir -> Agregar a inicio) en su lugar -- nunca un boton
+// disfrazado de instalable que no hace nada. Se puede descartar; una
+// vez descartado, no vuelve a aparecer en esta sesion de navegador
+// (localStorage), nunca de forma agresiva/repetida.
+function InstallCTA({ deferredPrompt }) {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem("moni_install_cta_dismissed") === "1"; } catch { return false; }
+  });
+  const [showIosHelp, setShowIosHelp] = useState(false);
+  if (dismissed || isStandaloneDisplay()) return null;
+  const showAndroid = !!deferredPrompt;
+  const showIos = !showAndroid && isIosSafari();
+  if (!showAndroid && !showIos) return null;
+
+  function dismiss() {
+    setDismissed(true);
+    try { localStorage.setItem("moni_install_cta_dismissed", "1"); } catch { /* ok si no hay storage */ }
+  }
+
+  return (
+    <div style={{
+      position: "sticky", bottom: "var(--mc-bottom-nav-height, 0px)", zIndex: 30,
+      margin: 10, padding: "10px 14px", borderRadius: 12, background: PANEL,
+      border: `1px solid ${LINE}`, display: "flex", alignItems: "center", gap: 10,
+    }}>
+      <span style={{ fontSize: 13, color: TXT, flex: 1 }}>
+        {showIos
+          ? (showIosHelp ? "Compartir → Agregar a pantalla de inicio" : "Instalá Moni Capital en tu iPhone")
+          : "Instalá Moni Capital en tu celular"}
+      </span>
+      {showAndroid && (
+        <button
+          className="mc-touch-target"
+          onClick={async () => { deferredPrompt.prompt(); await deferredPrompt.userChoice; dismiss(); }}
+          style={{ background: GOLD, color: NAVY_BG, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+        >
+          Instalar
+        </button>
+      )}
+      {showIos && !showIosHelp && (
+        <button
+          className="mc-touch-target"
+          onClick={() => setShowIosHelp(true)}
+          style={{ background: GOLD, color: NAVY_BG, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+        >
+          Cómo
+        </button>
+      )}
+      <button
+        className="mc-touch-target"
+        onClick={dismiss}
+        aria-label="Cerrar"
+        style={{ background: "none", color: MUTE, border: "none", fontSize: 18, cursor: "pointer", padding: "0 4px" }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [positions, setPositions] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
@@ -245,6 +411,12 @@ export default function Dashboard() {
   const [showAdd, setShowAdd] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false); // Sprint P4.1: menu "Mas" del bottom nav mobile
   const [showSmartImport, setShowSmartImport] = useState(false);
+  // Sprint P4.2 (PWA Foundation): conectividad, update de service worker
+  // e install prompt -- ninguno de los 3 decide ni toca un valor
+  // financiero, solo UI/estado del navegador.
+  const isOnline = useOnlineStatus();
+  const swUpdateAvailable = useSwUpdateAvailable();
+  const installPrompt = useInstallPrompt();
 
   // ================== Sprint P0.1 -- Reliable Data Loading ==================
   // Principio: LAST KNOWN GOOD DATA > EMPTY DATA CAUSED BY NETWORK
@@ -545,6 +717,9 @@ export default function Dashboard() {
 
   return (
     <div style={{ background: NAVY_BG, minHeight: "100vh", color: TXT, fontFamily: "'IBM Plex Sans','Inter',sans-serif" }}>
+      {swUpdateAvailable && (
+        <SwUpdateBanner onUpdate={() => window.__moniApplyServiceWorkerUpdate?.()} />
+      )}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
         .num { font-family: 'IBM Plex Mono', monospace; }
@@ -588,7 +763,9 @@ export default function Dashboard() {
 
         {loadError && (
           <Banner color={RED} icon={AlertTriangle}>
-            No se pudo cargar el portafolio: {loadError}.
+            {isOnline
+              ? <>No se pudo cargar el portafolio: {loadError}.</>
+              : <>Sin conexión a internet — no se pudo cargar el portafolio. Los datos financieros requieren conexión, nunca se muestran inventados.</>}
           </Banner>
         )}
         {missing.length > 0 && !loadError && (
@@ -901,6 +1078,10 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      <div className="mc-mobile-only">
+        <InstallCTA deferredPrompt={installPrompt} />
+      </div>
 
       <MobileBottomNav
         tab={tab}
