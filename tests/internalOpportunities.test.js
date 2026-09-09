@@ -199,6 +199,10 @@ test("P - QCOM golden case: conviction engine 4.0, peso 0.228% -> HIGH_CONVICTIO
   });
   assert.equal(mismatch.direction, "HIGH_CONVICTION_LOW_WEIGHT");
   assert.equal(mismatch.strength, "HIGH", "0.228% esta muy por debajo de 0.5 -- strength HIGH");
+  // Calibracion C+E: QCOM es engine-sourced (engine_proposed_pending_review)
+  // -- debe seguir REVIEW_REQUIRED, nunca degradarse a INFORMATIONAL.
+  assert.equal(mismatch.classification, "REVIEW_REQUIRED");
+  assert.equal(mismatch.review_required, true);
 
   const divergence = computeManualVsEngineDivergence({
     ticker: "QCOM", manualConviction: 4, engineValue: resolved.value, engineSource: resolved.source,
@@ -278,4 +282,129 @@ test("constants - umbrales expuestos coinciden con los aprobados", () => {
   assert.equal(CONCENTRATION_THRESHOLDS.TOP5_HIGH_PCT, 60);
   assert.equal(CONCENTRATION_THRESHOLDS.TOP10_HIGH_PCT, 80);
   assert.equal(DIVERGENCE_THRESHOLD, 1.0);
+});
+
+// ================== CALIBRATION C+E (Internal Opportunities Calibration) ==================
+// Auditoria real (sprint anterior): HIGH_CONVICTION_LOW_WEIGHT disparaba
+// en 21/39 posiciones (54%) -- demasiado ancho para ser accionable, casi
+// todo dominado por convicciones manuales nunca revisadas por el engine.
+// Los thresholds (1.5%/8.0%) NO cambian -- se aprobo condicionar
+// review_required/classification a la calidad de la evidencia detras
+// del numero (conviction_source), nunca descartar el caso.
+
+test("CAL-1 - manual_thesis_unreviewed + HIGH_CONVICTION_LOW_WEIGHT -> classification INFORMATIONAL, review_required=false", () => {
+  const s = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  });
+  assert.equal(s.direction, "HIGH_CONVICTION_LOW_WEIGHT");
+  assert.equal(s.classification, "INFORMATIONAL");
+  assert.equal(s.review_required, false, "REGRESION: una señal INFORMATIONAL nunca debe quedar review_required=true");
+});
+
+test("CAL-2 - engine_proposed_pending_review + HIGH_CONVICTION_LOW_WEIGHT -> classification REVIEW_REQUIRED", () => {
+  const s = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "engine_proposed_pending_review", weightPct: 0.6, evidenceRefs: [],
+  });
+  assert.equal(s.classification, "REVIEW_REQUIRED");
+  assert.equal(s.review_required, true);
+});
+
+test("CAL-3 - engine_accepted + HIGH_CONVICTION_LOW_WEIGHT -> classification REVIEW_REQUIRED", () => {
+  const s = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4.5, convictionSource: "engine_accepted", weightPct: 0.3, evidenceRefs: [],
+  });
+  assert.equal(s.classification, "REVIEW_REQUIRED");
+  assert.equal(s.review_required, true);
+});
+
+test("CAL-4 - una señal INFORMATIONAL en solitario NUNCA eleva overall_review_priority por encima de LOW", () => {
+  const informational = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  });
+  assert.equal(deriveOverallReviewPriority([informational]), "LOW", "REGRESION: INFORMATIONAL no debe participar en overall_review_priority");
+});
+
+test("CAL-4b - 20 señales INFORMATIONAL juntas SIGUEN sin elevar prioridad (nunca cuentan, sin importar cuantas)", () => {
+  const many = Array.from({ length: 20 }, (_, i) => computeConvictionWeightMismatch({
+    ticker: `X${i}`, convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  }));
+  assert.equal(deriveOverallReviewPriority(many), "LOW");
+});
+
+test("CAL-5 - MANUAL_VS_ENGINE_DIVERGENCE sigue elevando a HIGH aunque coexista con un mismatch INFORMATIONAL", () => {
+  const informational = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  });
+  const divergence = computeManualVsEngineDivergence({
+    ticker: "X", manualConviction: 5, engineValue: 3.5, engineSource: "engine_proposed_pending_review",
+    engineDeterministicStatus: "SCORED", engineConfidence: 80, engineCoverage: 0.5, evidenceRefs: [],
+  });
+  assert.equal(deriveOverallReviewPriority([informational, divergence]), "HIGH");
+});
+
+test("CAL-6 - VALUATION_SIGNAL no cambio (regresion) -- sigue KNOWN/UNKNOWN, sin classification/review_required nuevo", () => {
+  const known = computeValuationSignal({
+    ticker: "QCOM", valuationComponent: { value: 4, method: "peg_like_current_pe_over_observed_revenue_growth", peg_proxy: 1.4 },
+    overallConfidence: 83, coverage: 0.524, evidenceRefs: [],
+  });
+  assert.equal(known.status, "KNOWN");
+  assert.equal(known.review_required, false);
+  assert.equal(Object.keys(known).includes("classification"), false, "VALUATION_SIGNAL no participa de la calibracion C+E, queda sin cambios");
+});
+
+test("CAL-7 - ninguna explanation de señal INFORMATIONAL contiene BUY/SELL/comprar/vender", () => {
+  const forbidden = /\b(buy|sell|comprar|vender)\b/i;
+  const s = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  });
+  assert.equal(forbidden.test(s.explanation), false);
+  assert.ok(["REVIEW_SIZING", "REVIEW_CONVICTION", null].includes(s.recommendation));
+});
+
+test("CAL-8 - ningun campo 'score'/'opportunity_score' se agrego con la calibracion (classification es un enum, no un numero)", () => {
+  const s = computeConvictionWeightMismatch({
+    ticker: "X", convictionValue: 4, convictionSource: "manual_thesis_unreviewed", weightPct: 0.6, evidenceRefs: [],
+  });
+  assert.equal(Object.keys(s).includes("score"), false);
+  assert.equal(typeof s.classification, "string");
+});
+
+// ================== CAL-9: QCOM golden case (post-calibracion) ==================
+test("CAL-9 - QCOM golden case: sigue engine-sourced, classification=REVIEW_REQUIRED, review_required=true, overall_review_priority=MEDIUM", () => {
+  const resolved = resolveConvictionValue({ acceptedConviction: null, proposedConviction: 4.0, deterministicStatus: "SCORED", manualConviction: 4 });
+  const mismatch = computeConvictionWeightMismatch({
+    ticker: "QCOM", convictionValue: resolved.value, convictionSource: resolved.source, weightPct: 0.228, evidenceRefs: [],
+  });
+  assert.equal(mismatch.classification, "REVIEW_REQUIRED");
+  assert.equal(mismatch.review_required, true);
+  const ticker = buildTickerOpportunity({
+    ticker: "QCOM", signals: [mismatch],
+    dataCoverage: computeDataCoverage({ convictionKnown: true, weightKnown: true, valuationKnown: true }),
+  });
+  assert.equal(ticker.overall_review_priority, "MEDIUM", "1 sola señal REVIEW_REQUIRED, sin divergence ni LOW_CONVICTION_HIGH_WEIGHT -> MEDIUM, sin cambio respecto a antes de la calibracion");
+});
+
+// ================== CAL-10: golden case manual real (AAOI) ==================
+// AAOI real: thesis.conviction=4 (manual, nunca paso por conviction_history
+// -- conviction_history no tiene ninguna fila para AAOI), portfolio_weight_pct=0.624%
+// real (SQL directo, sprint Internal Opportunities V1). Antes de esta
+// calibracion, disparaba HIGH_CONVICTION_LOW_WEIGHT con review_required=true
+// como cualquier otro -- uno de los 21/39 que infló el ruido accionable.
+test("CAL-10 - AAOI golden case (manual_thesis_unreviewed real, conviction=4, weight=0.624%): INFORMATIONAL, no eleva prioridad", () => {
+  const resolved = resolveConvictionValue({ acceptedConviction: null, proposedConviction: null, deterministicStatus: null, manualConviction: 4 });
+  assert.deepEqual(resolved, { value: 4, source: "manual_thesis_unreviewed" });
+
+  const mismatch = computeConvictionWeightMismatch({
+    ticker: "AAOI", convictionValue: resolved.value, convictionSource: resolved.source, weightPct: 0.624, evidenceRefs: [],
+  });
+  assert.equal(mismatch.direction, "HIGH_CONVICTION_LOW_WEIGHT");
+  assert.equal(mismatch.classification, "INFORMATIONAL");
+  assert.equal(mismatch.review_required, false);
+
+  const ticker = buildTickerOpportunity({
+    ticker: "AAOI", signals: [mismatch],
+    dataCoverage: computeDataCoverage({ convictionKnown: true, weightKnown: true, valuationKnown: false }),
+  });
+  assert.equal(ticker.overall_review_priority, "LOW", "REGRESION: antes de la calibracion esto hubiera sido MEDIUM -- ahora INFORMATIONAL no cuenta");
+  assert.equal(ticker.signals.length, 1, "la señal sigue calculandose y mostrandose, nunca se descarta");
 });
