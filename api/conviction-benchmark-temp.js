@@ -34,7 +34,7 @@ import { extractDimensionsFromThesis } from "../lib/thesisDimensions.js";
 import {
   computeOverallConviction, computeConvictionConfidence, applyComponentDeltas,
 } from "../lib/convictionEngine.js";
-import { classifyReviewRequirement } from "../lib/convictionReview.js";
+import { classifyReviewRequirement, shouldCreateReviewDecision } from "../lib/convictionReview.js";
 import { requestThesisImpact, AI_NOT_ATTEMPTED, shouldInsertNeutralMarker } from "../lib/thesisImpactAi.js";
 import { callModel } from "../lib/aiGateway.js";
 import { tierScore } from "../lib/materialEventSources.js";
@@ -430,8 +430,22 @@ export default async function handler(req, res) {
       else if (!evidenceSufficiency.sufficient) recommendationStatus = "INSUFFICIENT_EVIDENCE_FOR_CHANGE";
       else recommendationStatus = "PROPOSED_CHANGE";
 
+      // Bugfix real (encontrado en la corrida en vivo de P3.2.1): esta
+      // condicion originalmente exigia events.length>0 -- asumia que
+      // solo un evento nuevo podia disparar una revision. Con
+      // fundamentales deterministicos (items 1-9), una corrida sin
+      // eventos nuevos puede producir un delta real y justificado
+      // (p.ej. QCOM 3->4 solo por evidencia fundamental, coverage 52%,
+      // confidence 83%) que requires_user_review=true y
+      // recommendation_status=PROPOSED_CHANGE ya marcan como legitimo --
+      // exigir eventos nuevos ademas de eso enmascaraba silenciosamente
+      // una recomendacion real (decision_id quedaba null pese a
+      // ameritar revision). El trigger correcto es "hay evidencia nueva
+      // de cualquier tipo" (evento interpretado O fundamental aplicado),
+      // no "hubo un evento".
+      const hasNewEvidenceThisRun = events.length > 0 || fundamentalsApplied.length > 0;
       let decisionId = null;
-      if (events.length > 0 && review.requires_user_review && recommendationStatus === "PROPOSED_CHANGE") {
+      if (shouldCreateReviewDecision({ hasNewEvidenceThisRun, requiresUserReview: review.requires_user_review, recommendationStatus })) {
         const title = `Revisión de convicción: ${ticker} ${previousConviction ?? "?"} → ${overall.proposed_conviction}`;
         const { data: openDecisions } = await supabase.from("decisions").select("id, title").eq("status", "abierta").eq("type", "conviction_review").eq("ticker", ticker);
         const alreadyOpen = (openDecisions || []).find((d) => d.title === title);
