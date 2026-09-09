@@ -12,6 +12,12 @@ import {
   solveDeltaForEarlierMonths, monthsBetweenDates, addMonthsToToday,
   computeMilestones, computeRebalanceDeviations, computeSystemHealth,
 } from "../lib/financialMath.js";
+import {
+  sbSelectAll, fetchMarketDataBatch, fetchFuturesEquity, fetchMarketPulse,
+} from "../lib/dataFetchers.js";
+import {
+  initialSourceMeta, resolveAllSourceMeta, isCriticalInitialFailure, isCurrentRequest,
+} from "../lib/dataSourceState.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -38,36 +44,18 @@ const fmtBig = (v) => {
   return fmt$2(v);
 };
 
-async function sb(table) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=*`, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
-  });
-  if (!res.ok) throw new Error(`No se pudo leer ${table} de Supabase`);
-  return res.json();
-}
-
-async function fetchMarketData(items) {
-  if (!items.length) return { data: {}, errors: [], updatedAt: null };
-  const res = await fetch("/api/market-data", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items }),
-  });
-  if (!res.ok) throw new Error("No se pudieron obtener datos de mercado");
-  return res.json();
-}
-
-// READ-ONLY: estado actual (solo latest snapshot confirmado por cuenta/
-// posicion) de Binance Futures, ya valuado a USD. Nunca escribe nada.
-async function fetchFuturesEquity() {
-  try {
-    const res = await fetch("/api/futures-equity");
-    if (!res.ok) return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
-    return res.json();
-  } catch {
-    return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
-  }
-}
+// Sprint P0.1 (Reliable Data Loading): sb()/fetchMarketData() delegan en
+// lib/dataFetchers.js -- fetchFuturesEquity/fetchMarketPulse se importan
+// directo (mismo nombre, sin alias). La unica diferencia de
+// comportamiento real es que NINGUNO de los 4 se traga un fallo en
+// silencio: todos propagan el error como rejection. Antes,
+// fetchFuturesEquity() atrapaba cualquier fallo y devolvia
+// {total_value_usd: 0, ...} -- indistinguible de una cuenta que
+// realmente vale $0. loadAll() (mas abajo) es quien decide, con
+// lib/dataSourceState.js, conservar el ultimo dato valido conocido en
+// vez de aceptar ese resultado.
+const sb = (table) => sbSelectAll(SUPABASE_URL, SUPABASE_ANON_KEY, table);
+const fetchMarketData = fetchMarketDataBatch;
 
 async function searchAssets(q) {
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
@@ -145,12 +133,6 @@ const TOOL_LABELS = {
   get_decision_queue: "Decision Queue",
 };
 
-async function fetchMarketPulse() {
-  const res = await fetch("/api/market-pulse");
-  if (!res.ok) return null;
-  return res.json();
-}
-
 // Opportunity Score, simulacion de metas, salud del sistema, etc. --
 // TODAS estas formulas viven en lib/financialMath.js, importadas abajo.
 // Es la MISMA libreria que usan las tools de Moni AI (revision critica
@@ -192,59 +174,129 @@ export default function Dashboard() {
   const [showAdd, setShowAdd] = useState(false);
   const [showSmartImport, setShowSmartImport] = useState(false);
 
+  // ================== Sprint P0.1 -- Reliable Data Loading ==================
+  // Principio: LAST KNOWN GOOD DATA > EMPTY DATA CAUSED BY NETWORK
+  // FAILURE. Un fallo transitorio de red durante un refresh NUNCA debe
+  // reemplazar datos validos ya en pantalla por [] / 0 / null.
+  //
+  // sourceMeta: estado de frescura por fuente (ver lib/dataSourceState.js
+  // -- NEVER_LOADED/OK/STALE/ERROR). Los refs mirror (sourceMetaRef,
+  // positionsRef, watchlistRef) existen porque loadAll() vive dentro de
+  // un setInterval creado una sola vez en el mount (useEffect con deps
+  // []) -- leer el STATE directo ahi adentro devolveria siempre el valor
+  // del primer render (closure obsoleta). Los .current de un ref, en
+  // cambio, siempre reflejan el ultimo valor real, sin ese problema.
+  const DATA_SOURCE_NAMES = ["positions", "watchlist", "thesis", "snapshots", "cash_movements", "transactions", "goals", "journal_entries", "decisions", "rebalance_targets", "ai_insights", "accounts", "marketPulse", "marketData", "futuresEquity"];
+  const [sourceMeta, setSourceMeta] = useState(() => {
+    const m = {};
+    DATA_SOURCE_NAMES.forEach((n) => { m[n] = initialSourceMeta(); });
+    return m;
+  });
+  const sourceMetaRef = useRef(sourceMeta);
+  useEffect(() => { sourceMetaRef.current = sourceMeta; }, [sourceMeta]);
+  const positionsRef = useRef(positions);
+  useEffect(() => { positionsRef.current = positions; }, [positions]);
+  const watchlistRef = useRef(watchlist);
+  useEffect(() => { watchlistRef.current = watchlist; }, [watchlist]);
+  // Guard de concurrencia (lib/dataSourceState.js::isCurrentRequest):
+  // contador monotonico, no AbortController -- loadAll() dispara ~15
+  // requests en paralelo, y lo unico que importa es que la request MAS
+  // RECIENTE EN INICIAR sea la unica que puede commitear estado. Si una
+  // mas nueva ya arranco (refresh manual mientras el polling de 60s
+  // seguia esperando, o viceversa), la vieja se descarta ENTERA en
+  // cuanto se detecta -- nunca mezcla resultados de dos ciclos distintos
+  // ni deja que una respuesta vieja sobrescriba estado mas nuevo.
+  const latestRequestIdRef = useRef(0);
+
   async function loadAll() {
+    const myRequestId = ++latestRequestIdRef.current;
     setLoading(true);
-    setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData, insightsData, accountsData] = await Promise.all([
-        sb("positions"),
-        sb("watchlist").catch(() => []),
-        sb("thesis").catch(() => []),
-        sb("snapshots").catch(() => []),
-        sb("cash_movements").catch(() => []),
-        sb("transactions").catch(() => []),
-        sb("goals").catch(() => []),
-        sb("journal_entries").catch(() => []),
-        sb("decisions").catch(() => []),
-        sb("rebalance_targets").catch(() => []),
-        sb("ai_insights").catch(() => []),
-        sb("accounts").catch(() => []),
+      // Promise.allSettled, nunca Promise.all: un fallo de UNA fuente no
+      // puede impedir que las demas se procesen.
+      const settled1 = await Promise.allSettled([
+        sb("positions"), sb("watchlist"), sb("thesis"), sb("snapshots"),
+        sb("cash_movements"), sb("transactions"), sb("goals"), sb("journal_entries"),
+        sb("decisions"), sb("rebalance_targets"), sb("ai_insights"), sb("accounts"),
       ]);
-      setPositions(pos);
-      setWatchlist(wl);
-      setThesis(th);
-      setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
-      setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setGoals(goalsData || []);
-      setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setDecisions(decisionsData || []);
-      setRebalanceTargets(rebalanceData || []);
-      setAiInsights([...(insightsData || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
-      setAccounts(accountsData || []);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada por un refresh mas nuevo
 
-      fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
+      const [posR, wlR, thR, snapsR, cmR, txR, goalsR, journalR, decisionsR, rebalanceR, insightsR, accountsR] = settled1;
 
+      // Solo se llama al setter cuando la fuente tuvo exito -- NO
+      // llamarlo en el caso "rejected" YA preserva el ultimo valor
+      // valido, sin logica adicional.
+      if (posR.status === "fulfilled") setPositions(posR.value);
+      if (wlR.status === "fulfilled") setWatchlist(wlR.value);
+      if (thR.status === "fulfilled") setThesis(thR.value);
+      if (snapsR.status === "fulfilled") setSnapshots([...snapsR.value].sort((a, b) => (a.date < b.date ? -1 : 1)));
+      if (cmR.status === "fulfilled") setCashMovements([...cmR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (txR.status === "fulfilled") setTransactions([...txR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (goalsR.status === "fulfilled") setGoals(goalsR.value || []);
+      if (journalR.status === "fulfilled") setJournalEntries([...journalR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (decisionsR.status === "fulfilled") setDecisions(decisionsR.value || []);
+      if (rebalanceR.status === "fulfilled") setRebalanceTargets(rebalanceR.value || []);
+      if (insightsR.status === "fulfilled") setAiInsights([...(insightsR.value || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
+      if (accountsR.status === "fulfilled") setAccounts(accountsR.value || []);
+
+      const now1 = new Date().toISOString();
+      const resultsMap1 = {};
+      ["positions", "watchlist", "thesis", "snapshots", "cash_movements", "transactions", "goals", "journal_entries", "decisions", "rebalance_targets", "ai_insights", "accounts"]
+        .forEach((n, i) => { resultsMap1[n] = settled1[i]; });
+      const meta1 = resolveAllSourceMeta(sourceMetaRef.current, resultsMap1, now1);
+      setSourceMeta((prev) => ({ ...prev, ...meta1 }));
+
+      // Unico caso de error bloqueante real: positions nunca tuvo datos
+      // validos Y este intento tambien fallo. Cualquier otro fallo se
+      // resuelve en silencio conservando el ultimo valor bueno (marcado
+      // STALE en sourceMeta, nunca mostrado como si fuera un error fatal).
+      setLoadError(
+        isCriticalInitialFailure(meta1.positions)
+          ? String(posR.reason?.message || posR.reason || "No se pudo cargar el portafolio")
+          : null
+      );
+
+      // items para precios de mercado: si positions/watchlist fallaron
+      // en ESTE intento, se usa el ultimo valor conocido (via ref) en
+      // vez de dejar de pedir precios por completo.
+      const positionsForItems = posR.status === "fulfilled" ? posR.value : positionsRef.current;
+      const watchlistForItems = wlR.status === "fulfilled" ? wlR.value : watchlistRef.current;
       const items = [];
       const seen = new Set();
-      [...pos.filter((p) => p.type !== "cash"), ...wl].forEach((p) => {
+      [...positionsForItems.filter((p) => p.type !== "cash"), ...watchlistForItems].forEach((p) => {
         const key = `${p.ticker}-${p.type}`;
         if (seen.has(key)) return;
         seen.add(key);
         items.push({ ticker: p.ticker, type: p.type, coingeckoId: p.coingecko_id || undefined });
       });
 
-      const { data, errors, updatedAt: ts } = await fetchMarketData(items);
-      setMarketData(data);
-      setMarketErrors(errors || []);
-      setUpdatedAt(ts);
+      // market-pulse / market-data / futures-equity: independientes
+      // entre si (Promise.allSettled) -- antes, un fallo de market-data
+      // (que va con `await` directo) impedia que futures-equity se
+      // intentara siquiera, porque saltaba al catch general.
+      const [pulseR, marketR, futuresR] = await Promise.allSettled([
+        fetchMarketPulse(),
+        fetchMarketData(items),
+        fetchFuturesEquity(),
+      ]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada mientras esperabamos estos 3
 
-      // Futures: read-only, nunca bloquea la carga principal si falla.
-      fetchFuturesEquity().then(setFuturesEquity).catch(() => {});
-    } catch (e) {
-      setLoadError(String(e.message || e));
+      if (pulseR.status === "fulfilled") setMarketPulse(pulseR.value);
+      if (marketR.status === "fulfilled") {
+        setMarketData(marketR.value.data);
+        setMarketErrors(marketR.value.errors || []);
+        setUpdatedAt(marketR.value.updatedAt);
+      }
+      // Futures Equity: NUNCA se llama al setter en el caso "rejected"
+      // -- el ultimo valor valido permanece en pantalla, marcado STALE
+      // via sourceMeta, en vez de convertirse silenciosamente en $0.
+      if (futuresR.status === "fulfilled") setFuturesEquity(futuresR.value);
+
+      const now2 = new Date().toISOString();
+      const meta2 = resolveAllSourceMeta(sourceMetaRef.current, { marketPulse: pulseR, marketData: marketR, futuresEquity: futuresR }, now2);
+      setSourceMeta((prev) => ({ ...prev, ...meta2 }));
     } finally {
-      setLoading(false);
+      if (isCurrentRequest(myRequestId, latestRequestIdRef.current)) setLoading(false);
     }
   }
 
