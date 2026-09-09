@@ -47,6 +47,15 @@ import {
   computeBusinessQuality, computeObservedGrowth, computeExecutionFromEarnings,
   computeFinancialStrength, computeValuationFromPeg, classifyEvidenceSufficiency,
 } from "../lib/fundamentalConviction.js";
+// Sprint Internal Opportunities V1. CERO reimplementacion de pesos --
+// enrichPositions/computePortfolioWeights/computeConcentration son
+// EXACTAMENTE las mismas funciones puras que usa src/App.jsx.
+import { enrichPositions, computePortfolioWeights, computeConcentration } from "../lib/financialSnapshot.js";
+import {
+  resolveConvictionValue, computeConvictionWeightMismatch, computeManualVsEngineDivergence,
+  computeConcentrationSignals, computeValuationSignal, computeDataCoverage, buildTickerOpportunity,
+  INTERNAL_OPPORTUNITIES_POLICY_VERSION, CONVICTION_WEIGHT_THRESHOLDS, CONCENTRATION_THRESHOLDS, DIVERGENCE_THRESHOLD,
+} from "../lib/internalOpportunities.js";
 
 // SEC EDGAR (10-K/10-Q) y el snapshot de mercado en market_cache son
 // evidencia real de mayor jerarquia posible (filing regulatorio /
@@ -245,12 +254,140 @@ function buildImpactPrompt(event, dimensions) {
   ].join("\n");
 }
 
+// Sprint Internal Opportunities V1: modo READ-ONLY, sin escritura
+// alguna (ni decisions, ni conviction_history, ni ninguna tabla) --
+// solo lee positions/thesis/market_cache/conviction_history reales y
+// aplica las funciones puras de lib/internalOpportunities.js. Universo:
+// las mismas 39 posiciones reales (TRADITIONAL_TYPES vía
+// computePortfolioWeights, exactamente igual que el dashboard real).
+async function runInternalOpportunitiesV1(req, res) {
+  const [{ data: positions, error: posErr }, { data: thesisRows, error: thErr }] = await Promise.all([
+    supabase.from("positions").select("*"),
+    supabase.from("thesis").select("asset_id, ticker, conviction"),
+  ]);
+  if (posErr) throw posErr;
+  if (thErr) throw thErr;
+
+  const tickers = [...new Set((positions || []).filter((p) => p.type !== "cash").map((p) => p.ticker))];
+  const { data: cacheRows, error: cacheErr } = await supabase
+    .from("market_cache").select("ticker, ai_price").in("ticker", tickers);
+  if (cacheErr) throw cacheErr;
+
+  // marketData: MISMA forma que consume enrichPositions() en produccion
+  // ({ticker: {price}}) -- se lee de market_cache tal cual esta hoy,
+  // CERO llamada en vivo a Finnhub/CoinGecko (nunca toca Price Truth).
+  const marketData = {};
+  (cacheRows || []).forEach((r) => { if (r.ai_price != null) marketData[r.ticker] = { price: Number(r.ai_price) }; });
+
+  const thesisByTicker = {};
+  (thesisRows || []).forEach((t) => { thesisByTicker[t.ticker] = t; });
+
+  const enriched = enrichPositions(positions, marketData, thesisByTicker);
+  const weightsResult = computePortfolioWeights(enriched);
+  const concentration = computeConcentration(weightsResult);
+  const concentrationSignals = computeConcentrationSignals(concentration);
+
+  const weightByTicker = {};
+  (weightsResult.weights || []).forEach((w) => { weightByTicker[w.ticker] = w.portfolio_weight_pct; });
+
+  const opportunities = [];
+  for (const ticker of tickers) {
+    const position = (positions || []).find((p) => p.ticker === ticker);
+    if (!position) continue;
+    const thesisRow = thesisByTicker[ticker] || null;
+    const latestHistory = await fetchLatestConvictionHistory(position.asset_id);
+
+    const resolved = resolveConvictionValue({
+      acceptedConviction: latestHistory?.accepted_conviction != null ? Number(latestHistory.accepted_conviction) : null,
+      proposedConviction: latestHistory?.proposed_conviction != null ? Number(latestHistory.proposed_conviction) : null,
+      deterministicStatus: latestHistory?.deterministic_status ?? null,
+      manualConviction: thesisRow?.conviction != null ? Number(thesisRow.conviction) : null,
+    });
+    const convictionEvidenceRefs = latestHistory
+      ? [{ conviction_history_id: latestHistory.id, ticker }]
+      : [{ thesis_asset_id: position.asset_id, ticker }];
+
+    const weightPct = weightByTicker[ticker] ?? null;
+
+    const signalA = computeConvictionWeightMismatch({
+      ticker, convictionValue: resolved.value, convictionSource: resolved.source,
+      weightPct, evidenceRefs: convictionEvidenceRefs,
+    });
+
+    const signalDivergence = computeManualVsEngineDivergence({
+      ticker,
+      manualConviction: thesisRow?.conviction != null ? Number(thesisRow.conviction) : null,
+      engineValue: resolved.value, engineSource: resolved.source,
+      engineDeterministicStatus: latestHistory?.deterministic_status ?? null,
+      engineConfidence: latestHistory?.overall_confidence ?? null,
+      engineCoverage: latestHistory?.coverage != null ? Number(latestHistory.coverage) : null,
+      evidenceRefs: convictionEvidenceRefs,
+    });
+
+    const valuationComponent = latestHistory?.component_scores?.VALUATION ?? null;
+    const signalValuation = computeValuationSignal({
+      ticker, valuationComponent,
+      overallConfidence: latestHistory?.overall_confidence ?? null,
+      coverage: latestHistory?.coverage != null ? Number(latestHistory.coverage) : null,
+      evidenceRefs: latestHistory ? [{ conviction_history_id: latestHistory.id, ticker }] : [],
+    });
+
+    const concSignalsForTicker = concentrationSignals.signals_by_ticker[ticker] || [];
+
+    const dataCoverage = computeDataCoverage({
+      convictionKnown: resolved.value != null,
+      weightKnown: weightPct != null,
+      valuationKnown: signalValuation.status === "KNOWN",
+    });
+
+    opportunities.push(buildTickerOpportunity({
+      ticker,
+      signals: [signalA, signalDivergence, ...concSignalsForTicker, signalValuation],
+      dataCoverage,
+    }));
+  }
+
+  const counts = {
+    total_tickers: opportunities.length,
+    with_conviction_weight_mismatch: opportunities.filter((o) => o.signals.some((s) => s.signal_type === "CONVICTION_WEIGHT_MISMATCH")).length,
+    with_concentration_signal: opportunities.filter((o) => o.signals.some((s) => s.signal_type === "CONCENTRATION_SIGNAL")).length,
+    with_manual_vs_engine_divergence: opportunities.filter((o) => o.signals.some((s) => s.signal_type === "MANUAL_VS_ENGINE_DIVERGENCE")).length,
+    valuation_known: opportunities.filter((o) => o.signals.some((s) => s.signal_type === "VALUATION_SIGNAL" && s.status === "KNOWN")).length,
+    valuation_unknown: opportunities.filter((o) => o.signals.some((s) => s.signal_type === "VALUATION_SIGNAL" && s.status === "UNKNOWN")).length,
+    priority_distribution: {
+      HIGH: opportunities.filter((o) => o.overall_review_priority === "HIGH").length,
+      MEDIUM: opportunities.filter((o) => o.overall_review_priority === "MEDIUM").length,
+      LOW: opportunities.filter((o) => o.overall_review_priority === "LOW").length,
+    },
+    tickers_with_any_unknown: opportunities.filter((o) => o.unknowns.length > 0).length,
+  };
+
+  return res.status(200).json({
+    ok: true,
+    mode: "INTERNAL_OPPORTUNITIES_V1",
+    policy_version: INTERNAL_OPPORTUNITIES_POLICY_VERSION,
+    thresholds: { CONVICTION_WEIGHT_THRESHOLDS, CONCENTRATION_THRESHOLDS, DIVERGENCE_THRESHOLD },
+    concentration_status: concentrationSignals.status,
+    portfolio_weight_status: weightsResult.status,
+    counts,
+    opportunities,
+  });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
-  const { pin, migrate_tickers, score_tickers, ai_test, max_events } = req.query || {};
+  const { pin, migrate_tickers, score_tickers, ai_test, max_events, opportunities } = req.query || {};
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
+  }
+
+  if (opportunities === "true") {
+    try {
+      return await runInternalOpportunitiesV1(req, res);
+    } catch (err) {
+      return res.status(500).json({ error: "internal_opportunities_failed", detail: String(err.message || err) });
+    }
   }
 
   const migrateTickerList = migrate_tickers ? migrate_tickers.split(",").map((t) => t.trim().toUpperCase()).filter(Boolean) : [];
