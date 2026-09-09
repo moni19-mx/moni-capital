@@ -223,6 +223,24 @@ export default async function handler(req, res) {
           });
           if (eff.effect === "INVALIDATES") anyInvalidated = true;
         }
+        // Bugfix real (encontrado en la corrida en vivo): un evento que
+        // el AI evaluo con exito y encontro NEUTRAL (cero dimensiones
+        // afectadas -- el resultado correcto para ruido) nunca dejaba
+        // rastro aqui, asi que fetchUnprocessedEvents() lo reprocesaba
+        // (y re-facturaba al AI) en cada corrida siguiente. Se inserta
+        // SIEMPRE al menos una fila marcadora cuando el AI genuinamente
+        // corrio (APPLIED o NEUTRAL) -- dimension_id=null significa
+        // "evaluado contra toda la tesis, sin efecto en ninguna
+        // dimension", distinto de "nunca evaluado" (FAILED/NOT_ATTEMPTED
+        // nunca insertan marcador -- se reintentan en la proxima corrida).
+        if (effectRows.length === 0 && (aiResult.ai_status === "APPLIED" || aiResult.ai_status === "NEUTRAL")) {
+          effectRows.push({
+            material_event_id: event.id, dimension_id: null, asset_id: assetId,
+            effect: "NEUTRAL", confidence: null, evidence_refs: [{ material_event_id: event.id, headline: event.headline }],
+            explanation: "El AI evaluo el evento completo contra la tesis real y no encontro efecto en ninguna dimension.",
+            requires_review: false, engine_version: CONVICTION_ENGINE_VERSION,
+          });
+        }
         if (effectRows.length > 0) {
           const { error: effErr } = await supabase.from("thesis_dimension_effects").insert(effectRows);
           if (effErr) throw effErr;
