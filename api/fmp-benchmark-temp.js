@@ -387,17 +387,21 @@ async function runReconciliation(req, res) {
 
   const financialCommitAt = new Date().toISOString();
 
-  const stockBreakdown = enriched
-    .filter((p) => p.type === "stock")
-    .map((p) => ({
-      ticker: p.ticker,
-      shares: Number(p.shares),
-      price_used: p.market?.price ?? null,
-      price_status: p.value == null ? "MISSING" : (p.market?.price_status || "LIVE"),
-      price_source: p.market?.price_source ?? null,
-      price_fetched_at: p.market?.price_fetched_at ?? null,
-      market_value: p.value,
-    }))
+  const breakdownRow = (p) => ({
+    ticker: p.ticker,
+    shares: Number(p.shares),
+    price_used: p.market?.price ?? null,
+    price_status: p.value == null ? "MISSING" : (p.market?.price_status || "LIVE"),
+    price_source: p.market?.price_source ?? null,
+    price_fetched_at: p.market?.price_fetched_at ?? null,
+    market_value: p.value,
+  });
+  const stockBreakdown = enriched.filter((p) => p.type === "stock").map(breakdownRow)
+    .sort((a, b) => (b.market_value ?? -1) - (a.market_value ?? -1));
+  // Price Truth POST-review: item explicito del usuario -- traza tambien
+  // los tickers cripto (antes solo stock_breakdown existia, LINK/SOL/ETH
+  // eran invisibles en esta respuesta salvo dentro de crypto_value agregado).
+  const cryptoBreakdown = enriched.filter((p) => p.type === "crypto").map(breakdownRow)
     .sort((a, b) => (b.market_value ?? -1) - (a.market_value ?? -1));
 
   const missingStocks = enriched.filter((p) => p.type === "stock" && p.value == null).map((p) => p.ticker);
@@ -412,8 +416,20 @@ async function runReconciliation(req, res) {
     data_unavailable: perTicker.filter((r) => r.status === "DATA_UNAVAILABLE").length,
     total_requested: perTicker.length,
     provider_health: marketR.ok ? (marketR.json.provider_health || null) : null,
+    // Price Truth POST-review: estos dos campos existian en
+    // computeMarketDataDirect() desde 646adb7 pero nunca se habian
+    // conectado a la respuesta HTTP real -- el bug de diseño (breaker
+    // por proveedor) SI estaba corregido y corriendo, solo faltaba
+    // exponer la evidencia.
+    finnhub_status: marketR.ok ? (marketR.json.finnhub_status || null) : null,
+    coingecko_status: marketR.ok ? (marketR.json.coingecko_status || null) : null,
     cache_write_failures: perTicker.filter((r) => r.cacheWriteFailed).length,
   };
+  // Trace completo por ticker (item explicito del usuario, ver
+  // lib/marketDataOrchestrator.js) -- mismo `trace` que cada item de
+  // per_ticker ya trae, indexado por ticker para consulta directa.
+  const traceByTicker = {};
+  perTicker.forEach((r) => { if (r.trace) traceByTicker[r.ticker] = r.trace; });
 
   return res.status(200).json({
     ok: true,
@@ -446,6 +462,8 @@ async function runReconciliation(req, res) {
       missing_price_stocks: missingStocks,
     },
     stock_breakdown: stockBreakdown,
+    crypto_breakdown: cryptoBreakdown,
+    trace_by_ticker: traceByTicker,
   });
 }
 
