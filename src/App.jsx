@@ -20,6 +20,10 @@ import {
 // fuente de verdad, el preview de confirmacion nunca puede mostrar algo
 // distinto de lo que el backend realmente va a decidir.
 import { classifyBalanceForPersistence } from "../lib/futuresImportNormalize.js";
+// Sprint P1 (Universal Asset Detail): resolver canonico y PURO de
+// identidad de asset (ticker/type/name/coingeckoId) para openAsset() --
+// ver el archivo para la precedencia completa (A-D). Nunca adivina type.
+import { resolveAssetIdentity } from "../lib/assetResolver.js";
 import {
   initialSourceMeta, resolveAllSourceMeta, isCriticalInitialFailure, isCurrentRequest,
 } from "../lib/dataSourceState.js";
@@ -458,7 +462,11 @@ export default function Dashboard() {
   const [tab, setTab] = useState("resumen");
   const [assetDetail, setAssetDetail] = useState(null); // { ticker, type, name, coingeckoId } | null
 
-  function openAsset(meta) { setAssetDetail(meta); }
+  // Sprint P1 (Universal Asset Detail): TODA resolucion de identidad
+  // pasa por aqui, centralizada -- ningun call site de onOpenAsset
+  // necesita parchearse (ej. Decisions pasando solo {ticker}: se
+  // resuelve solo via positions/watchlist ya cargados, precedencia C).
+  function openAsset(meta) { setAssetDetail(resolveAssetIdentity({ callerMeta: meta, positions, watchlist })); }
   function closeAsset() { setAssetDetail(null); }
   const [showAdd, setShowAdd] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false); // Sprint P4.1: menu "Mas" del bottom nav mobile
@@ -1051,6 +1059,7 @@ export default function Dashboard() {
             netWorthWeightById={netWorthWeightById}
             portfolioWeightStatus={portfolioWeights.status}
             netWorthWeightStatus={netWorthWeights.status}
+            thesisByTicker={thesisByTicker}
             onBack={closeAsset}
             onSaved={loadAll}
             onOpenAsset={openAsset}
@@ -3936,7 +3945,7 @@ function WatchlistAddForm({ result, onDone }) {
 function AssetDetailScreen({
   meta, positions, watchlist, transactions, journalEntries, patrimonio,
   portfolioWeightById, netWorthWeightById, portfolioWeightStatus, netWorthWeightStatus,
-  onBack, onSaved, onOpenAsset,
+  thesisByTicker, onBack, onSaved, onOpenAsset,
 }) {
   const [market, setMarket] = useState(null);
   const [loadingMarket, setLoadingMarket] = useState(false);
@@ -3945,18 +3954,27 @@ function AssetDetailScreen({
 
   const position = positions.find((p) => p.ticker === meta.ticker);
   const watchlistItem = watchlist.find((w) => w.ticker === meta.ticker);
-  const thesis = position?.thesis || null;
+  // Sprint P1: tesis por TICKER, no por posesion -- un activo en
+  // watchlist o incluso totalmente externo (Discover/Decisions) puede
+  // tener tesis propia. position?.thesis se mantiene primero porque ya
+  // viene enriquecido (misma fuente, mismo objeto -- sin diferencia real,
+  // solo evita un lookup extra cuando existe posicion).
+  const thesis = position?.thesis || (thesisByTicker && thesisByTicker[meta.ticker]) || null;
 
   useEffect(() => {
     if (position?.market) { setMarket(position.market); return; }
     if (watchlistItem?.market) { setMarket(watchlistItem.market); return; }
+    // Sprint P1 (item G): type:null significa no resuelto -- jamas se
+    // pide market-data con type undefined, eso rompia el contrato del
+    // endpoint. Se queda sin cotizacion, la pantalla igual renderiza.
+    if (meta.type == null) { setMarket(null); return; }
     setLoadingMarket(true);
     fetchMarketData([{ ticker: meta.ticker, type: meta.type, coingeckoId: meta.coingeckoId }])
       .then(({ data }) => setMarket(data[meta.ticker] || null))
       .catch(() => setMarket(null))
       .finally(() => setLoadingMarket(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta.ticker]);
+  }, [meta.ticker, meta.type]);
 
   const ranking = useMemo(() => {
     const withValue = positions.filter((p) => p.value != null && p.type !== "cash");
@@ -4073,6 +4091,11 @@ function AssetDetailScreen({
             ) : (
               <div style={{ fontSize: 13, color: MUTE }}>No la tienes ni la vigilas todavía.</div>
             )}
+            {meta.type == null && (
+              <div style={{ fontSize: 12, color: AMBER, marginTop: 10 }}>
+                Tipo de activo pendiente de resolver — no se solicitó cotización de mercado para este ticker.
+              </div>
+            )}
             {!watchlistItem && !showWlForm && (
               <button onClick={() => setShowWlForm(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer", marginTop: 12 }}>
                 + Agregar a Watchlist
@@ -4100,26 +4123,36 @@ function AssetDetailScreen({
           </Panel>
         )}
 
-        {position && (
-          <Panel title="Investment Thesis">
-            {!showThesisEdit ? (
-              <>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
-                  <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
-                  <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
-                  <ThesisField label="Exit Thesis (criterio de salida)" value={thesis?.sell_trigger} />
-                  <ThesisField label="Horizonte" value={thesis?.horizon} />
-                  <ThesisField label="Riesgos" value={thesis?.risks} />
-                </div>
-                <button onClick={() => setShowThesisEdit(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>
-                  {thesis ? "Revisar tesis" : "Definir tesis"}
-                </button>
-              </>
-            ) : (
-              <ThesisEditForm ticker={meta.ticker} current={thesis} onDone={() => { setShowThesisEdit(false); onSaved(); }} />
-            )}
-          </Panel>
-        )}
+        {/* Sprint P1 (items 5/6): tesis es por TICKER, no por posesion --
+            ya no se gatea con `position &&`. Un activo en watchlist o
+            totalmente externo (Discover/Decisions) puede definir su
+            propia tesis; ThesisEditForm/manageThesis ya son ticker-scoped,
+            sin dependencia de asset_id ni de tener una posicion. */}
+        <Panel title="Investment Thesis">
+          {!showThesisEdit ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
+                <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
+                <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
+                <ThesisField label="Exit Thesis (criterio de salida)" value={thesis?.sell_trigger} />
+                <ThesisField label="Horizonte" value={thesis?.horizon} />
+                <ThesisField label="Riesgos" value={thesis?.risks} />
+              </div>
+              <button onClick={() => setShowThesisEdit(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>
+                {thesis ? "Revisar tesis" : "Definir tesis"}
+              </button>
+              {/* Sprint P1 (item 7): Analysis Freshness, deliberadamente
+                  separado de la frescura de PRECIO (esa vive en `market`/
+                  price_status, nunca se mezcla aqui) -- basado solo en
+                  thesis.updated_at. */}
+              <div style={{ fontSize: 10, color: MUTE, marginTop: 10 }}>
+                Frescura del análisis: {reviewDays != null ? `hace ${reviewDays} día${reviewDays === 1 ? "" : "s"}` : "sin tesis registrada"}
+              </div>
+            </>
+          ) : (
+            <ThesisEditForm ticker={meta.ticker} current={thesis} onDone={() => { setShowThesisEdit(false); onSaved(); }} />
+          )}
+        </Panel>
 
         {scoreData && (
           <Panel title="Opportunity Score">
