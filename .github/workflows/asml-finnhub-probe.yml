@@ -1,0 +1,46 @@
+name: ASML.AS Finnhub Provider Probe
+
+# Auditoria angosta, temporal, SOLO LECTURA -- "PROVIDER SYMBOL
+# RESOLUTION GAP -- ASML.AS". Ver scripts/asmlFinnhubProbe.mjs. NUNCA
+# escribe en Supabase, NUNCA toca product code, NUNCA loguea
+# FINNHUB_API_KEY. Corre en GitHub Actions por egress real (mismo motivo
+# que price-truth-probe.yml / conviction-coverage.yml).
+
+on:
+  workflow_dispatch: {}
+  # Bootstrap (mismo patron que los otros workflows de este repo):
+  # workflow_dispatch via API solo funciona para un workflow que YA
+  # existe en la default branch -- este archivo todavia vive solo en
+  # esta feature branch. "push" no tiene esa restriccion, asi que este
+  # trigger, acotado por paths a este mismo archivo, permite el primer
+  # run real sin esperar a mergear. Se puede quitar despues de mergear.
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/asml-finnhub-probe.yml'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run ASML.AS Finnhub Provider Probe
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: node scripts/asmlFinnhubProbe.mjs
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asml-finnhub-probe-results
+          path: asml-finnhub-probe.json
+          retention-days: 30
+          if-no-files-found: ignore
