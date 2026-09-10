@@ -1,0 +1,25 @@
+name: BE EPS Tag Audit
+
+# Sprint P2A -- auditoria puntual, SOLO LECTURA, temporal, de un solo
+# caso (BE). Ver scripts/beEpsTagAudit.mjs. SEC EDGAR es publico -- sin
+# secrets. NUNCA escribe en Supabase, NUNCA modifica CANDIDATE_TAGS.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/be-eps-tag-audit.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run BE EPS Tag Audit
+        run: node scripts/beEpsTagAudit.mjs
