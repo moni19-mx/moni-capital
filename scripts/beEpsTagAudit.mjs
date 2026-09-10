@@ -80,6 +80,33 @@ async function main() {
 
   console.log("[be-audit] === RESULT ===");
   console.log(JSON.stringify({ entityName, eps_like_tags: results, latest_filing_any_tag: latestFilingAnyTag }, null, 2));
+
+  // Companyfacts (arriba) muestra un punto 2025 real bajo
+  // EarningsPerShareDiluted -- pero el probe de cobertura original (que
+  // usa companyconcept, un endpoint SEC DISTINTO) resolvio esa misma
+  // empresa/tag a un valor de 2020 via el tag de fallback. Se
+  // reproduce el fetch EXACTO que hizo el probe original para ver si
+  // companyconcept genuinamente no trae el punto 2025 (discrepancia
+  // real entre superficies de API de SEC) o si fue una falla
+  // transitoria de red en esa corrida.
+  console.log("[be-audit] === REPRODUCING ORIGINAL companyconcept FETCH ===");
+  const conceptUrl = `https://data.sec.gov/api/xbrl/companyconcept/CIK${BE_CIK}/us-gaap/EarningsPerShareDiluted.json`;
+  const conceptResp = await fetch(conceptUrl, { headers: SEC_HEADERS });
+  console.log(`[be-audit] companyconcept/EarningsPerShareDiluted status=${conceptResp.status}`);
+  if (conceptResp.ok) {
+    const conceptData = await conceptResp.json();
+    const units = conceptData.units || {};
+    const unitKey = Object.keys(units)[0];
+    const entries = unitKey ? units[unitKey] : [];
+    const annualShaped = (entries || [])
+      .filter((e) => e.form === "10-K" && e.start && e.end)
+      .filter((e) => { const d = Math.round((new Date(e.end) - new Date(e.start)) / 86400000); return d >= 330 && d <= 400; })
+      .sort((a, b) => (a.end < b.end ? 1 : -1));
+    console.log(`[be-audit] companyconcept total_entries=${(entries || []).length} annual_10K_shaped_count=${annualShaped.length} most_recent_annual=${JSON.stringify(annualShaped[0] || null)}`);
+  } else {
+    const bodyText = await conceptResp.text();
+    console.log(`[be-audit] companyconcept fetch FAILED, body_snippet=${bodyText.slice(0, 300)}`);
+  }
 }
 
 main().catch((e) => { console.error("[fatal]", e); process.exit(1); });
