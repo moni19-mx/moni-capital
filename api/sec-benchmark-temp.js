@@ -20,6 +20,17 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { checkAdminAuth } from "../lib/adminAuth.js";
+// Sprint P2A: la logica PURA de resolucion (extraccion de puntos,
+// scoring, confidence, ranking+ambiguedad) vive ahora en
+// lib/secFinancialsResolver.js para ser testeable sin red -- CERO
+// cambio de comportamiento para REVENUE/NET_INCOME/OPERATING_INCOME/
+// OPERATING_CASH_FLOW/CAPEX, solo se movio de archivo. EPS_DILUTED
+// (septimo concepto anual) y la capa trimestral/TTM son nuevas, viven
+// en ese mismo lib.
+import {
+  CANDIDATE_TAGS, CANONICAL_CONCEPTS,
+  extractAnnualPoints, scoreCandidate, pickWinnerAndDetectAmbiguity, confidenceRank,
+} from "../lib/secFinancialsResolver.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -32,45 +43,9 @@ const SEC_HEADERS = {
 
 const REQUEST_DELAY_MS = 120;
 const MAX_POINTS_STORED = 5;
-const FRESH_DAYS_HIGH = 550;   // ~18 meses -- cubre el rezago normal entre fiscal year-end y 10-K
-const FRESH_DAYS_MEDIUM = 730; // ~24 meses
-const AMBIGUITY_THRESHOLD_PCT = 5; // % de diferencia entre tags candidatos en el mismo periodo
-
-// Listas priorizadas de tags XBRL conocidos y semanticamente validos por
-// concepto canonico. El orden es una preferencia inicial, NO una regla
-// ciega -- el resolver puede elegir un tag de menor prioridad si tiene
-// mejor recencia/cobertura real para ese emisor especifico.
-const CANDIDATE_TAGS = {
-  REVENUE: [
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
-    "Revenues",
-    "SalesRevenueNet",
-  ],
-  NET_INCOME: ["NetIncomeLoss", "ProfitLoss"],
-  OPERATING_INCOME: ["OperatingIncomeLoss"],
-  OPERATING_CASH_FLOW: [
-    "NetCashProvidedByUsedInOperatingActivities",
-    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-  ],
-  CAPEX: [
-    "PaymentsToAcquirePropertyPlantAndEquipment",
-    "PaymentsForCapitalImprovements",
-    "PaymentsToAcquireProductiveAssets",
-  ],
-};
-
-// FREE_CASH_FLOW no tiene tags candidatos -- se calcula siempre como
-// OPERATING_CASH_FLOW - CAPEX, nunca se busca un tag "FreeCashFlow".
-const CANONICAL_CONCEPTS = Object.keys(CANDIDATE_TAGS);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function daysBetween(a, b) {
-  if (!a || !b) return null;
-  return Math.round((new Date(b) - new Date(a)) / 86400000);
 }
 
 async function getCikMap() {
@@ -97,96 +72,13 @@ async function fetchConcept(cikPadded, tag) {
   }
 }
 
-// Extrae la serie anual real de un tag (deteccion por duracion del
-// periodo ~365 dias, no por el campo `fp` -- resulto no ser confiable
-// entre distintos emisores en el benchmark V1). Devuelve TODOS los
-// puntos anuales encontrados (no solo 5), para poder evaluar cobertura
-// y continuidad reales antes de decidir si este tag es el ganador.
-// Formas de filing confiables para datos anuales -- un 10-K/A (enmienda)
-// se trata igual que un 10-K para efectos de confianza, nunca baja
-// confidence solo por ser una enmienda. Cualquier otra forma (DEF 14A,
-// 8-K, S-1, etc.) NUNCA participa en la deteccion de periodo anual,
-// aunque su duracion coincida con ~365 dias -- este fue el mecanismo
-// real detras del bug de NET_INCOME de ANET (un filing no-anual gano el
-// desempate por "filed mas reciente" sobre el 10-K correcto).
-const TRUSTED_ANNUAL_FORMS = ["10-K", "10-K/A", "10-KT", "10-KT/A"];
-
-function formRank(form) {
-  return TRUSTED_ANNUAL_FORMS.includes(form) ? 1 : 0;
-}
-
-function extractAnnualPoints(conceptJson) {
-  const units = conceptJson?.units || {};
-  const unitKey = Object.keys(units)[0];
-  if (!unitKey) return [];
-  const entries = units[unitKey];
-  if (!Array.isArray(entries) || entries.length === 0) return [];
-
-  const annual = entries.filter((e) => {
-    if (!TRUSTED_ANNUAL_FORMS.includes(e.form)) return false;
-    if (e.start && e.end) {
-      const dur = daysBetween(e.start, e.end);
-      return dur != null && dur >= 330 && dur <= 400;
-    }
-    return true; // valor instantaneo (sin start) en una forma ya confiable
-  });
-  if (annual.length === 0) return [];
-
-  // Desempate: entre 10-K y 10-K/A del MISMO periodo, gana el mas
-  // reciente filed (la enmienda corrige al original, como pediste en el
-  // punto 4). Nunca hay riesgo de que una forma no confiable participe
-  // porque ya se filtraron arriba.
-  const byEnd = {};
-  annual.forEach((e) => {
-    const current = byEnd[e.end];
-    if (!current || e.filed > current.filed) byEnd[e.end] = e;
-  });
-
-  return Object.values(byEnd)
-    .sort((a, b) => (a.end < b.end ? 1 : -1))
-    .map((e) => ({
-      value: e.val,
-      unit: unitKey,
-      form: e.form,
-      filed_date: e.filed,
-      period_end: e.end,
-      fiscal_year: e.fy,
-      accession_number: e.accn || null,
-    }));
-}
-
-// Evalua un candidato: recencia del punto mas reciente, cobertura
-// (cuantos puntos anuales tiene), continuidad (cuantos de esos puntos
-// son años consecutivos reales, no con huecos grandes).
-function scoreCandidate(points) {
-  if (points.length === 0) return null;
-  const mostRecent = points[0];
-  const recencyDays = daysBetween(mostRecent.period_end, new Date().toISOString().slice(0, 10));
-  let continuity = 1;
-  for (let i = 0; i < points.length - 1; i++) {
-    const gap = daysBetween(points[i + 1].period_end, points[i].period_end);
-    if (gap != null && gap >= 330 && gap <= 400) continuity++;
-    else break;
-  }
-  const trustedFormCount = points.filter((p) => TRUSTED_ANNUAL_FORMS.includes(p.form)).length;
-  return { recencyDays, coverage: points.length, continuity, form10K: trustedFormCount, mostRecent };
-}
-
-function computeConfidence(score) {
-  if (!score) return null;
-  if (score.recencyDays <= FRESH_DAYS_HIGH && score.coverage >= 3 && score.continuity >= 3 && score.form10K >= score.coverage - 1) {
-    return "HIGH";
-  }
-  if (score.recencyDays <= FRESH_DAYS_MEDIUM && score.coverage >= 2) {
-    return "MEDIUM";
-  }
-  return "LOW";
-}
-
 // Resuelve un concepto canonico para un ticker: prueba todos los tags
 // candidatos, evalua cada uno, y selecciona por recencia+cobertura+
 // continuidad -- nunca por prioridad ciega. Detecta ambiguedad cuando
 // dos tags tienen valores materialmente distintos en el mismo periodo.
+// La decision (ranking + ambiguedad) es pickWinnerAndDetectAmbiguity,
+// pura, en lib/secFinancialsResolver.js -- esta funcion solo hace los
+// fetch reales y arma los candidatos para pasarselos.
 async function resolveConcept(cikPadded, canonicalConcept) {
   const tags = CANDIDATE_TAGS[canonicalConcept];
   const candidates = [];
@@ -202,47 +94,9 @@ async function resolveConcept(cikPadded, canonicalConcept) {
     }
   }
 
-  if (candidates.length === 0) {
-    return { status: "DATA_UNAVAILABLE", reason: "no_candidate_tag_had_usable_annual_data" };
-  }
-
-  // Ranking: recencia primero (freshest wins), luego cobertura, luego
-  // el orden de la lista priorizada como desempate final.
-  candidates.sort((a, b) => {
-    if (a.score.recencyDays !== b.score.recencyDays) return a.score.recencyDays - b.score.recencyDays;
-    if (a.score.coverage !== b.score.coverage) return b.score.coverage - a.score.coverage;
-    return tags.indexOf(a.tag) - tags.indexOf(b.tag);
-  });
-
-  const winner = candidates[0];
-  const confidence = computeConfidence(winner.score);
-
-  // Deteccion de ambiguedad: algun otro candidato tiene un valor para
-  // el MISMO period_end mas reciente, con diferencia material.
-  let ambiguityNote = null;
-  const winnerLatest = winner.points[0];
-  for (const other of candidates.slice(1)) {
-    const match = other.points.find((p) => p.period_end === winnerLatest.period_end);
-    if (match && winnerLatest.value) {
-      const diffPct = Math.abs((match.value - winnerLatest.value) / winnerLatest.value) * 100;
-      if (diffPct > AMBIGUITY_THRESHOLD_PCT) {
-        ambiguityNote = `tag alterno "${other.tag}" reporta ${match.value} para el mismo periodo (${winnerLatest.period_end}) vs ${winnerLatest.value} del tag elegido -- diferencia ${diffPct.toFixed(1)}%`;
-        break;
-      }
-    }
-  }
-
-  return {
-    status: "OK",
-    tag: winner.tag,
-    points: winner.points.slice(0, MAX_POINTS_STORED),
-    confidence: ambiguityNote ? "LOW" : confidence,
-    ambiguityNote,
-  };
-}
-
-function confidenceRank(c) {
-  return { HIGH: 3, MEDIUM: 2, LOW: 1 }[c] || 0;
+  const decision = pickWinnerAndDetectAmbiguity(candidates, tags);
+  if (decision.status === "DATA_UNAVAILABLE") return decision;
+  return { ...decision, points: decision.points.slice(0, MAX_POINTS_STORED) };
 }
 
 async function processTicker(ticker, cikPadded) {
