@@ -23,6 +23,10 @@ on:
         description: 'Numero de corridas -- default segun mode si se deja vacio (diagnostic=3, certification=16)'
         required: false
         type: string
+      cert_tickers:
+        description: 'SOLO certification: JSON array [{"ticker":"X","type":"stock|crypto"},...] ya resuelto contra `assets` (positions UNION watchlist + USDT). Vacio = fallback al universo fijo de 9. Ignorado en mode=diagnostic.'
+        required: false
+        type: string
   # Bootstrap (mismo patron que conviction-coverage.yml): GitHub solo
   # permite disparar workflow_dispatch via API para un workflow que YA
   # existe en la default branch -- este archivo todavia vive solo en
@@ -55,6 +59,7 @@ jobs:
           TARGET_BASE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.target_base_url || 'https://moni-capital-git-claude-supabase-mon-bcfab4-moni19-mxs-projects.vercel.app' }}
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'diagnostic' }}
           ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '' }}
+          CERT_TICKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.cert_tickers || '' }}
           VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
           GITHUB_SHA: ${{ github.sha }}
         run: node scripts/priceTruthProbe.mjs

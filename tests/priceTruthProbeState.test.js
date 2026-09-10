@@ -10,6 +10,7 @@ import {
   detectLkgRegression, detectCrossProviderContamination, detectFuturesValuationRegression,
   sanitizeHeadersForLog, truncateBody, classifyResponseFingerprint, buildDiagnosticVerdict,
   classifyJsonResponseShape, validateFuturesContract, validateMarketDataContract, classifyEndpointDiagnosticResult,
+  resolveCertificationUniverse, TRACKED_SUBSET_TICKERS,
 } from "../lib/priceTruthProbeState.js";
 
 // ================== classifyMarketDataIteration ==================
@@ -336,4 +337,50 @@ test("QQ - futures-equity con 200 pero respuesta invalida (el caso real que moti
     futuresResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "PLATFORM_INTERCEPT_OR_INVALID_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
   });
   assert.equal(result, "DIAGNOSTIC_BLOCKED");
+});
+
+// ================== resolveCertificationUniverse ==================
+
+const FIXED_FALLBACK = [{ ticker: "ETH", type: "crypto" }, { ticker: "AMZN", type: "stock" }];
+
+test("RR - entries null (CERT_TICKERS no seteado) -> fallback al universo fijo, missingTrackedSubset vacio se ignora en este modo", () => {
+  const result = resolveCertificationUniverse(null, FIXED_FALLBACK);
+  assert.equal(result.source, "fallback_fixed_list");
+  assert.deepEqual(result.universe, FIXED_FALLBACK);
+  assert.deepEqual(result.missingTrackedSubset, []);
+});
+
+test("SS - array vacio -> throws, nunca certifica con universo vacio silenciosamente", () => {
+  assert.throws(() => resolveCertificationUniverse([], FIXED_FALLBACK), /no vacio/);
+});
+
+test("TT - type invalido (ni 'stock' ni 'crypto') -> throws, nunca adivina el type", () => {
+  assert.throws(() => resolveCertificationUniverse([{ ticker: "XYZ", type: "etf" }], FIXED_FALLBACK), /type debe ser/);
+});
+
+test("UU - ticker faltante en una entrada -> throws", () => {
+  assert.throws(() => resolveCertificationUniverse([{ type: "stock" }], FIXED_FALLBACK), /ticker faltante/);
+});
+
+test("VV - deduplica tickers repetidos, conserva la primera aparicion", () => {
+  const result = resolveCertificationUniverse(
+    [{ ticker: "ETH", type: "crypto" }, { ticker: "BTC", type: "crypto" }, { ticker: "ETH", type: "crypto" }],
+    FIXED_FALLBACK
+  );
+  assert.equal(result.source, "dynamic");
+  assert.deepEqual(result.universe, [{ ticker: "ETH", type: "crypto" }, { ticker: "BTC", type: "crypto" }]);
+});
+
+test("WW - universo completo de 48 (positions UNION watchlist + USDT) con el subset trackeado presente -> missingTrackedSubset vacio", () => {
+  const entries = TRACKED_SUBSET_TICKERS.map((t) => ({ ticker: t, type: ["ETH", "BTC", "LINK", "SOL", "USDT"].includes(t) ? "crypto" : "stock" }))
+    .concat([{ ticker: "AAPL", type: "stock" }, { ticker: "TSM", type: "stock" }]);
+  const result = resolveCertificationUniverse(entries, FIXED_FALLBACK);
+  assert.equal(result.universe.length, 11);
+  assert.deepEqual(result.missingTrackedSubset, []);
+});
+
+test("XX - universo dinamico sin USDT -> missingTrackedSubset=['USDT'], nunca se corre certification silenciosamente incompleta", () => {
+  const entries = TRACKED_SUBSET_TICKERS.filter((t) => t !== "USDT").map((t) => ({ ticker: t, type: ["ETH", "BTC", "LINK", "SOL"].includes(t) ? "crypto" : "stock" }));
+  const result = resolveCertificationUniverse(entries, FIXED_FALLBACK);
+  assert.deepEqual(result.missingTrackedSubset, ["USDT"]);
 });

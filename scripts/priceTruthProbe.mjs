@@ -37,6 +37,7 @@ import {
   detectLkgRegression, detectCrossProviderContamination, detectFuturesValuationRegression,
   buildProbeSummary, sanitizeHeadersForLog, truncateBody, classifyResponseFingerprint, buildDiagnosticVerdict,
   classifyEndpointDiagnosticResult, validateFuturesContract, validateMarketDataContract,
+  resolveCertificationUniverse,
 } from "../lib/priceTruthProbeState.js";
 
 const TARGET_BASE_URL = process.env.TARGET_BASE_URL;
@@ -67,6 +68,23 @@ const PROBE_TICKERS = [
 ];
 const TICKER_NAMES = PROBE_TICKERS.map((t) => t.ticker);
 const PROVIDER_BY_TICKER = Object.fromEntries(PROBE_TICKERS.map((t) => [t.ticker, t.type === "crypto" ? "coingecko" : "finnhub"]));
+
+// CERT_TICKERS: universo dinamico opcional para MODE=certification
+// UNICAMENTE (positions UNION watchlist deduplicado + USDT, ya resuelto
+// contra la tabla `assets` real antes de disparar el workflow -- este
+// script NUNCA llama Supabase ni auto-crea/adivina un asset_type). Si no
+// se provee, certification usa el mismo PROBE_TICKERS fijo de siempre.
+// MODE=diagnostic ignora esta variable por completo -- sin cambios de
+// comportamiento ahi.
+function parseCertTickersEnv(raw) {
+  if (!raw) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) {
+    console.error(`[fatal] CERT_TICKERS no es JSON valido: ${e.message}`);
+    process.exit(1);
+  }
+  return parsed;
+}
 
 function nowIso() { return new Date().toISOString(); }
 
@@ -235,6 +253,24 @@ async function runCertification() {
   console.log(`[probe] TARGET_BASE_URL=${TARGET_BASE_URL} CODE_BASE_SHA=${CODE_BASE_SHA} iterations=${ITERATIONS} interval_ms=${INTERVAL_MS} user_agent="${USER_AGENT}"`);
   console.log(`[probe] started_at=${startedAt}`);
 
+  // Universo: dinamico (positions UNION watchlist deduplicado + USDT, ya
+  // resuelto contra `assets` real) si CERT_TICKERS viene seteado, si no
+  // el mismo PROBE_TICKERS fijo de siempre. resolveCertificationUniverse
+  // es pura (lib/priceTruthProbeState.js) -- aqui solo se parsea el JSON
+  // del env var y se sale con error explicito si es invalido, nunca se
+  // silencia ni se cae de vuelta al fijo por un parse error.
+  const certTickersEntries = parseCertTickersEnv(process.env.CERT_TICKERS);
+  const { universe, source, missingTrackedSubset } = resolveCertificationUniverse(certTickersEntries, PROBE_TICKERS);
+  if (missingTrackedSubset.length > 0) {
+    console.error(`[fatal] certification universe (source=${source}) no incluye el subset trackeado explicito: ${missingTrackedSubset.join(", ")}`);
+    process.exit(1);
+  }
+  const universeTickers = universe;
+  const universeNames = universeTickers.map((t) => t.ticker);
+  const providerByTicker = Object.fromEntries(universeTickers.map((t) => [t.ticker, t.type === "crypto" ? "coingecko" : "finnhub"]));
+  console.log(`[probe] certification_universe_source=${source} certification_universe_size=${universeNames.length}`);
+  console.log(`[probe] certification_universe_tickers=${JSON.stringify(universeNames)}`);
+
   writeFileSync("price-truth-probe.jsonl", "");
 
   const httpFailures = [];
@@ -248,7 +284,7 @@ async function runCertification() {
 
   const bestByTicker = {}; // ticker -> {status, price, iteration}
   const lastStatusByTicker = {}; // ticker -> status (para detectar transiciones STALE/STALE_RATE_LIMITED)
-  const tickerAvailability = Object.fromEntries(TICKER_NAMES.map((t) => [t, 0]));
+  const tickerAvailability = Object.fromEntries(universeNames.map((t) => [t, 0]));
   let usdmAvailability = 0, coinmAvailability = 0;
   let bestUsdm = null, bestCoinm = null;
   let prevProviderStatuses = null;
@@ -260,7 +296,7 @@ async function runCertification() {
 
     const mdResp = await callJson(
       `${TARGET_BASE_URL}/api/market-data`,
-      { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ items: PROBE_TICKERS }) },
+      { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ items: universeTickers }) },
       i, "market-data", httpFailures
     );
     const feResp = await callJson(
@@ -271,7 +307,7 @@ async function runCertification() {
 
     actualIterations = i;
 
-    const mdClassified = mdResp.ok ? classifyMarketDataIteration(mdResp.json, TICKER_NAMES) : Object.fromEntries(TICKER_NAMES.map((t) => [t, { status: "HTTP_FAILURE", price: null }]));
+    const mdClassified = mdResp.ok ? classifyMarketDataIteration(mdResp.json, universeNames) : Object.fromEntries(universeNames.map((t) => [t, { status: "HTTP_FAILURE", price: null }]));
     const feClassified = feResp.ok ? classifyFuturesIteration(feResp.json) : { usdm: null, coinm: null, total_value_usd: null, is_complete: null, warnings: [] };
 
     const currProviderStatuses = mdResp.ok ? { finnhub: mdResp.json?.finnhub_status, coingecko: mdResp.json?.coingecko_status } : { finnhub: null, coingecko: null };
@@ -279,9 +315,9 @@ async function runCertification() {
     if (currProviderStatuses.coingecko === "RATE_LIMITED") coingeckoRateLimitEvents++;
 
     // -------- LKG regression por ticker --------
-    for (const ticker of TICKER_NAMES) {
+    for (const ticker of universeNames) {
       const current = mdClassified[ticker];
-      const provider = PROVIDER_BY_TICKER[ticker];
+      const provider = providerByTicker[ticker];
       const { regression, newBest } = detectLkgRegression({
         ticker, provider, previousBest: bestByTicker[ticker] || null, current, iterationIndex: i,
         providerHealth: { finnhub_status: currProviderStatuses.finnhub, coingecko_status: currProviderStatuses.coingecko },
