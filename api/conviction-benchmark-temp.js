@@ -30,6 +30,7 @@
 // materiality_scores/material_events -- solo lee de ahi.
 
 import { createClient } from "@supabase/supabase-js";
+import { checkAdminAuth } from "../lib/adminAuth.js";
 import { extractDimensionsFromThesis } from "../lib/thesisDimensions.js";
 import {
   computeOverallConviction, computeConvictionConfidence, applyComponentDeltas,
@@ -254,6 +255,120 @@ function buildImpactPrompt(event, dimensions) {
   ].join("\n");
 }
 
+// Conviction Coverage Orchestrator MVP (Priority 2 del sprint de
+// automatizacion): estado persistente de runs/run_items en
+// conviction_runs/conviction_run_items -- para que la idempotencia del
+// resume no dependa solo de que un array remaining_tickers este bien
+// formado en memoria de un runner de GitHub Actions que puede morir a
+// mitad de camino. Solo CRUD de estado, nunca duplica logica del engine
+// de scoring ni del fetch SEC -- eso lo sigue haciendo scripts/
+// orchestrate-conviction.js llamando a los modos existentes de este
+// mismo archivo y de sec-benchmark-temp.js.
+async function handleRunAction(req, res, action) {
+  if (action === "create_run") {
+    const { mode, tickers } = req.body || {};
+    if (!mode || !Array.isArray(tickers) || tickers.length === 0) {
+      return res.status(400).json({ error: "missing_params", detail: "requiere {mode, tickers:[]} en el body" });
+    }
+    const { data: run, error: runErr } = await supabase.from("conviction_runs").insert([{
+      status: "RUNNING", mode, requested_tickers: tickers, started_at: new Date().toISOString(),
+      created_by: "github_actions", engine_version: CONVICTION_ENGINE_VERSION,
+    }]).select().single();
+    if (runErr) throw runErr;
+
+    const itemRows = tickers.map((ticker) => ({ run_id: run.id, ticker, status: "PENDING" }));
+    const { data: items, error: itemsErr } = await supabase.from("conviction_run_items").insert(itemRows).select();
+    if (itemsErr) throw itemsErr;
+
+    return res.status(200).json({ ok: true, run_id: run.id, items: items.map((i) => ({ id: i.id, ticker: i.ticker, status: i.status })) });
+  }
+
+  if (action === "get_run") {
+    const runId = req.query?.run_id;
+    if (!runId) return res.status(400).json({ error: "missing_params", detail: "requiere ?run_id=" });
+    const [{ data: run, error: runErr }, { data: items, error: itemsErr }] = await Promise.all([
+      supabase.from("conviction_runs").select("*").eq("id", runId).single(),
+      supabase.from("conviction_run_items").select("*").eq("run_id", runId).order("id"),
+    ]);
+    if (runErr) throw runErr;
+    if (itemsErr) throw itemsErr;
+    return res.status(200).json({ ok: true, run, items });
+  }
+
+  if (action === "update_item") {
+    const { run_id, ticker, fields } = req.body || {};
+    if (!run_id || !ticker || typeof fields !== "object") {
+      return res.status(400).json({ error: "missing_params", detail: "requiere {run_id, ticker, fields:{}} en el body" });
+    }
+    // Whitelist estricta -- nunca deja que el body sobreescriba id/run_id/ticker.
+    const ALLOWED_FIELDS = new Set([
+      "status", "current_step", "sec_status", "score_status", "blocker_reason", "last_error",
+      "attempt_count", "sec_completed_at", "scoring_completed_at", "conviction_history_id", "decision_id",
+      "started_at", "completed_at",
+    ]);
+    const updatePayload = { updated_at: new Date().toISOString() };
+    for (const key of Object.keys(fields)) {
+      if (ALLOWED_FIELDS.has(key)) updatePayload[key] = fields[key];
+    }
+    const { data: updated, error: updErr } = await supabase
+      .from("conviction_run_items").update(updatePayload).eq("run_id", run_id).eq("ticker", ticker).select().single();
+    if (updErr) throw updErr;
+    return res.status(200).json({ ok: true, item: updated });
+  }
+
+  if (action === "sec_status") {
+    const { tickers } = req.body || {};
+    if (!Array.isArray(tickers) || tickers.length === 0) {
+      return res.status(400).json({ error: "missing_params", detail: "requiere {tickers:[]} en el body" });
+    }
+    const { data: rows, error: secErr } = await supabase
+      .from("sec_financials_normalized").select("ticker, canonical_concept, period_end").in("ticker", tickers);
+    if (secErr) throw secErr;
+    const byTicker = {};
+    tickers.forEach((t) => { byTicker[t] = { concepts: new Set(), revenue_periods: 0 }; });
+    (rows || []).forEach((r) => {
+      if (!byTicker[r.ticker]) return;
+      byTicker[r.ticker].concepts.add(r.canonical_concept);
+      if (r.canonical_concept === "REVENUE" && r.period_end) byTicker[r.ticker].revenue_periods += 1;
+    });
+    const results = tickers.map((ticker) => {
+      const info = byTicker[ticker];
+      const concepts_present = info.concepts.size;
+      // Mismo umbral usado en todas las verificaciones manuales de este
+      // sprint: 6/6 conceptos y >=2 periodos de REVENUE (minimo real para
+      // GROWTH_TAM, que compara los 2 mas recientes -- ver
+      // computeObservedGrowth en lib/fundamentalConviction.js).
+      const ready_to_score = concepts_present >= 6 && info.revenue_periods >= 2;
+      return { ticker, sec_rows_found: info.concepts.size > 0, concepts_present, revenue_periods: info.revenue_periods, ready_to_score };
+    });
+    return res.status(200).json({ ok: true, results });
+  }
+
+  if (action === "verify_history") {
+    const idsParam = req.query?.ids;
+    if (!idsParam) return res.status(400).json({ error: "missing_params", detail: "requiere ?ids=1,2,3" });
+    const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
+    const { data: rows, error } = await supabase
+      .from("conviction_history")
+      .select("id, ticker, accepted_conviction, source, status, deterministic_status, proposed_conviction, previous_conviction")
+      .in("id", ids);
+    if (error) throw error;
+    return res.status(200).json({ ok: true, rows });
+  }
+
+  if (action === "complete_run") {
+    const { run_id, status, error_summary } = req.body || {};
+    if (!run_id || !status) return res.status(400).json({ error: "missing_params", detail: "requiere {run_id, status} en el body" });
+    const { data: run, error: runErr } = await supabase.from("conviction_runs")
+      .update({ status, completed_at: new Date().toISOString(), error_summary: error_summary || null })
+      .eq("id", run_id).select().single();
+    if (runErr) throw runErr;
+    return res.status(200).json({ ok: true, run });
+  }
+
+  return res.status(400).json({ error: "unknown_run_action", detail: `run_action="${action}" no reconocido` });
+}
+
 // Sprint Internal Opportunities V1: modo READ-ONLY, sin escritura
 // alguna (ni decisions, ni conviction_history, ni ninguna tabla) --
 // solo lee positions/thesis/market_cache/conviction_history reales y
@@ -377,9 +492,21 @@ async function runInternalOpportunitiesV1(req, res) {
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
-  const { pin, migrate_tickers, score_tickers, ai_test, max_events, opportunities } = req.query || {};
-  if (!pin || pin !== process.env.MONI_PIN) {
-    return res.status(401).json({ error: "invalid_pin" });
+  const auth = checkAdminAuth(
+    { headers: req.headers, query: req.query },
+    { MONI_ADMIN_SECRET: process.env.MONI_ADMIN_SECRET, MONI_PIN: process.env.MONI_PIN }
+  );
+  if (!auth.authorized) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const { migrate_tickers, score_tickers, ai_test, max_events, opportunities, run_action } = req.query || {};
+
+  if (run_action) {
+    try {
+      return await handleRunAction(req, res, run_action);
+    } catch (err) {
+      return res.status(500).json({ error: "run_action_failed", detail: String(err.message || err) });
+    }
   }
 
   if (opportunities === "true") {

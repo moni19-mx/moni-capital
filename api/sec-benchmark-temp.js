@@ -19,6 +19,7 @@
 // registra la ambiguedad explicitamente -- nunca se elige en silencio.
 
 import { createClient } from "@supabase/supabase-js";
+import { checkAdminAuth } from "../lib/adminAuth.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -247,8 +248,10 @@ function confidenceRank(c) {
 async function processTicker(ticker, cikPadded) {
   const rows = [];
   const resolved = {}; // canonicalConcept -> resolveConcept result, para poder calcular FCF despues
+  let secHttpCalls = 0;
 
   for (const concept of CANONICAL_CONCEPTS) {
+    secHttpCalls += CANDIDATE_TAGS[concept].length;
     const result = await resolveConcept(cikPadded, concept);
     resolved[concept] = result;
 
@@ -344,46 +347,88 @@ async function processTicker(ticker, cikPadded) {
     });
   }
 
-  return rows;
+  return { rows, secHttpCalls };
 }
 
 export const config = { maxDuration: 60 };
 
+// Instrumentacion real de timing (Priority 2, item 2 del sprint de
+// automatizacion): antes solo se podia inferir runtime desde el
+// fetched_at del ticker siguiente (delta entre inserts), lo cual mide
+// OBSERVED_INTER_TICKER_DELTA, no ACTUAL_BATCH_DURATION ni el costo del
+// primer ticker ni el fetch del CIK map. Ahora se mide con Date.now()
+// real dentro del propio request/response -- no depende de acceso a
+// logs de Vercel (al que este entorno no tiene acceso). Todo lo que no
+// se puede medir limpiamente (timing por-request individual a SEC,
+// tiempo de normalizacion aislado del de red) se deja fuera en vez de
+// inventarse -- ver per_ticker.db_write_duration_ms como la unica pieza
+// nueva medible con precision razonable.
 export default async function handler(req, res) {
-  const { pin, tickers } = req.query || {};
-
-  if (!pin || pin !== process.env.MONI_PIN) {
-    return res.status(401).json({ error: "invalid_pin" });
+  const requestStartedAt = Date.now();
+  const auth = checkAdminAuth(
+    { headers: req.headers, query: req.query },
+    { MONI_ADMIN_SECRET: process.env.MONI_ADMIN_SECRET, MONI_PIN: process.env.MONI_PIN }
+  );
+  if (!auth.authorized) {
+    return res.status(401).json({ error: "unauthorized" });
   }
+  const { tickers } = req.query || {};
   if (!tickers) {
     return res.status(400).json({ error: "missing_params", detail: "usa ?tickers=ANET,VRT,ALAB,..." });
   }
 
   try {
+    const cikMapStartedAt = Date.now();
     const cikMap = await getCikMap();
+    const cikMapDurationMs = Date.now() - cikMapStartedAt;
+
     const tickerList = tickers.split(",").map((t) => t.trim().toUpperCase()).filter(Boolean);
     const summary = [];
 
     for (const ticker of tickerList) {
+      const tickerStartedAt = Date.now();
       const cikPadded = cikMap[ticker];
       if (!cikPadded) {
         summary.push({ ticker, ok: false, error: "cik_not_found" });
         continue;
       }
       try {
-        const rows = await processTicker(ticker, cikPadded);
+        const { rows, secHttpCalls } = await processTicker(ticker, cikPadded);
+        const dbWriteStartedAt = Date.now();
         const { error: insertErr } = await supabase.from("sec_financials_normalized").insert(rows);
+        const dbWriteDurationMs = Date.now() - dbWriteStartedAt;
+        const tickerFinishedAt = Date.now();
         if (insertErr) {
           summary.push({ ticker, ok: false, error: insertErr.message });
           continue;
         }
-        summary.push({ ticker, ok: true, cik: cikPadded, rows_inserted: rows.length });
+        summary.push({
+          ticker, ok: true, cik: cikPadded, rows_inserted: rows.length,
+          timing: {
+            started_at: new Date(tickerStartedAt).toISOString(),
+            finished_at: new Date(tickerFinishedAt).toISOString(),
+            duration_ms: tickerFinishedAt - tickerStartedAt,
+            sec_http_calls: secHttpCalls,
+            db_write_duration_ms: dbWriteDurationMs,
+          },
+        });
       } catch (tickerErr) {
         summary.push({ ticker, ok: false, error: String(tickerErr.message || tickerErr) });
       }
     }
 
-    return res.status(200).json({ ok: true, processed: summary.length, summary });
+    const requestFinishedAt = Date.now();
+    return res.status(200).json({
+      ok: true,
+      processed: summary.length,
+      summary,
+      timing: {
+        request_started_at: new Date(requestStartedAt).toISOString(),
+        request_finished_at: new Date(requestFinishedAt).toISOString(),
+        total_duration_ms: requestFinishedAt - requestStartedAt,
+        cik_map_fetch_duration_ms: cikMapDurationMs,
+      },
+    });
   } catch (err) {
     return res.status(500).json({ error: "sec_benchmark_failed", detail: String(err.message || err) });
   }

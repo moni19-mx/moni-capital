@@ -1,0 +1,51 @@
+name: Conviction Coverage Orchestrator
+
+# MVP del Conviction Coverage Orchestrator (Priority 2, sprint de
+# automatizacion). Corre en un runner de GitHub Actions -- egress real,
+# a diferencia del sandbox de Claude Code (confirmado con curl real:
+# *.vercel.app y *.sec.gov devuelven 403 CONNECT rejected por politica
+# de egress del sandbox; api.github.com no). Este workflow es el unico
+# puente automatico: Claude Code lo dispara via workflow_dispatch y lee
+# el resultado de vuelta, sin que el usuario copie/pegue JSON.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Tickers separados por coma, ej. GOOG,NVDA (vacio si se usa resume_run_id)'
+        required: false
+        type: string
+      mode:
+        description: 'FULL_PIPELINE | SEC_ONLY | SCORE_ONLY'
+        required: false
+        default: 'FULL_PIPELINE'
+        type: string
+      resume_run_id:
+        description: 'run_id de conviction_runs a resumir en vez de crear uno nuevo (opcional)'
+        required: false
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run Conviction Coverage Orchestrator
+        env:
+          MONI_ADMIN_SECRET: ${{ secrets.MONI_ADMIN_SECRET }}
+          VERCEL_BASE_URL: ${{ vars.VERCEL_BASE_URL }}
+        run: |
+          ARGS="--mode=${{ inputs.mode }}"
+          if [ -n "${{ inputs.resume_run_id }}" ]; then
+            ARGS="$ARGS --resume-run-id=${{ inputs.resume_run_id }}"
+          fi
+          if [ -n "${{ inputs.tickers }}" ]; then
+            ARGS="$ARGS --tickers=${{ inputs.tickers }}"
+          fi
+          node scripts/orchestrate-conviction.js $ARGS
