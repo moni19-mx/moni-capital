@@ -9,6 +9,7 @@ import {
   classifyMarketDataIteration, classifyFuturesIteration,
   detectLkgRegression, detectCrossProviderContamination, detectFuturesValuationRegression,
   sanitizeHeadersForLog, truncateBody, classifyResponseFingerprint, buildDiagnosticVerdict,
+  classifyJsonResponseShape, validateFuturesContract, validateMarketDataContract, classifyEndpointDiagnosticResult,
 } from "../lib/priceTruthProbeState.js";
 
 // ================== classifyMarketDataIteration ==================
@@ -224,28 +225,115 @@ test("AA - 401 sin ninguna senal fuerte -> UNKNOWN_NON_2XX_SOURCE, NUNCA adivina
   assert.equal(result, "UNKNOWN_NON_2XX_SOURCE");
 });
 
-// ================== buildDiagnosticVerdict ==================
+// ================== classifyJsonResponseShape (revision: 200 no basta) ==================
 
-test("BB - todos 2xx en ambos endpoints -> DIAGNOSTIC_OK", () => {
+test("BB - status no-2xx -> HTTP_NON_2XX sin importar el body", () => {
+  assert.equal(classifyJsonResponseShape({ status: 401, contentType: "application/json", rawText: '{"ok":true}' }), "HTTP_NON_2XX");
+});
+
+test("CC - status 200 con HTML (pagina de auto-redirect de Vercel Auth) -> HTTP_200_HTML, NUNCA se confunde con exito", () => {
+  const result = classifyJsonResponseShape({ status: 200, contentType: "text/html", rawText: "<html><body>Redirecting to SSO...</body></html>" });
+  assert.equal(result, "HTTP_200_HTML");
+});
+
+test("DD - status 200 con texto no-JSON y sin content-type html -> HTTP_200_INVALID_JSON", () => {
+  const result = classifyJsonResponseShape({ status: 200, contentType: "text/plain", rawText: "not json at all" });
+  assert.equal(result, "HTTP_200_INVALID_JSON");
+});
+
+test("EE - status 200 con JSON real -> HTTP_200_VALID_JSON", () => {
+  const result = classifyJsonResponseShape({ status: 200, contentType: "application/json", rawText: '{"data":{},"errors":[]}' });
+  assert.equal(result, "HTTP_200_VALID_JSON");
+});
+
+// ================== validateFuturesContract (contrato real del codigo, nunca inventado) ==================
+
+test("FF - shape exacto real de futures-equity.js -> valido", () => {
+  const result = validateFuturesContract({ total_value_usd: 4300.5, is_complete: true, accounts: [], positions: [], warnings: [] });
+  assert.equal(result.valid, true);
+});
+
+test("GG - total_value_usd=null (imposible en una ejecucion real del handler) -> invalido, razon explicita", () => {
+  const result = validateFuturesContract({ total_value_usd: null, is_complete: null, accounts: [], positions: [], warnings: [] });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, "total_value_usd_not_number");
+});
+
+test("HH - falta una key del contrato real -> invalido, lista la key faltante", () => {
+  const result = validateFuturesContract({ total_value_usd: 0, is_complete: true, accounts: [], positions: [] });
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.missingKeys, ["warnings"]);
+});
+
+test("II - null/no-objeto -> invalido, nunca explota", () => {
+  assert.equal(validateFuturesContract(null).valid, false);
+  assert.equal(validateFuturesContract("string").valid, false);
+});
+
+// ================== validateMarketDataContract ==================
+
+test("JJ - shape exacto real de market-data.js -> valido", () => {
+  const result = validateMarketDataContract({ data: { ETH: {} }, errors: [] });
+  assert.equal(result.valid, true);
+});
+
+test("KK - errors no es array -> invalido", () => {
+  const result = validateMarketDataContract({ data: {}, errors: "none" });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, "errors_not_array");
+});
+
+// ================== classifyEndpointDiagnosticResult (integracion) ==================
+
+test("LL - 200 + JSON valido + contrato real cumplido -> VALID_ENDPOINT_RESPONSE", () => {
+  const result = classifyEndpointDiagnosticResult({
+    status: 200, contentType: "application/json", rawText: JSON.stringify({ total_value_usd: 100, is_complete: true, accounts: [], positions: [], warnings: [] }),
+    validateContract: validateFuturesContract,
+  });
+  assert.equal(result.result, "VALID_ENDPOINT_RESPONSE");
+  assert.ok(result.topLevelKeys.includes("total_value_usd"));
+});
+
+test("MM - 200 pero HTML (el caso real encontrado: Vercel Auth con auto_vercel_auth_redirect) -> PLATFORM_INTERCEPT_OR_INVALID_RESPONSE, NUNCA cuenta como exito de Price Truth", () => {
+  const result = classifyEndpointDiagnosticResult({
+    status: 200, contentType: "text/html", rawText: "<html>redirecting...</html>",
+    validateContract: validateFuturesContract,
+  });
+  assert.equal(result.result, "PLATFORM_INTERCEPT_OR_INVALID_RESPONSE");
+  assert.equal(result.shape, "HTTP_200_HTML");
+});
+
+test("NN - 200 + JSON valido pero con shape distinto al contrato real (ej. total_value_usd null) -> PLATFORM_INTERCEPT_OR_INVALID_RESPONSE", () => {
+  const result = classifyEndpointDiagnosticResult({
+    status: 200, contentType: "application/json", rawText: JSON.stringify({ total_value_usd: null, is_complete: null, accounts: [], positions: [], warnings: [] }),
+    validateContract: validateFuturesContract,
+  });
+  assert.equal(result.result, "PLATFORM_INTERCEPT_OR_INVALID_RESPONSE");
+  assert.equal(result.contract.reason, "total_value_usd_not_number");
+});
+
+// ================== buildDiagnosticVerdict (revisado: exige endpointResult, no solo status) ==================
+
+test("OO - ambos endpoints VALID_ENDPOINT_RESPONSE en las 3 iteraciones -> DIAGNOSTIC_OK", () => {
   const result = buildDiagnosticVerdict({
-    marketDataResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
-    futuresResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+    marketDataResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
+    futuresResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
   });
   assert.equal(result, "DIAGNOSTIC_OK");
 });
 
-test("CC - market-data sigue fallando en cualquier iteracion -> DIAGNOSTIC_BLOCKED", () => {
+test("PP - market-data intercepted por plataforma en cualquier iteracion -> DIAGNOSTIC_BLOCKED", () => {
   const result = buildDiagnosticVerdict({
-    marketDataResults: [{ status: 200 }, { status: 401 }, { status: 200 }],
-    futuresResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+    marketDataResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "PLATFORM_INTERCEPT_OR_INVALID_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
+    futuresResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
   });
   assert.equal(result, "DIAGNOSTIC_BLOCKED");
 });
 
-test("DD - futures-equity falla -> tambien DIAGNOSTIC_BLOCKED, ambos endpoints deben ser observables", () => {
+test("QQ - futures-equity con 200 pero respuesta invalida (el caso real que motivo este cambio) -> DIAGNOSTIC_BLOCKED, NUNCA cuenta como exito solo por status 200", () => {
   const result = buildDiagnosticVerdict({
-    marketDataResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
-    futuresResults: [{ status: 200 }, { status: 500 }, { status: 200 }],
+    marketDataResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
+    futuresResults: [{ endpointResult: "VALID_ENDPOINT_RESPONSE" }, { endpointResult: "PLATFORM_INTERCEPT_OR_INVALID_RESPONSE" }, { endpointResult: "VALID_ENDPOINT_RESPONSE" }],
   });
   assert.equal(result, "DIAGNOSTIC_BLOCKED");
 });

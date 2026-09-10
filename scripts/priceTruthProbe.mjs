@@ -36,6 +36,7 @@ import {
   classifyMarketDataIteration, classifyFuturesIteration,
   detectLkgRegression, detectCrossProviderContamination, detectFuturesValuationRegression,
   buildProbeSummary, sanitizeHeadersForLog, truncateBody, classifyResponseFingerprint, buildDiagnosticVerdict,
+  classifyEndpointDiagnosticResult, validateFuturesContract, validateMarketDataContract,
 } from "../lib/priceTruthProbeState.js";
 
 const TARGET_BASE_URL = process.env.TARGET_BASE_URL;
@@ -112,6 +113,14 @@ async function callJson(url, opts, iteration, endpointLabel, httpFailures) {
 }
 
 // ================== MODO DIAGNOSTICO ==================
+// Revision (item 2/3): un 200 NUNCA se cuenta como exito por si solo,
+// para NINGUNO de los dos endpoints -- Vercel Authentication puede
+// devolver 200 con una pagina HTML de auto-redirect en vez de dejar
+// pasar la request al handler real (evidencia real encontrada: el
+// 401 de market-data trae `auto_vercel_auth_redirect: true`). Siempre
+// se captura el fingerprint completo (status/content-type/body
+// truncado/headers seguros/duration), en TODAS las iteraciones, no
+// solo en las que fallan por HTTP.
 async function runDiagnostic() {
   const startedAt = nowIso();
   console.log(`[diagnostic] TARGET_BASE_URL=${TARGET_BASE_URL} CODE_BASE_SHA=${CODE_BASE_SHA} iterations=${ITERATIONS} interval_ms=${INTERVAL_MS} user_agent="${USER_AGENT}"`);
@@ -131,23 +140,24 @@ async function runDiagnostic() {
       { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ items: PROBE_TICKERS }) },
       i, "market-data", httpFailures
     );
-    marketDataResults.push({ status: typeof mdResp.status === "number" ? mdResp.status : 0 });
+    const mdStatus = typeof mdResp.status === "number" ? mdResp.status : 0;
+    const mdDiag = classifyEndpointDiagnosticResult({ status: mdStatus, contentType: mdResp.contentType, rawText: mdResp.rawText, validateContract: validateMarketDataContract });
+    marketDataResults.push({ endpointResult: mdDiag.result });
 
-    let mdFingerprint = null;
-    if (mdResp.status !== 200) {
-      mdFingerprint = {
-        status: mdResp.status,
-        content_type: mdResp.contentType || null,
-        body_snippet: truncateBody(mdResp.rawText, 500),
-        headers: sanitizeHeadersForLog(mdResp.headers),
-        method: "POST",
-        url_path: "/api/market-data",
-        duration_ms: mdResp.duration_ms,
-        classification: classifyResponseFingerprint({ status: typeof mdResp.status === "number" ? mdResp.status : 0, contentType: mdResp.contentType, bodySnippet: mdResp.rawText, headers: sanitizeHeadersForLog(mdResp.headers) }),
-      };
-      console.log(`[diagnostic] iter ${i}/${ITERATIONS} market-data FAIL fingerprint: ${JSON.stringify(mdFingerprint)}`);
-    } else {
-      console.log(`[diagnostic] iter ${i}/${ITERATIONS} market-data OK status=200 duration_ms=${mdResp.duration_ms}`);
+    const mdFingerprint = {
+      status: mdStatus, content_type: mdResp.contentType || null,
+      body_snippet: truncateBody(mdResp.rawText, 500), headers: sanitizeHeadersForLog(mdResp.headers),
+      method: "POST", url_path: "/api/market-data", duration_ms: mdResp.duration_ms,
+      json_parsed: mdDiag.shape === "HTTP_200_VALID_JSON", top_level_keys: mdDiag.topLevelKeys,
+      shape: mdDiag.shape, endpoint_result: mdDiag.result, contract: mdDiag.contract,
+      fingerprint_classification: mdStatus !== 200 ? classifyResponseFingerprint({ status: mdStatus, contentType: mdResp.contentType, bodySnippet: mdResp.rawText, headers: sanitizeHeadersForLog(mdResp.headers) }) : null,
+    };
+    console.log(`[diagnostic] iter ${i}/${ITERATIONS} market-data ${mdDiag.result}: ${JSON.stringify(mdFingerprint)}`);
+
+    let mdTickers = null;
+    if (mdDiag.result === "VALID_ENDPOINT_RESPONSE") {
+      mdTickers = classifyMarketDataIteration(mdResp.json, TICKER_NAMES);
+      console.log(`[diagnostic]   tickers: ${JSON.stringify(mdTickers)}`);
     }
 
     const feResp = await callJson(
@@ -155,24 +165,32 @@ async function runDiagnostic() {
       { method: "GET", headers: authHeaders() },
       i, "futures-equity", httpFailures
     );
-    futuresResults.push({ status: typeof feResp.status === "number" ? feResp.status : 0 });
+    const feStatus = typeof feResp.status === "number" ? feResp.status : 0;
+    const feDiag = classifyEndpointDiagnosticResult({ status: feStatus, contentType: feResp.contentType, rawText: feResp.rawText, validateContract: validateFuturesContract });
+    futuresResults.push({ endpointResult: feDiag.result });
 
-    let feDiagnostics = null;
-    if (feResp.status === 200) {
-      const classified = classifyFuturesIteration(feResp.json);
-      feDiagnostics = classified;
-      console.log(`[diagnostic] iter ${i}/${ITERATIONS} futures-equity OK total_value_usd=${classified.total_value_usd} is_complete=${classified.is_complete} warnings=${JSON.stringify(classified.warnings)}`);
-      console.log(`[diagnostic]   USD-M (USDT): ${JSON.stringify(classified.usdm)}`);
-      console.log(`[diagnostic]   COIN-M (BTC): ${JSON.stringify(classified.coinm)}`);
-    } else {
-      feDiagnostics = {
-        status: feResp.status, content_type: feResp.contentType || null,
-        body_snippet: truncateBody(feResp.rawText, 500), headers: sanitizeHeadersForLog(feResp.headers),
-      };
-      console.log(`[diagnostic] iter ${i}/${ITERATIONS} futures-equity FAIL fingerprint: ${JSON.stringify(feDiagnostics)}`);
+    const feFingerprint = {
+      status: feStatus, content_type: feResp.contentType || null,
+      body_snippet: truncateBody(feResp.rawText, 500), headers: sanitizeHeadersForLog(feResp.headers),
+      method: "GET", url_path: "/api/futures-equity", duration_ms: feResp.duration_ms,
+      json_parsed: feDiag.shape === "HTTP_200_VALID_JSON", top_level_keys: feDiag.topLevelKeys,
+      shape: feDiag.shape, endpoint_result: feDiag.result, contract: feDiag.contract,
+      fingerprint_classification: feStatus !== 200 ? classifyResponseFingerprint({ status: feStatus, contentType: feResp.contentType, bodySnippet: feResp.rawText, headers: sanitizeHeadersForLog(feResp.headers) }) : null,
+    };
+    console.log(`[diagnostic] iter ${i}/${ITERATIONS} futures-equity ${feDiag.result}: ${JSON.stringify(feFingerprint)}`);
+
+    let feBalances = null;
+    if (feDiag.result === "VALID_ENDPOINT_RESPONSE") {
+      feBalances = classifyFuturesIteration(feResp.json);
+      console.log(`[diagnostic]   USD-M (USDT): ${JSON.stringify(feBalances.usdm)}`);
+      console.log(`[diagnostic]   COIN-M (BTC): ${JSON.stringify(feBalances.coinm)}`);
     }
 
-    const record = { iteration: i, timestamp: iterStart, market_data_fingerprint: mdFingerprint, market_data_status: mdResp.status, futures_equity: feDiagnostics, futures_equity_status: feResp.status };
+    const record = {
+      iteration: i, timestamp: iterStart,
+      market_data: mdFingerprint, market_data_tickers: mdTickers,
+      futures_equity: feFingerprint, futures_equity_balances: feBalances,
+    };
     perIteration.push(record);
     appendFileSync("price-truth-diagnostic.jsonl", JSON.stringify(record) + "\n");
 
@@ -190,17 +208,17 @@ async function runDiagnostic() {
   lines.push(`started_at: ${startedAt} | finished_at: ${finishedAt}`);
   lines.push(`iterations: ${ITERATIONS}`);
   lines.push("");
-  lines.push("## 1. market-data HTTP results");
-  perIteration.forEach((r) => lines.push(`- iter ${r.iteration}: status=${r.market_data_status}`));
+  lines.push("## 1. market-data -- por iteracion (endpoint_result, nunca solo status)");
+  perIteration.forEach((r) => lines.push(`- iter ${r.iteration}: ${JSON.stringify(r.market_data)}`));
   lines.push("");
-  lines.push("## 2. market-data fingerprint (solo iteraciones no-2xx)");
-  perIteration.filter((r) => r.market_data_fingerprint).forEach((r) => lines.push(`- iter ${r.iteration}: ${JSON.stringify(r.market_data_fingerprint)}`));
+  lines.push("## 2. market-data tickers (solo iteraciones VALID_ENDPOINT_RESPONSE)");
+  perIteration.filter((r) => r.market_data_tickers).forEach((r) => lines.push(`- iter ${r.iteration}: ${JSON.stringify(r.market_data_tickers)}`));
   lines.push("");
-  lines.push("## 3. futures-equity HTTP results");
-  perIteration.forEach((r) => lines.push(`- iter ${r.iteration}: status=${r.futures_equity_status}`));
-  lines.push("");
-  lines.push("## 4. futures-equity breakdown (USD-M / COIN-M)");
+  lines.push("## 3. futures-equity -- por iteracion (endpoint_result, nunca solo status)");
   perIteration.forEach((r) => lines.push(`- iter ${r.iteration}: ${JSON.stringify(r.futures_equity)}`));
+  lines.push("");
+  lines.push("## 4. futures-equity breakdown USD-M / COIN-M (solo iteraciones VALID_ENDPOINT_RESPONSE)");
+  perIteration.filter((r) => r.futures_equity_balances).forEach((r) => lines.push(`- iter ${r.iteration}: ${JSON.stringify(r.futures_equity_balances)}`));
   lines.push("");
   lines.push(`user_agent_applied: "${USER_AGENT}" (aplicado a AMBAS llamadas, market-data y futures-equity)`);
 
