@@ -1,0 +1,50 @@
+name: Price Truth Stability Probe
+
+# Probe de observabilidad pura (15 minutos reales) -- ver
+# scripts/priceTruthProbe.mjs / lib/priceTruthProbeState.js. Nunca
+# corrige nada, nunca cambia formulas/TTL/MAX_STALE_AGE/breaker
+# behavior. Corre en GitHub Actions por el mismo motivo que el
+# Conviction Coverage Orchestrator: egress real, a diferencia del
+# sandbox de Claude Code (*.vercel.app da 403 CONNECT rejected ahi).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_base_url:
+        description: 'Preview URL a probar, SIN trailing slash (ej. https://moni-capital-git-....vercel.app) -- requerido, nunca hay default'
+        required: true
+        type: string
+      iterations:
+        description: 'Numero de corridas (default 16 -- con intervalo de 60s da ~15 min entre la muestra #1 y la ultima)'
+        required: false
+        default: '16'
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run Price Truth Stability Probe
+        env:
+          TARGET_BASE_URL: ${{ inputs.target_base_url }}
+          ITERATIONS: ${{ inputs.iterations }}
+          VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: node scripts/priceTruthProbe.mjs
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-truth-probe-results
+          path: |
+            price-truth-probe.jsonl
+            price-truth-summary.md
+          retention-days: 30
