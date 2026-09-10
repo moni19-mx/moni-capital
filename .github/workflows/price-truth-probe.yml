@@ -14,10 +14,14 @@ on:
         description: 'Preview URL a probar, SIN trailing slash (ej. https://moni-capital-git-....vercel.app) -- requerido, nunca hay default'
         required: true
         type: string
-      iterations:
-        description: 'Numero de corridas (default 16 -- con intervalo de 60s da ~15 min entre la muestra #1 y la ultima)'
+      mode:
+        description: 'diagnostic (3 iter, ~2 min, NO certifica Price Truth) | certification (16 iter, ~15 min, produce PASS/FAIL)'
         required: false
-        default: '16'
+        default: 'diagnostic'
+        type: string
+      iterations:
+        description: 'Numero de corridas -- default segun mode si se deja vacio (diagnostic=3, certification=16)'
+        required: false
         type: string
   # Bootstrap (mismo patron que conviction-coverage.yml): GitHub solo
   # permite disparar workflow_dispatch via API para un workflow que YA
@@ -49,7 +53,8 @@ jobs:
       - name: Run Price Truth Stability Probe
         env:
           TARGET_BASE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.target_base_url || 'https://moni-capital-git-claude-supabase-mon-bcfab4-moni19-mxs-projects.vercel.app' }}
-          ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '16' }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'diagnostic' }}
+          ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '' }}
           VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
           GITHUB_SHA: ${{ github.sha }}
         run: node scripts/priceTruthProbe.mjs
@@ -62,4 +67,7 @@ jobs:
           path: |
             price-truth-probe.jsonl
             price-truth-summary.md
+            price-truth-diagnostic.jsonl
+            price-truth-diagnostic-summary.md
           retention-days: 30
+          if-no-files-found: ignore

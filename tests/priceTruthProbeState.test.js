@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   classifyMarketDataIteration, classifyFuturesIteration,
   detectLkgRegression, detectCrossProviderContamination, detectFuturesValuationRegression,
+  sanitizeHeadersForLog, truncateBody, classifyResponseFingerprint, buildDiagnosticVerdict,
 } from "../lib/priceTruthProbeState.js";
 
 // ================== classifyMarketDataIteration ==================
@@ -153,4 +154,98 @@ test("O - USD-M incluido en iter 1, excluido en iter 2 -> regresion detectada", 
 test("P - nunca incluido -> nunca hay regresion (no hay baseline usable que perder)", () => {
   const { regression } = detectFuturesValuationRegression({ bucket: "COIN-M", previousIncluded: null, currentIncluded: { included: false }, iterationIndex: 1, current: { included: false } });
   assert.equal(regression, null);
+});
+
+// ================== sanitizeHeadersForLog / truncateBody (modo diagnostico) ==================
+
+test("Q - sanitizeHeadersForLog solo captura la whitelist -- un header desconocido nunca se loguea", () => {
+  const headers = new Map([
+    ["content-type", "text/html"], ["x-vercel-id", "abc123"],
+    ["authorization", "Bearer secret-should-never-appear"], ["x-custom-unknown", "whatever"],
+  ]);
+  const result = sanitizeHeadersForLog(headers);
+  assert.equal(result["content-type"], "text/html");
+  assert.equal(result["x-vercel-id"], "abc123");
+  assert.equal(result.authorization, undefined, "REGRESION: un secreto/header no-whitelisted jamas debe aparecer en el log");
+  assert.equal(result["x-custom-unknown"], undefined);
+});
+
+test("R - sanitizeHeadersForLog: set-cookie nunca expone su valor, solo presencia", () => {
+  const headers = new Map([["set-cookie", "session=abc123; secret-value-here"]]);
+  const result = sanitizeHeadersForLog(headers);
+  assert.equal(result["set-cookie"], "PRESENT_REDACTED");
+  assert.ok(!JSON.stringify(result).includes("abc123"));
+});
+
+test("S - sanitizeHeadersForLog acepta objeto plano ademas de Headers/Map", () => {
+  const result = sanitizeHeadersForLog({ "Content-Type": "application/json" });
+  assert.equal(result["content-type"], "application/json");
+});
+
+test("T - truncateBody trunca cuerpos largos con limite explicito, nunca los oculta por completo", () => {
+  const long = "x".repeat(1000);
+  const truncated = truncateBody(long, 500);
+  assert.equal(truncated.length, 500 + "...[truncated, 1000 bytes total]".length);
+  assert.ok(truncated.startsWith("x".repeat(500)));
+});
+
+test("U - truncateBody con texto corto no lo toca", () => {
+  assert.equal(truncateBody("short body", 500), "short body");
+});
+
+test("V - truncateBody con null/undefined -> null, nunca explota", () => {
+  assert.equal(truncateBody(null), null);
+  assert.equal(truncateBody(undefined), null);
+});
+
+// ================== classifyResponseFingerprint ==================
+
+test("W - 200 real -> OK", () => {
+  assert.equal(classifyResponseFingerprint({ status: 200, contentType: "application/json", bodySnippet: "{}", headers: {} }), "OK");
+});
+
+test("X - 401 JSON con nuestro shape exacto {error:unauthorized} -> APP_LEVEL_REJECTION_UNEXPECTED (documentado como imposible hoy, nunca oculto)", () => {
+  const result = classifyResponseFingerprint({ status: 401, contentType: "application/json", bodySnippet: '{"error":"unauthorized"}', headers: {} });
+  assert.equal(result, "APP_LEVEL_REJECTION_UNEXPECTED");
+});
+
+test("Y - 401 con body mencionando vercel + authenticate -> VERCEL_DEPLOYMENT_PROTECTION_LIKELY", () => {
+  const result = classifyResponseFingerprint({ status: 401, contentType: "text/html", bodySnippet: "<html>Vercel Authentication required, please authenticate</html>", headers: {} });
+  assert.equal(result, "VERCEL_DEPLOYMENT_PROTECTION_LIKELY");
+});
+
+test("Z - 401 con header x-vercel-error -> VERCEL_FIREWALL_LIKELY", () => {
+  const result = classifyResponseFingerprint({ status: 401, contentType: "text/plain", bodySnippet: "denied", headers: { "x-vercel-error": "FIREWALL_DENIED" } });
+  assert.equal(result, "VERCEL_FIREWALL_LIKELY");
+});
+
+test("AA - 401 sin ninguna senal fuerte -> UNKNOWN_NON_2XX_SOURCE, NUNCA adivina WAF sin evidencia", () => {
+  const result = classifyResponseFingerprint({ status: 401, contentType: "text/plain", bodySnippet: "Unauthorized", headers: {} });
+  assert.equal(result, "UNKNOWN_NON_2XX_SOURCE");
+});
+
+// ================== buildDiagnosticVerdict ==================
+
+test("BB - todos 2xx en ambos endpoints -> DIAGNOSTIC_OK", () => {
+  const result = buildDiagnosticVerdict({
+    marketDataResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+    futuresResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+  });
+  assert.equal(result, "DIAGNOSTIC_OK");
+});
+
+test("CC - market-data sigue fallando en cualquier iteracion -> DIAGNOSTIC_BLOCKED", () => {
+  const result = buildDiagnosticVerdict({
+    marketDataResults: [{ status: 200 }, { status: 401 }, { status: 200 }],
+    futuresResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+  });
+  assert.equal(result, "DIAGNOSTIC_BLOCKED");
+});
+
+test("DD - futures-equity falla -> tambien DIAGNOSTIC_BLOCKED, ambos endpoints deben ser observables", () => {
+  const result = buildDiagnosticVerdict({
+    marketDataResults: [{ status: 200 }, { status: 200 }, { status: 200 }],
+    futuresResults: [{ status: 200 }, { status: 500 }, { status: 200 }],
+  });
+  assert.equal(result, "DIAGNOSTIC_BLOCKED");
 });
