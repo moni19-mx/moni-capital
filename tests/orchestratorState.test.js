@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   needsSecFetch, needsScoring, classifySecResult, verifyEngineInvariants,
-  redactSecret, deriveRunStatus, buildRunSummary, BLOCKER_REASONS,
+  redactSecret, deriveRunStatus, buildRunSummary, BLOCKER_REASONS, classifyAuthResponse,
 } from "../lib/orchestratorState.js";
 
 // ============== needsSecFetch (item 5/7A: same-run + cross-ticker skip) ==============
@@ -161,4 +161,42 @@ test("Y: la firma de buildRunSummary no acepta ningun campo de credencial -- est
     opportunityByTicker: {},
   });
   assert.equal(summary.includes(fakeSecret), false);
+});
+
+// ============== classifyAuthResponse (item 5: Vercel Deployment Protection vs app auth) ==============
+
+test("Z: 200 real -> OK, no es un caso de auth failure", () => {
+  assert.equal(classifyAuthResponse({ status: 200, contentType: "application/json", parsedBody: { ok: true } }), "OK");
+});
+
+test("AA: 401 con nuestro shape exacto {error:unauthorized} en JSON -> APP_AUTH_FAILED (Vercel dejo pasar, nuestro codigo corrio y rechazo)", () => {
+  const result = classifyAuthResponse({ status: 401, contentType: "application/json; charset=utf-8", parsedBody: { error: "unauthorized" } });
+  assert.equal(result, "APP_AUTH_FAILED");
+});
+
+test("BB: 401 con HTML (Vercel Deployment Protection block page) -> PLATFORM_AUTH_FAILED", () => {
+  const result = classifyAuthResponse({ status: 401, contentType: "text/html; charset=utf-8", parsedBody: null });
+  assert.equal(result, "PLATFORM_AUTH_FAILED");
+});
+
+test("CC: 401 con JSON pero forma distinta a la nuestra (no viene de checkAdminAuth) -> PLATFORM_AUTH_FAILED", () => {
+  const result = classifyAuthResponse({ status: 401, contentType: "application/json", parsedBody: { message: "Authentication Required" } });
+  assert.equal(result, "PLATFORM_AUTH_FAILED");
+});
+
+test("DD: 403 (no solo 401) con nuestro shape -> tambien se evalua, no solo 401", () => {
+  const result = classifyAuthResponse({ status: 403, contentType: "application/json", parsedBody: { error: "unauthorized" } });
+  assert.equal(result, "APP_AUTH_FAILED");
+});
+
+test("EE: 500 u otro status no-auth -> OK (no es un caso de auth failure, es otro tipo de error)", () => {
+  assert.equal(classifyAuthResponse({ status: 500, contentType: "application/json", parsedBody: { error: "internal" } }), "OK");
+});
+
+test("FF: nunca revela el valor de ningun secreto -- solo status/content-type/shape entran a la funcion, nunca un valor de env var", () => {
+  // La firma de classifyAuthResponse no acepta ningun parametro de
+  // credencial -- estructuralmente no puede filtrar un secreto.
+  const result = classifyAuthResponse({ status: 401, contentType: "text/html", parsedBody: null });
+  assert.equal(typeof result, "string");
+  assert.ok(!result.toLowerCase().includes("secret"));
 });

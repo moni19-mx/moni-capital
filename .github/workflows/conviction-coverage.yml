@@ -52,6 +52,7 @@ jobs:
       - name: Run Conviction Coverage Orchestrator
         env:
           MONI_ADMIN_SECRET: ${{ secrets.MONI_ADMIN_SECRET }}
+          VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
           VERCEL_BASE_URL: ${{ vars.VERCEL_BASE_URL }}
           MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'FULL_PIPELINE' }}
           TICKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.tickers || 'GOOG,NVDA' }}

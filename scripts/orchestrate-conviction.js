@@ -11,14 +11,26 @@
 // en lib/*.js.
 //
 // Uso: node scripts/orchestrate-conviction.js --tickers=GOOG,NVDA --mode=FULL_PIPELINE
-// Env requerido: MONI_ADMIN_SECRET (nunca se imprime, nunca se loguea).
-// Env opcional: VERCEL_BASE_URL (default: el preview de este sprint).
+// Env requerido: MONI_ADMIN_SECRET (auth de la app -- nunca se imprime).
+// Env opcional: VERCEL_BASE_URL (default: el preview de este sprint),
+//   VERCEL_PROTECTION_BYPASS_SECRET (bypass de Vercel Deployment
+//   Protection a nivel de plataforma -- capa SEPARADA de
+//   MONI_ADMIN_SECRET, defense in depth; si Deployment Protection no
+//   esta activo en el proyecto simplemente se omite el header).
 
-import { needsSecFetch, needsScoring, classifySecResult, verifyEngineInvariants, deriveRunStatus, buildRunSummary } from "../lib/orchestratorState.js";
+import { needsSecFetch, needsScoring, classifySecResult, verifyEngineInvariants, deriveRunStatus, buildRunSummary, classifyAuthResponse } from "../lib/orchestratorState.js";
 
 const DEFAULT_BASE_URL = "https://moni-capital-git-claude-supabase-mon-bcfab4-moni19-mxs-projects.vercel.app";
 const BASE_URL = process.env.VERCEL_BASE_URL || DEFAULT_BASE_URL;
 const SECRET = process.env.MONI_ADMIN_SECRET;
+// Bypass de Vercel Deployment Protection (item 1-2 del sprint de
+// automatizacion) -- capa DISTINTA del auth de la app (x-admin-secret).
+// Defense in depth deliberado (item 6): el bypass solo atraviesa la
+// proteccion de plataforma de Vercel, nunca reemplaza la autorizacion
+// administrativa propia de Moni. Opcional: si no esta configurado,
+// simplemente no se manda ese header (para no romper un entorno sin
+// Deployment Protection activo).
+const VERCEL_BYPASS = process.env.VERCEL_PROTECTION_BYPASS_SECRET;
 
 function parseArgs() {
   const args = { tickers: [], mode: "FULL_PIPELINE", resumeRunId: null };
@@ -32,18 +44,42 @@ function parseArgs() {
 }
 
 async function callVercel(path, { method = "GET", body } = {}) {
+  // Helper central UNICA (item 4) -- todas las llamadas administrativas
+  // pasan por aca, nunca se duplican headers por endpoint. Dos capas de
+  // auth SEPARADAS (item 2/6, defense in depth): el bypass de Vercel
+  // solo atraviesa Deployment Protection a nivel de plataforma; el
+  // admin-secret sigue siendo la autorizacion propia de Moni, nunca se
+  // reemplazan entre si.
   const url = `${BASE_URL}${path}`;
   const headers = { "x-admin-secret": SECRET };
+  if (VERCEL_BYPASS) headers["x-vercel-protection-bypass"] = VERCEL_BYPASS;
   if (body) headers["Content-Type"] = "application/json";
   const resp = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const contentType = resp.headers.get("content-type") || "";
+  const rawText = await resp.text();
   let json = null;
-  try { json = await resp.json(); } catch { /* respuesta no-JSON, json queda null */ }
-  return { ok: resp.ok, status: resp.status, json };
+  try { json = JSON.parse(rawText); } catch { /* respuesta no-JSON, json queda null */ }
+  const authFailure = classifyAuthResponse({ status: resp.status, contentType, parsedBody: json });
+  return { ok: resp.ok, status: resp.status, json, contentType, authFailure };
 }
 
 function logStep(ticker, msg) {
   // Nunca imprime SECRET -- solo mensajes de progreso.
   console.log(`[${ticker || "run"}] ${msg}`);
+}
+
+// Item 5: reporta PLATFORM_AUTH_FAILED vs APP_AUTH_FAILED (o un error
+// http generico si no es 401/403) sin revelar ningun secreto -- solo
+// status, content-type, y la clasificacion pura de
+// lib/orchestratorState.js::classifyAuthResponse.
+function reportAuthOrHttpFailure(step, resp) {
+  if (resp.authFailure === "PLATFORM_AUTH_FAILED") {
+    console.error(`[${step}] PLATFORM_AUTH_FAILED -- Vercel Deployment Protection bloqueo la request antes de llegar a nuestro codigo (http ${resp.status}, content-type="${resp.contentType}"). Revisar VERCEL_PROTECTION_BYPASS_SECRET.`);
+  } else if (resp.authFailure === "APP_AUTH_FAILED") {
+    console.error(`[${step}] APP_AUTH_FAILED -- Vercel dejo pasar la request, pero x-admin-secret no coincide con MONI_ADMIN_SECRET en el deployment actual (http ${resp.status}).`);
+  } else {
+    console.error(`[${step}] http ${resp.status} (no relacionado a auth)`);
+  }
 }
 
 async function updateItem(runId, ticker, fields) {
@@ -65,7 +101,7 @@ async function processTicker(runId, ticker, mode, runItem) {
   const statusResp = await callVercel(`/api/conviction-benchmark-temp?run_action=sec_status`, {
     method: "POST", body: { tickers: [ticker] },
   });
-  if (!statusResp.ok) return blockedAs("SEC_HTTP_ERROR", `sec_status http ${statusResp.status}`);
+  if (!statusResp.ok) return blockedAs("SEC_HTTP_ERROR", `sec_status http ${statusResp.status} (${statusResp.authFailure})`);
   const secStatus = statusResp.json.results[0];
 
   if (mode !== "SCORE_ONLY" && needsSecFetch({ runItem, secStatusFromDb: secStatus })) {
@@ -74,7 +110,7 @@ async function processTicker(runId, ticker, mode, runItem) {
     const secResp = await callVercel(`/api/sec-benchmark-temp?tickers=${encodeURIComponent(ticker)}`);
     const secOk = secResp.ok && secResp.json?.summary?.[0]?.ok === true;
     if (!secOk) {
-      return blockedAs("SEC_HTTP_ERROR", secResp.json?.summary?.[0]?.error || `sec fetch http ${secResp.status}`);
+      return blockedAs("SEC_HTTP_ERROR", secResp.json?.summary?.[0]?.error || `sec fetch http ${secResp.status} (${secResp.authFailure})`);
     }
     // Re-chequear estado real post-fetch -- nunca asumir que el insert
     // implica READY_TO_SCORE (puede haber quedado con conceptos
@@ -106,7 +142,7 @@ async function processTicker(runId, ticker, mode, runItem) {
     const scoreResp = await callVercel(`/api/conviction-benchmark-temp?score_tickers=${encodeURIComponent(ticker)}`);
     const scoreRow = scoreResp.json?.scoring?.results?.find((r) => r.ticker === ticker);
     if (!scoreResp.ok || !scoreRow || scoreRow.skipped) {
-      return blockedAs("SCORING_ERROR", scoreRow?.reason || `scoring http ${scoreResp.status}`);
+      return blockedAs("SCORING_ERROR", scoreRow?.reason || `scoring http ${scoreResp.status} (${scoreResp.authFailure})`);
     }
     scoringResult = scoreRow;
     convictionHistoryId = scoreRow.conviction_history_id;
@@ -154,7 +190,7 @@ async function main() {
     // muerto a mitad de camino.
     const getResp = await callVercel(`/api/conviction-benchmark-temp?run_action=get_run&run_id=${resumeRunId}`);
     if (!getResp.ok) {
-      console.error(`No se pudo leer run_id=${resumeRunId}: http ${getResp.status}`);
+      reportAuthOrHttpFailure("get_run", getResp);
       process.exit(1);
     }
     runId = resumeRunId;
@@ -172,7 +208,7 @@ async function main() {
       method: "POST", body: { mode, tickers },
     });
     if (!createResp.ok) {
-      console.error(`No se pudo crear el run: http ${createResp.status}`);
+      reportAuthOrHttpFailure("create_run", createResp);
       process.exit(1);
     }
     runId = createResp.json.run_id;
