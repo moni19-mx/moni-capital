@@ -12,10 +12,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  CANDIDATE_TAGS, CANONICAL_CONCEPTS,
+  CANDIDATE_TAGS, CANONICAL_CONCEPTS, CONCEPT_UNITS, selectCompatibleUnit,
   extractAnnualPoints, scoreCandidate, computeConfidence, confidenceRank,
   pickWinnerAndDetectAmbiguity, extractQuarterlyPoints, computeTtmEps,
 } from "../lib/secFinancialsResolver.js";
+
+const USD = ["USD"];
+const USD_PER_SHARE = ["USD/shares"];
 
 function annualEntry({ end, start, val, form = "10-K", filed, fy }) {
   return { start, end, val, form, filed: filed || end, fy };
@@ -33,7 +36,7 @@ test("A - extractAnnualPoints: filtra por forma confiable (10-K) y duracion ~365
       ],
     },
   };
-  const points = extractAnnualPoints(conceptJson);
+  const points = extractAnnualPoints(conceptJson, USD);
   assert.equal(points.length, 1);
   assert.equal(points[0].value, 1000);
 });
@@ -47,7 +50,7 @@ test("B - extractAnnualPoints: 10-K/A mas reciente gana sobre el 10-K original d
       ],
     },
   };
-  const points = extractAnnualPoints(conceptJson);
+  const points = extractAnnualPoints(conceptJson, USD);
   assert.equal(points.length, 1);
   assert.equal(points[0].value, 1050);
   assert.equal(points[0].form, "10-K/A");
@@ -106,7 +109,7 @@ test("H - EPS_DILUTED resuelve con la MISMA maquinaria anual que REVENUE (extrac
       ],
     },
   };
-  const points = extractAnnualPoints(conceptJson);
+  const points = extractAnnualPoints(conceptJson, USD_PER_SHARE);
   const candidates = [{ tag: "EarningsPerShareDiluted", points, score: scoreCandidate(points) }];
   const result = pickWinnerAndDetectAmbiguity(candidates, CANDIDATE_TAGS.EPS_DILUTED);
   assert.equal(result.status, "OK");
@@ -119,8 +122,8 @@ test("I - EPS_DILUTED cae a EarningsPerShareBasicAndDiluted cuando el emisor no 
   const basicAndDilutedJson = {
     units: { "USD/shares": [annualEntry({ start: "2025-01-01", end: "2025-12-31", val: 2.3, fy: 2025 })] },
   };
-  const pointsDiluted = extractAnnualPoints(dilutedJson);
-  const pointsBasicDiluted = extractAnnualPoints(basicAndDilutedJson);
+  const pointsDiluted = extractAnnualPoints(dilutedJson, USD_PER_SHARE);
+  const pointsBasicDiluted = extractAnnualPoints(basicAndDilutedJson, USD_PER_SHARE);
   const candidates = [];
   if (pointsDiluted.length > 0) candidates.push({ tag: "EarningsPerShareDiluted", points: pointsDiluted, score: scoreCandidate(pointsDiluted) });
   if (pointsBasicDiluted.length > 0) candidates.push({ tag: "EarningsPerShareBasicAndDiluted", points: pointsBasicDiluted, score: scoreCandidate(pointsBasicDiluted) });
@@ -150,7 +153,7 @@ test("K - extractQuarterlyPoints: filtra por forma 10-Q y duracion ~90 dias, exc
       ],
     },
   };
-  const points = extractQuarterlyPoints(conceptJson);
+  const points = extractQuarterlyPoints(conceptJson, USD_PER_SHARE);
   assert.equal(points.length, 1);
   assert.equal(points[0].value, 1.2);
 });
@@ -164,8 +167,8 @@ test("L - extractQuarterlyPoints: reusa el MISMO JSON que extractAnnualPoints (c
       ],
     },
   };
-  const annual = extractAnnualPoints(conceptJson);
-  const quarterly = extractQuarterlyPoints(conceptJson);
+  const annual = extractAnnualPoints(conceptJson, USD_PER_SHARE);
+  const quarterly = extractQuarterlyPoints(conceptJson, USD_PER_SHARE);
   assert.equal(annual.length, 1);
   assert.equal(quarterly.length, 1);
 });
@@ -241,4 +244,105 @@ test("S - confidenceRank: orden real HIGH > MEDIUM > LOW > desconocido, usado po
   assert.ok(confidenceRank("HIGH") > confidenceRank("MEDIUM"));
   assert.ok(confidenceRank("MEDIUM") > confidenceRank("LOW"));
   assert.equal(confidenceRank("DATA_UNAVAILABLE"), 0);
+});
+
+// ================== Grupo 4: bugfix de seleccion de unidad (caso real BE) ==================
+// BUGFIX real: Object.keys(units)[0] tomaba la PRIMERA key del objeto
+// JSON sin importar si era la unidad correcta -- el orden de keys de un
+// objeto NUNCA es un contrato de SEC. Confirmado con evidencia real:
+// BE tiene multiples unidades en su companyconcept de
+// EarningsPerShareDiluted, "USD/shares" no es la primera -- esto hacia
+// que el resolver cayera silenciosamente al tag de fallback
+// (EarningsPerShareBasicAndDiluted, con un valor de 2020) en vez de ver
+// el valor real de 2025 bajo el tag correcto.
+
+test("T - selectCompatibleUnit: elige la unidad permitida aunque NO sea la primera key del objeto (caso real BE)", () => {
+  // Shape real: "USD" (una unidad NO declarada para EPS_DILUTED) aparece
+  // ANTES que "USD/shares" en el objeto -- exactamente el patron que
+  // rompia Object.keys(units)[0].
+  const units = {
+    USD: [{ val: 999999 }], // unidad NO compatible con EPS_DILUTED, nunca debe elegirse
+    "USD/shares": [{ val: 1.5 }],
+  };
+  const unitKey = selectCompatibleUnit(units, CONCEPT_UNITS.EPS_DILUTED);
+  assert.equal(unitKey, "USD/shares");
+});
+
+test("U - selectCompatibleUnit: unidad esperada ausente -> null, NUNCA usa otra unidad en su lugar", () => {
+  const units = { USD: [{ val: 1000 }], shares: [{ val: 500 }], pure: [{ val: 1 }] };
+  const unitKey = selectCompatibleUnit(units, CONCEPT_UNITS.EPS_DILUTED); // pide "USD/shares", no existe
+  assert.equal(unitKey, null);
+});
+
+test("V - selectCompatibleUnit: unidad presente pero vacia (array sin elementos) -> null, no se elige una unidad sin datos reales", () => {
+  const units = { "USD/shares": [] };
+  const unitKey = selectCompatibleUnit(units, CONCEPT_UNITS.EPS_DILUTED);
+  assert.equal(unitKey, null);
+});
+
+test("W - selectCompatibleUnit: unidad presente pero con forma no-array (el crash real reproducido con BE) -> null, nunca truena", () => {
+  const units = { "USD/shares": { unexpected: "shape" } };
+  assert.doesNotThrow(() => selectCompatibleUnit(units, CONCEPT_UNITS.EPS_DILUTED));
+  assert.equal(selectCompatibleUnit(units, CONCEPT_UNITS.EPS_DILUTED), null);
+});
+
+test("X - REGRESION BE: fixture real (USD aparece primero, USD/shares tiene el EPS 2025 real) -- EPS_DILUTED debe resolver el punto reciente, NUNCA caer al fallback de 2020 solo por orden de keys", () => {
+  // EarningsPerShareDiluted: shape real de BE -- "USD" primero (no
+  // compatible), "USD/shares" con el punto real reciente (FY2025).
+  const dilutedJson = {
+    units: {
+      USD: [annualEntry({ start: "2020-01-01", end: "2020-12-31", val: -50000000, fy: 2020 })], // unidad incorrecta, nunca debe leerse como EPS
+      "USD/shares": [annualEntry({ start: "2025-01-01", end: "2025-12-31", val: -0.37, filed: "2026-02-09", fy: 2025 })],
+    },
+  };
+  // EarningsPerShareBasicAndDiluted: solo tiene el valor viejo de 2020.
+  const basicAndDilutedJson = {
+    units: {
+      "USD/shares": [annualEntry({ start: "2020-01-01", end: "2020-12-31", val: -1.14, filed: "2021-02-26", fy: 2020 })],
+    },
+  };
+
+  const tags = CANDIDATE_TAGS.EPS_DILUTED;
+  const allowedUnits = CONCEPT_UNITS.EPS_DILUTED;
+  const candidates = [];
+  const dilutedPoints = extractAnnualPoints(dilutedJson, allowedUnits);
+  if (dilutedPoints.length > 0) candidates.push({ tag: "EarningsPerShareDiluted", points: dilutedPoints, score: scoreCandidate(dilutedPoints) });
+  const basicDilutedPoints = extractAnnualPoints(basicAndDilutedJson, allowedUnits);
+  if (basicDilutedPoints.length > 0) candidates.push({ tag: "EarningsPerShareBasicAndDiluted", points: basicDilutedPoints, score: scoreCandidate(basicDilutedPoints) });
+
+  const result = pickWinnerAndDetectAmbiguity(candidates, tags);
+  assert.equal(result.status, "OK");
+  assert.equal(result.tag, "EarningsPerShareDiluted"); // el tag preferido, no el fallback
+  assert.equal(result.points[0].value, -0.37); // el punto REAL de 2025, no el de 2020
+  assert.equal(result.points[0].fiscal_year, 2025);
+});
+
+// ================== Grupo 5: contrato explicito concepto -> unidad (cross-concept) ==================
+
+test("Y - CONCEPT_UNITS declara exactamente una unidad monetaria (USD) para cada concepto contable, y USD/shares SOLO para EPS_DILUTED", () => {
+  for (const concept of ["REVENUE", "NET_INCOME", "OPERATING_INCOME", "OPERATING_CASH_FLOW", "CAPEX"]) {
+    assert.deepEqual(CONCEPT_UNITS[concept], ["USD"]);
+  }
+  assert.deepEqual(CONCEPT_UNITS.EPS_DILUTED, ["USD/shares"]);
+});
+
+test("Z - orden de keys de `units` nunca importa para NINGUN concepto anual existente (REVENUE ejemplo, unidad no-USD primero)", () => {
+  const conceptJson = {
+    units: {
+      shares: [{ val: 12345 }], // unidad irrelevante que aparece primero -- nunca debe elegirse para REVENUE
+      USD: [annualEntry({ start: "2025-01-01", end: "2025-12-31", val: 500000000, fy: 2025 })],
+    },
+  };
+  const points = extractAnnualPoints(conceptJson, CONCEPT_UNITS.REVENUE);
+  assert.equal(points.length, 1);
+  assert.equal(points[0].value, 500000000);
+  assert.equal(points[0].unit, "USD");
+});
+
+test("AA - concepto sin ninguna unidad compatible -> DATA_UNAVAILABLE explicito, nunca usa una unidad incompatible en su lugar", () => {
+  const conceptJson = { units: { shares: [{ val: 1 }], pure: [{ val: 2 }] } }; // ninguna es "USD"
+  const points = extractAnnualPoints(conceptJson, CONCEPT_UNITS.REVENUE);
+  assert.equal(points.length, 0);
+  const decision = pickWinnerAndDetectAmbiguity([], CANDIDATE_TAGS.REVENUE);
+  assert.equal(decision.status, "DATA_UNAVAILABLE");
 });

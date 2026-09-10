@@ -28,7 +28,7 @@ import { checkAdminAuth } from "../lib/adminAuth.js";
 // (septimo concepto anual) y la capa trimestral/TTM son nuevas, viven
 // en ese mismo lib.
 import {
-  CANDIDATE_TAGS, CANONICAL_CONCEPTS,
+  CANDIDATE_TAGS, CANONICAL_CONCEPTS, CONCEPT_UNITS,
   extractAnnualPoints, scoreCandidate, pickWinnerAndDetectAmbiguity, confidenceRank,
 } from "../lib/secFinancialsResolver.js";
 
@@ -87,7 +87,7 @@ async function resolveConcept(cikPadded, canonicalConcept) {
     const result = await fetchConcept(cikPadded, tag);
     await sleep(REQUEST_DELAY_MS);
     if (result.data) {
-      const points = extractAnnualPoints(result.data);
+      const points = extractAnnualPoints(result.data, CONCEPT_UNITS[canonicalConcept]);
       if (points.length > 0) {
         candidates.push({ tag, points, score: scoreCandidate(points) });
       }

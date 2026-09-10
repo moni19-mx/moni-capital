@@ -19,7 +19,7 @@
 
 import { writeFileSync } from "node:fs";
 import {
-  CANDIDATE_TAGS, extractAnnualPoints, scoreCandidate,
+  CANDIDATE_TAGS, CONCEPT_UNITS, extractAnnualPoints, scoreCandidate,
   pickWinnerAndDetectAmbiguity, extractQuarterlyPoints, computeTtmEps,
 } from "../lib/secFinancialsResolver.js";
 
@@ -57,8 +57,21 @@ async function fetchConcept(cikPadded, tag) {
   }
 }
 
+// Sprint P2A revision: clasifica profundidad de historial ANUAL usable
+// para una futura distribucion de P/E -- SOLO evidencia, no calcula
+// ningun P/E aqui. "Usable" = EPS positivo (un EPS negativo/cero no
+// produce un P/E con significado economico, se excluye de la cuenta
+// pero NUNCA se borra del historial real).
+function classifyHistoryDepth(positiveYearsCount) {
+  if (positiveYearsCount >= 5) return "HISTORY_STRONG";
+  if (positiveYearsCount === 4) return "HISTORY_MINIMUM";
+  if (positiveYearsCount >= 1) return "HISTORY_WEAK";
+  return "NO_USABLE_HISTORY";
+}
+
 async function auditTicker(ticker, cikPadded) {
   const tags = CANDIDATE_TAGS.EPS_DILUTED;
+  const allowedUnits = CONCEPT_UNITS.EPS_DILUTED;
   const annualCandidates = [];
   const quarterlyByTag = {};
   const httpCalls = [];
@@ -68,9 +81,11 @@ async function auditTicker(ticker, cikPadded) {
     httpCalls.push({ tag, status: result.status, notFound: !!result.notFound, error: result.error || null });
     await sleep(REQUEST_DELAY_MS);
     if (result.data) {
-      const annualPoints = extractAnnualPoints(result.data);
+      // BUGFIX (Sprint P2A, caso BE): unidad explicita -- nunca
+      // "la primera key del objeto units", ver lib/secFinancialsResolver.js.
+      const annualPoints = extractAnnualPoints(result.data, allowedUnits);
       if (annualPoints.length > 0) annualCandidates.push({ tag, points: annualPoints, score: scoreCandidate(annualPoints) });
-      quarterlyByTag[tag] = extractQuarterlyPoints(result.data);
+      quarterlyByTag[tag] = extractQuarterlyPoints(result.data, allowedUnits);
     }
   }
 
@@ -84,11 +99,34 @@ async function auditTicker(ticker, cikPadded) {
     ttmResult = computeTtmEps(quarters);
   }
 
+  let annualResult;
+  if (annualDecision.status === "OK") {
+    const points = annualDecision.points; // ya ordenados mas reciente primero
+    const positivePoints = points.filter((p) => typeof p.value === "number" && p.value > 0);
+    const negativeOrZeroPoints = points.filter((p) => typeof p.value === "number" && p.value <= 0);
+    const fiscalYears = points.map((p) => p.fiscal_year).filter((fy) => fy != null);
+    annualResult = {
+      status: "OK",
+      tag: annualDecision.tag,
+      confidence: annualDecision.confidence,
+      ambiguity_note: annualDecision.ambiguityNote,
+      latest_value: points[0]?.value ?? null,
+      latest_period_end: points[0]?.period_end ?? null,
+      latest_filed_date: points[0]?.filed_date ?? null,
+      points_found: points.length,
+      fiscal_years: fiscalYears,
+      oldest_usable_fiscal_year: fiscalYears.length > 0 ? fiscalYears[fiscalYears.length - 1] : null,
+      positive_eps_years: positivePoints.length,
+      negative_or_zero_eps_years: negativeOrZeroPoints.length,
+      history_depth_classification: classifyHistoryDepth(positivePoints.length),
+    };
+  } else {
+    annualResult = { status: "DATA_UNAVAILABLE", reason: annualDecision.reason, history_depth_classification: "NO_USABLE_HISTORY" };
+  }
+
   return {
     ticker, cik: cikPadded,
-    annual: annualDecision.status === "OK"
-      ? { status: "OK", tag: annualDecision.tag, confidence: annualDecision.confidence, ambiguity_note: annualDecision.ambiguityNote, latest_value: annualDecision.points[0]?.value ?? null, latest_period_end: annualDecision.points[0]?.period_end ?? null, points_found: annualDecision.points.length }
-      : { status: "DATA_UNAVAILABLE", reason: annualDecision.reason },
+    annual: annualResult,
     quarterly_points_found: quarterlyPointsFound,
     ttm: ttmResult.status === "OK"
       ? { status: "OK", ttm_eps: ttmResult.ttm_eps, is_positive: ttmResult.is_positive, quarters_used: ttmResult.quarters_used }
@@ -110,7 +148,7 @@ async function main() {
       continue;
     }
     const r = await auditTicker(ticker, cikPadded);
-    console.log(`[sec-eps-probe] ${ticker} (CIK ${cikPadded}): annual=${r.annual.status}${r.annual.status === "OK" ? `(${r.annual.tag}, ${r.annual.confidence}, latest=${r.annual.latest_value}@${r.annual.latest_period_end})` : ""} quarterly_points=${r.quarterly_points_found} ttm=${r.ttm.status}${r.ttm.status === "OK" ? `(${r.ttm.ttm_eps.toFixed(4)}, positive=${r.ttm.is_positive})` : ` (${r.ttm.reason})`}`);
+    console.log(`[sec-eps-probe] ${ticker} (CIK ${cikPadded}): annual=${r.annual.status}${r.annual.status === "OK" ? `(${r.annual.tag}, ${r.annual.confidence}, latest=${r.annual.latest_value}@${r.annual.latest_period_end}, filed=${r.annual.latest_filed_date}, years=${JSON.stringify(r.annual.fiscal_years)}, positive=${r.annual.positive_eps_years}, neg_or_zero=${r.annual.negative_or_zero_eps_years}, depth=${r.annual.history_depth_classification})` : ""} quarterly_points=${r.quarterly_points_found} ttm=${r.ttm.status}${r.ttm.status === "OK" ? `(${r.ttm.ttm_eps.toFixed(4)}, positive=${r.ttm.is_positive})` : ` (${r.ttm.reason})`}`);
     results.push(r);
   }
 
@@ -124,6 +162,10 @@ async function main() {
     ttm_negative_or_zero: results.filter((r) => r.ttm.status === "OK" && !r.ttm.is_positive).map((r) => r.ticker),
     ttm_insufficient_data: results.filter((r) => r.ttm.status === "INSUFFICIENT_DATA").map((r) => r.ticker),
     annual_with_ambiguity: results.filter((r) => r.annual.status === "OK" && r.annual.ambiguity_note).map((r) => ({ ticker: r.ticker, note: r.annual.ambiguity_note })),
+    history_strong: results.filter((r) => r.annual.history_depth_classification === "HISTORY_STRONG").map((r) => r.ticker),
+    history_minimum: results.filter((r) => r.annual.history_depth_classification === "HISTORY_MINIMUM").map((r) => r.ticker),
+    history_weak: results.filter((r) => r.annual.history_depth_classification === "HISTORY_WEAK").map((r) => r.ticker),
+    no_usable_history: results.filter((r) => r.annual.history_depth_classification === "NO_USABLE_HISTORY").map((r) => r.ticker),
   };
 
   const report = { started_at: new Date().toISOString(), finished_at: new Date().toISOString(), tickers: TICKERS, results, summary };
