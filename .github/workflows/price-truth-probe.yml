@@ -19,6 +19,21 @@ on:
         required: false
         default: '16'
         type: string
+  # Bootstrap (mismo patron que conviction-coverage.yml): GitHub solo
+  # permite disparar workflow_dispatch via API para un workflow que YA
+  # existe en la default branch -- este archivo todavia vive solo en
+  # esta feature branch. "push" no tiene esa restriccion, asi que este
+  # trigger, acotado por paths a este mismo archivo, permite el primer
+  # run real sin esperar a mergear. El target_base_url de este bloque
+  # es la Preview URL estable de ESTA rama (la misma usada durante todo
+  # el sprint, confirmada via el status de GitHub para este commit) --
+  # nunca un default silencioso para uso manual futuro, solo para este
+  # arranque puntual. Se puede quitar despues de mergear a main.
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/price-truth-probe.yml'
 
 jobs:
   probe:
@@ -33,8 +48,8 @@ jobs:
 
       - name: Run Price Truth Stability Probe
         env:
-          TARGET_BASE_URL: ${{ inputs.target_base_url }}
-          ITERATIONS: ${{ inputs.iterations }}
+          TARGET_BASE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.target_base_url || 'https://moni-capital-git-claude-supabase-mon-bcfab4-moni19-mxs-projects.vercel.app' }}
+          ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '16' }}
           VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
           GITHUB_SHA: ${{ github.sha }}
         run: node scripts/priceTruthProbe.mjs
