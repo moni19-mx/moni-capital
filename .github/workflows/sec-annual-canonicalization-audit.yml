@@ -1,0 +1,39 @@
+name: SEC Annual EPS Canonicalization Audit
+
+# PRIORITY 1 (Historical Multiple Data Review) -- ver
+# scripts/secAnnualCanonicalizationAudit.mjs. Auditoria SOLO LECTURA,
+# temporal, de si positive_years/negative_or_zero_years representan
+# años fiscales UNICOS (por period_end) o filas/frames crudos de SEC.
+# SEC EDGAR es publico -- sin API key, sin secret. NUNCA escribe en
+# Supabase.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/sec-annual-canonicalization-audit.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run SEC Annual EPS Canonicalization Audit
+        run: node scripts/secAnnualCanonicalizationAudit.mjs
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec-annual-canonicalization-audit-results
+          path: sec-annual-canonicalization-audit.json
+          retention-days: 30
+          if-no-files-found: ignore
