@@ -1,0 +1,72 @@
+name: FMP Historical Price Probe
+
+# PRIORITY 2 (Historical Multiple Methodology Review). Secuencia
+# ESTRICTA, cada paso solo corre si el anterior fue exitoso -- nunca se
+# corre la auditoria completa a ciegas (ver el caso ASML.AS/Finnhub,
+# donde 3 corridas identicas de 401 obligaron a detener el probe):
+#
+#   1. Confirmar presencia de FMP_API_KEY como secret (nunca imprime el
+#      valor, solo true/false).
+#   2. Si esta presente: UNA sola llamada simple de auth/capability
+#      (AAPL/quote).
+#   3. Solo si esa llamada NO fue 401/403: correr la auditoria completa
+#      de cobertura historica sobre el universo EPS-eligible real.
+#
+# SEC EDGAR no aplica aqui -- este workflow es 100% FMP. Requiere el
+# secret FMP_API_KEY en GitHub Actions (ya configurado en Vercel, pero
+# eso NO garantiza que tambien lo este en GitHub Actions -- ver el caso
+# Finnhub). NUNCA escribe en Supabase.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/fmp-historical-probe.yml'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check FMP_API_KEY presence
+        id: presence
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          if [ -z "$FMP_API_KEY" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "[fmp-probe] FMP_API_KEY_PRESENT=false"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "[fmp-probe] FMP_API_KEY_PRESENT=true"
+          fi
+
+      - name: FMP single auth/capability test call
+        id: authtest
+        if: steps.presence.outputs.present == 'true'
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: node scripts/fmpAuthTest.mjs
+
+      - name: FMP historical price coverage audit
+        if: steps.presence.outputs.present == 'true' && steps.authtest.outputs.auth_ok == 'true'
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: node scripts/fmpHistoricalPriceProbe.mjs
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmp-historical-price-probe-results
+          path: fmp-historical-price-probe.json
+          retention-days: 30
+          if-no-files-found: ignore
