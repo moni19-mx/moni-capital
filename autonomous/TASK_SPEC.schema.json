@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "required": [
+    "task_id", "title", "objective", "scope",
+    "acceptance_criteria", "required_tests", "required_live_evidence",
+    "risk_level", "human_approval_required_for"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": { "type": "string" },
+    "title": { "type": "string" },
+    "objective": { "type": "string" },
+    "scope": {
+      "type": "object",
+      "required": ["allowed_files", "forbidden_files"],
+      "additionalProperties": false,
+      "properties": {
+        "allowed_files": { "type": "array", "items": { "type": "string" } },
+        "forbidden_files": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "auto_checkable": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "required_tests": { "type": "array", "items": { "type": "string" } },
+    "required_live_evidence": { "type": "array", "items": { "type": "string" } },
+    "risk_level": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] },
+    "human_approval_required_for": { "type": "array", "items": { "type": "string" } }
+  }
+}

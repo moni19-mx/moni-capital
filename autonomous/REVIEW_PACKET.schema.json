@@ -1,0 +1,87 @@
+{
+  "type": "object",
+  "required": [
+    "task_id", "iteration", "base_commit", "head_commit",
+    "files_changed", "diff_summary",
+    "tests", "build",
+    "live_evidence", "schema_changes", "data_writes", "security_changes", "financial_logic_changes",
+    "known_limitations", "open_questions",
+    "acceptance_criteria"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": { "type": "string" },
+    "iteration": { "type": "number" },
+    "base_commit": { "type": "string" },
+    "head_commit": { "type": "string" },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "diff_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "additions", "deletions"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string" },
+          "additions": { "type": "number" },
+          "deletions": { "type": "number" }
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "required": ["commands", "passed", "failed", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "passed": { "type": "number" },
+        "failed": { "type": "number" },
+        "evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": ["command", "status", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string" },
+        "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"] },
+        "evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "live_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["description", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" },
+          "result": { "type": "string" }
+        }
+      }
+    },
+    "schema_changes": { "type": "array", "items": { "type": "string" } },
+    "data_writes": { "type": "array", "items": { "type": "string" } },
+    "security_changes": { "type": "array", "items": { "type": "string" } },
+    "financial_logic_changes": { "type": "array", "items": { "type": "string" } },
+    "known_limitations": { "type": "array", "items": { "type": "string" } },
+    "open_questions": { "type": "array", "items": { "type": "string" } },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion", "status", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "criterion": { "type": "string" },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "UNVERIFIED", "MISSING_EVIDENCE"] },
+          "evidence": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+name: SEC EPS Coverage Probe
+
+# Sprint P2A (Valuation Facts Layer) -- auditoria de cobertura real,
+# SOLO LECTURA, temporal. Ver scripts/secEpsCoverageProbe.mjs. SEC EDGAR
+# es publico (sin API key) -- este workflow no requiere NINGUN secret.
+# NUNCA escribe en Supabase. Corre en GitHub Actions por egress real
+# (mismo motivo que el resto de probes de este repo).
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/sec-eps-coverage-probe.yml'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run SEC EPS Coverage Probe
+        run: node scripts/secEpsCoverageProbe.mjs
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec-eps-coverage-probe-results
+          path: sec-eps-coverage-probe.json
+          retention-days: 30
+          if-no-files-found: ignore

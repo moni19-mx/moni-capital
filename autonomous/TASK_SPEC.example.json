@@ -1,0 +1,40 @@
+{
+  "task_id": "example-task",
+  "title": "Example task spec (template)",
+  "objective": "Describe, in one or two sentences, exactly what this task must accomplish and why. This is what the reviewer measures every iteration against -- it never changes mid-run unless a human explicitly edits this file.",
+  "scope": {
+    "allowed_files": [
+      "path/to/file/this/task/may/change.js"
+    ],
+    "forbidden_files": [
+      "lib/financialSnapshot.js"
+    ]
+  },
+  "acceptance_criteria": [
+    {
+      "id": "criterion_one",
+      "description": "Precise, checkable statement of one thing that must be true for this task to be done.",
+      "auto_checkable": false
+    },
+    {
+      "id": "tests_pass",
+      "description": "The full test suite passes with zero failures.",
+      "auto_checkable": true
+    },
+    {
+      "id": "build_succeeds",
+      "description": "npm run build exits 0.",
+      "auto_checkable": true
+    }
+  ],
+  "required_tests": [
+    "npm test"
+  ],
+  "required_live_evidence": [],
+  "risk_level": "LOW",
+  "human_approval_required_for": [
+    "any change outside allowed_files",
+    "any change to a forbidden_files path",
+    "any AUTONOMOUS_INFRA_CHANGE-classified file"
+  ]
+}

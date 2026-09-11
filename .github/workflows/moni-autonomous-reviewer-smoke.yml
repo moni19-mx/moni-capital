@@ -1,0 +1,75 @@
+name: Moni Autonomous Reviewer Smoke Test
+
+# Moni Autonomous Dev Loop, Fase B -- prueba de conectividad + contrato
+# SOLAMENTE. NO es el loop autonomo real (eso es Fase D, y requiere
+# ademas que Fase C -- Claude Code headless -- este probada). Ver
+# autonomous/README.md.
+#
+# Secuencia estricta, cada paso solo corre si el anterior fue exitoso
+# (mismo patron ya probado en este repo para FMP_API_KEY):
+#   1. Confirmar presencia de OPENAI_API_KEY (nunca imprime el valor).
+#   2. Solo si esta presente: correr el smoke test real contra OpenAI.
+#   3. Subir los 3 artefactos (request/response/validation) SIEMPRE que
+#      existan, para poder diagnosticar tanto un PASS como un FAIL.
+#
+# Manual dispatch unicamente -- rollout controlado, nunca en cada push.
+# Read-only: nunca modifica archivos, nunca commitea, nunca hace push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewer_model:
+        description: 'Modelo de OpenAI a usar para el smoke test (nunca hardcodeado en el codigo)'
+        required: true
+        type: string
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/moni-autonomous-reviewer-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check OPENAI_API_KEY presence
+        id: presence
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "[reviewer-smoke] OPENAI_API_KEY_PRESENT=false"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "[reviewer-smoke] OPENAI_API_KEY_PRESENT=true"
+          fi
+
+      - name: Run OpenAI reviewer smoke test
+        id: smoke
+        if: steps.presence.outputs.present == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: node scripts/autonomous/runReviewer.mjs --smoke --model "${{ inputs.reviewer_model }}"
+
+      - name: Upload smoke test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openai-reviewer-smoke-results
+          path: |
+            openai-smoke-request.json
+            openai-smoke-response.json
+            openai-smoke-validation.json
+          retention-days: 30
+          if-no-files-found: ignore

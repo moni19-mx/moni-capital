@@ -12,6 +12,30 @@ import {
   solveDeltaForEarlierMonths, monthsBetweenDates, addMonthsToToday,
   computeMilestones, computeRebalanceDeviations, computeSystemHealth,
 } from "../lib/financialMath.js";
+import {
+  sbSelectAll, fetchMarketDataBatch, fetchFuturesEquity, fetchMarketPulse,
+} from "../lib/dataFetchers.js";
+// Sprint P1.2 (Smart Import Futures Confirm): mismas funciones puras que
+// usa el servidor para clasificar balances de cuenta Futures -- una sola
+// fuente de verdad, el preview de confirmacion nunca puede mostrar algo
+// distinto de lo que el backend realmente va a decidir.
+import { classifyBalanceForPersistence } from "../lib/futuresImportNormalize.js";
+// Sprint P1 (Universal Asset Detail): resolver canonico y PURO de
+// identidad de asset (ticker/type/name/coingeckoId) para openAsset() --
+// ver el archivo para la precedencia completa (A-D). Nunca adivina type.
+import { resolveAssetIdentity } from "../lib/assetResolver.js";
+import {
+  initialSourceMeta, resolveAllSourceMeta, isCriticalInitialFailure, isCurrentRequest,
+} from "../lib/dataSourceState.js";
+// Sprint P0.2 (Financial Totals Correctness + Stability): formula
+// canonica unica de los totales financieros -- ver lib/financialSnapshot.js.
+import {
+  buildMarketDataItems, mergeMarketData, enrichPositions, computeCashValue,
+  computeStocksValue, computeCryptoValue, computePatrimonioBase, computePatrimonio,
+  computeInvested, computeTotalGain, unclassifiedPositions, summarizeGlobalFreshness,
+  computePortfolioWeights, computeNetWorthWeights, computePatrimonioBreakdown, computeConcentration,
+  reconstructTraditionalMarketValue,
+} from "../lib/financialSnapshot.js";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -38,36 +62,56 @@ const fmtBig = (v) => {
   return fmt$2(v);
 };
 
-async function sb(table) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=*`, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
-  });
-  if (!res.ok) throw new Error(`No se pudo leer ${table} de Supabase`);
-  return res.json();
-}
-
-async function fetchMarketData(items) {
-  if (!items.length) return { data: {}, errors: [], updatedAt: null };
-  const res = await fetch("/api/market-data", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items }),
-  });
-  if (!res.ok) throw new Error("No se pudieron obtener datos de mercado");
-  return res.json();
-}
-
-// READ-ONLY: estado actual (solo latest snapshot confirmado por cuenta/
-// posicion) de Binance Futures, ya valuado a USD. Nunca escribe nada.
-async function fetchFuturesEquity() {
-  try {
-    const res = await fetch("/api/futures-equity");
-    if (!res.ok) return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
-    return res.json();
-  } catch {
-    return { total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] };
+// Sprint P0.4 (Price Freshness UI, item 5) -- texto discreto para el
+// indicador global, solo se llama cuando status !== ALL_GOOD (ver
+// summarizeGlobalFreshness en lib/financialSnapshot.js). Presentacion
+// pura, sin decidir ningun $ ni ningun estado -- solo redacta lo que
+// summarizeGlobalFreshness ya calculo.
+function freshnessStatusText(f) {
+  if (f.status === "PROVIDER_RATE_LIMITED") {
+    return "Proveedor de precios con límite de tasa activo — usando últimos precios válidos";
   }
+  if (f.status === "PARTIAL_MISSING") {
+    return `${f.missingCount} ${f.missingCount === 1 ? "posición sin precio" : "posiciones sin precio"} por ahora`;
+  }
+  if (f.status === "PARTIAL_STALE") {
+    return `${f.staleCount} ${f.staleCount === 1 ? "precio usando" : "precios usando"} último dato válido`;
+  }
+  return "";
 }
+
+// Sprint P0.4 (item 6) -- antiguedad humana para el tooltip por
+// posicion ("hace 4m 12s"). Presentacion pura.
+function ageLabel(fetchedAtIso, now = new Date()) {
+  if (!fetchedAtIso) return "desconocida";
+  const ms = Math.max(0, now.getTime() - new Date(fetchedAtIso).getTime());
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `hace ${m}m ${s}s` : `hace ${s}s`;
+}
+
+const PRICE_SOURCE_LABELS = { finnhub: "Finnhub", coingecko: "CoinGecko", finnhub_cache: "Finnhub (cache)", coingecko_cache: "CoinGecko (cache)", cache_stale: "último dato válido" };
+
+function priceTooltip(market) {
+  if (!market) return "";
+  const priceTxt = market.price != null ? fmt$2(market.price) : "—";
+  const sourceTxt = PRICE_SOURCE_LABELS[market.price_source] || market.price_source || "—";
+  return `${priceTxt} · Actualizado ${ageLabel(market.price_fetched_at)} · Proveedor: ${sourceTxt} · Estado: ${market.price_status || "—"}`;
+}
+
+// Sprint P0.1 (Reliable Data Loading): sb()/fetchMarketData() delegan en
+// lib/dataFetchers.js -- fetchFuturesEquity/fetchMarketPulse se importan
+// directo (mismo nombre, sin alias). La unica diferencia de
+// comportamiento real es que NINGUNO de los 4 se traga un fallo en
+// silencio: todos propagan el error como rejection. Antes,
+// fetchFuturesEquity() atrapaba cualquier fallo y devolvia
+// {total_value_usd: 0, ...} -- indistinguible de una cuenta que
+// realmente vale $0. loadAll() (mas abajo) es quien decide, con
+// lib/dataSourceState.js, conservar el ultimo dato valido conocido en
+// vez de aceptar ese resultado.
+const sb = (table) => sbSelectAll(SUPABASE_URL, SUPABASE_ANON_KEY, table);
+const fetchMarketData = fetchMarketDataBatch;
 
 async function searchAssets(q) {
   const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
@@ -145,12 +189,6 @@ const TOOL_LABELS = {
   get_decision_queue: "Decision Queue",
 };
 
-async function fetchMarketPulse() {
-  const res = await fetch("/api/market-pulse");
-  if (!res.ok) return null;
-  return res.json();
-}
-
 // Opportunity Score, simulacion de metas, salud del sistema, etc. --
 // TODAS estas formulas viven en lib/financialMath.js, importadas abajo.
 // Es la MISMA libreria que usan las tools de Moni AI (revision critica
@@ -158,6 +196,238 @@ async function fetchMarketPulse() {
 // matematico entre lo que ves en pantalla y lo que Moni AI interpreta).
 
 const STARS = ["", "★", "★★", "★★★", "★★★★", "★★★★★"];
+
+// Sprint P4.1 (Responsive Mobile Foundation). Un solo breakpoint (767px,
+// igual que src/responsive.css) -- "responsive rendering, no dos
+// datasets distintos": los componentes que lo usan reciben los MISMOS
+// props/datos, solo deciden como renderizarlos (tabla vs cards, orden
+// del hero). matchMedia + listener, sin polling ni resize handlers
+// manuales.
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)").matches : false
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 767px)");
+    const onChange = (e) => setIsMobile(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return isMobile;
+}
+
+// Sprint P4.2 (PWA Foundation). Estado de conectividad real del
+// navegador. Nunca decide nada financiero -- solo permite que el banner
+// de error ya existente (loadError, Sprint P0.1) aclare "sin conexion"
+// en vez de un mensaje HTTP generico cuando corresponde.
+function useOnlineStatus() {
+  const [isOnline, setIsOnline] = useState(
+    typeof navigator !== "undefined" ? navigator.onLine : true
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onOnline = () => setIsOnline(true);
+    const onOffline = () => setIsOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+  return isOnline;
+}
+
+// Sprint P4.2. Escucha el CustomEvent que src/main.jsx dispara cuando
+// hay un service worker nuevo instalado y esperando. Nunca hace reload
+// solo -- eso lo decide el usuario con el boton del banner (ver render
+// de updateAvailable mas abajo), que llama a
+// window.__moniApplyServiceWorkerUpdate().
+function useSwUpdateAvailable() {
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onUpdate = () => setUpdateAvailable(true);
+    window.addEventListener("moni:sw-update-available", onUpdate);
+    return () => window.removeEventListener("moni:sw-update-available", onUpdate);
+  }, []);
+  return updateAvailable;
+}
+
+// Sprint P4.2. Captura beforeinstallprompt (Chrome/Android) para poder
+// mostrar un CTA propio "Instalar Moni Capital" en vez del mini-infobar
+// del navegador. Safari/iOS nunca dispara este evento -- ahi
+// canInstall queda siempre false a proposito (ver InstallCTA: en iOS se
+// muestra una ayuda manual en su lugar, nunca un boton que no funciona).
+function useInstallPrompt() {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onBeforeInstall = (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+    const onInstalled = () => setDeferredPrompt(null);
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+  return deferredPrompt;
+}
+
+function isStandaloneDisplay() {
+  if (typeof window === "undefined") return false;
+  return (
+    window.matchMedia?.("(display-mode: standalone)")?.matches ||
+    window.navigator.standalone === true // iOS Safari
+  );
+}
+
+function isIosSafari() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  return /iPhone|iPad|iPod/.test(ua) && /Safari/.test(ua) && !/CriOS|FxiOS/.test(ua);
+}
+
+// Fuente unica de la lista de tabs -- el nav de desktop y el menu "Más"
+// de mobile leen exactamente de aqui, nunca duplicada.
+const ALL_TABS = [
+  ["command", "Command Center"], ["moniai", "Moni AI"], ["resumen", "Resumen"], ["performance", "Performance"],
+  ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"],
+  ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"],
+  ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"],
+];
+
+// Los 5 destinos principales del bottom nav (mobile). El resto de tabs
+// vive detras de "Más" -- nunca se duplica la lista de tabs, ambos
+// (desktop nav y el menu de "Más") leen de ALL_TABS mas abajo.
+const PRIMARY_MOBILE_TABS = [
+  ["resumen", "Home", "🏠"],
+  ["posiciones", "Portfolio", "📊"],
+  ["__smart_import__", "Import", "📷"],
+  ["moniai", "Moni AI", "✨"],
+  ["__more__", "Más", "☰"],
+];
+
+function MobileBottomNav({ tab, onNavigate, onOpenSmartImport, moreOpen, onToggleMore }) {
+  return (
+    <nav className="mc-bottom-nav mc-mobile-only" aria-label="Navegación principal">
+      {PRIMARY_MOBILE_TABS.map(([key, label, icon]) => {
+        const isSmartImport = key === "__smart_import__";
+        const isMore = key === "__more__";
+        const active = isMore ? moreOpen : (!isSmartImport && tab === key);
+        return (
+          <button
+            key={key}
+            className={`mc-bottom-nav-item${active ? " active" : ""}`}
+            onClick={() => {
+              if (isSmartImport) { onOpenSmartImport(); return; }
+              if (isMore) { onToggleMore(); return; }
+              onNavigate(key);
+            }}
+          >
+            <span style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
+            <span>{label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+// Sprint P4.2. Banner discreto para el flujo "hay una version nueva".
+// Nunca recarga solo -- el click llama a
+// window.__moniApplyServiceWorkerUpdate(), que dispara SKIP_WAITING en
+// el service worker en espera; el reload real ocurre en el listener
+// "controllerchange" de src/main.jsx, una unica vez.
+function SwUpdateBanner({ onUpdate }) {
+  return (
+    <div
+      className="mc-touch-target"
+      style={{
+        position: "sticky", top: 0, zIndex: 50, background: GOLD, color: NAVY_BG,
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+        padding: "8px 12px", fontSize: 13, fontWeight: 700,
+      }}
+    >
+      Hay una nueva versión de Moni Capital
+      <button
+        onClick={onUpdate}
+        className="mc-touch-target"
+        style={{ background: NAVY_BG, color: GOLD, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+      >
+        Actualizar
+      </button>
+    </div>
+  );
+}
+
+// Sprint P4.2. CTA de instalacion discreto. Android/Chrome: usa el
+// beforeinstallprompt real capturado por useInstallPrompt(). iOS
+// Safari: nunca dispara ese evento, asi que se muestra una ayuda manual
+// (Compartir -> Agregar a inicio) en su lugar -- nunca un boton
+// disfrazado de instalable que no hace nada. Se puede descartar; una
+// vez descartado, no vuelve a aparecer en esta sesion de navegador
+// (localStorage), nunca de forma agresiva/repetida.
+function InstallCTA({ deferredPrompt }) {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem("moni_install_cta_dismissed") === "1"; } catch { return false; }
+  });
+  const [showIosHelp, setShowIosHelp] = useState(false);
+  if (dismissed || isStandaloneDisplay()) return null;
+  const showAndroid = !!deferredPrompt;
+  const showIos = !showAndroid && isIosSafari();
+  if (!showAndroid && !showIos) return null;
+
+  function dismiss() {
+    setDismissed(true);
+    try { localStorage.setItem("moni_install_cta_dismissed", "1"); } catch { /* ok si no hay storage */ }
+  }
+
+  return (
+    <div style={{
+      position: "sticky", bottom: "var(--mc-bottom-nav-height, 0px)", zIndex: 30,
+      margin: 10, padding: "10px 14px", borderRadius: 12, background: PANEL,
+      border: `1px solid ${LINE}`, display: "flex", alignItems: "center", gap: 10,
+    }}>
+      <span style={{ fontSize: 13, color: TXT, flex: 1 }}>
+        {showIos
+          ? (showIosHelp ? "Compartir → Agregar a pantalla de inicio" : "Instalá Moni Capital en tu iPhone")
+          : "Instalá Moni Capital en tu celular"}
+      </span>
+      {showAndroid && (
+        <button
+          className="mc-touch-target"
+          onClick={async () => { deferredPrompt.prompt(); await deferredPrompt.userChoice; dismiss(); }}
+          style={{ background: GOLD, color: NAVY_BG, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+        >
+          Instalar
+        </button>
+      )}
+      {showIos && !showIosHelp && (
+        <button
+          className="mc-touch-target"
+          onClick={() => setShowIosHelp(true)}
+          style={{ background: GOLD, color: NAVY_BG, border: "none", borderRadius: 8, padding: "6px 14px", fontWeight: 700, cursor: "pointer" }}
+        >
+          Cómo
+        </button>
+      )}
+      <button
+        className="mc-touch-target"
+        onClick={dismiss}
+        aria-label="Cerrar"
+        style={{ background: "none", color: MUTE, border: "none", fontSize: 18, cursor: "pointer", padding: "0 4px" }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
 
 export default function Dashboard() {
   const [positions, setPositions] = useState([]);
@@ -180,6 +450,11 @@ export default function Dashboard() {
   const [marketPulse, setMarketPulse] = useState(null);
   const [marketData, setMarketData] = useState({});
   const [marketErrors, setMarketErrors] = useState([]);
+  // Sprint P0.4 (Price Freshness UI): provider_health ya venia en la
+  // respuesta de /api/market-data desde P0.3 pero nunca se guardaba en
+  // estado ni se usaba -- ver summarizeGlobalFreshness en
+  // lib/financialSnapshot.js.
+  const [marketProviderHealth, setMarketProviderHealth] = useState("OK");
   const [futuresEquity, setFuturesEquity] = useState({ total_value_usd: 0, is_complete: true, accounts: [], positions: [], warnings: [] });
   const [updatedAt, setUpdatedAt] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -187,64 +462,215 @@ export default function Dashboard() {
   const [tab, setTab] = useState("resumen");
   const [assetDetail, setAssetDetail] = useState(null); // { ticker, type, name, coingeckoId } | null
 
-  function openAsset(meta) { setAssetDetail(meta); }
+  // Sprint P1 (Universal Asset Detail): TODA resolucion de identidad
+  // pasa por aqui, centralizada -- ningun call site de onOpenAsset
+  // necesita parchearse (ej. Decisions pasando solo {ticker}: se
+  // resuelve solo via positions/watchlist ya cargados, precedencia C).
+  function openAsset(meta) { setAssetDetail(resolveAssetIdentity({ callerMeta: meta, positions, watchlist })); }
   function closeAsset() { setAssetDetail(null); }
   const [showAdd, setShowAdd] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false); // Sprint P4.1: menu "Mas" del bottom nav mobile
   const [showSmartImport, setShowSmartImport] = useState(false);
+  // Sprint P4.2 (PWA Foundation): conectividad, update de service worker
+  // e install prompt -- ninguno de los 3 decide ni toca un valor
+  // financiero, solo UI/estado del navegador.
+  const isOnline = useOnlineStatus();
+  const swUpdateAvailable = useSwUpdateAvailable();
+  const installPrompt = useInstallPrompt();
 
+  // ================== Sprint P0.1 -- Reliable Data Loading ==================
+  // Principio: LAST KNOWN GOOD DATA > EMPTY DATA CAUSED BY NETWORK
+  // FAILURE. Un fallo transitorio de red durante un refresh NUNCA debe
+  // reemplazar datos validos ya en pantalla por [] / 0 / null.
+  //
+  // sourceMeta: estado de frescura por fuente (ver lib/dataSourceState.js
+  // -- NEVER_LOADED/OK/STALE/ERROR). Los refs mirror (sourceMetaRef,
+  // positionsRef, watchlistRef) existen porque loadAll() vive dentro de
+  // un setInterval creado una sola vez en el mount (useEffect con deps
+  // []) -- leer el STATE directo ahi adentro devolveria siempre el valor
+  // del primer render (closure obsoleta). Los .current de un ref, en
+  // cambio, siempre reflejan el ultimo valor real, sin ese problema.
+  const DATA_SOURCE_NAMES = ["positions", "watchlist", "thesis", "snapshots", "cash_movements", "transactions", "goals", "journal_entries", "decisions", "rebalance_targets", "ai_insights", "accounts", "marketPulse", "marketData", "futuresEquity"];
+  const [sourceMeta, setSourceMeta] = useState(() => {
+    const m = {};
+    DATA_SOURCE_NAMES.forEach((n) => { m[n] = initialSourceMeta(); });
+    return m;
+  });
+  const sourceMetaRef = useRef(sourceMeta);
+  useEffect(() => { sourceMetaRef.current = sourceMeta; }, [sourceMeta]);
+  const positionsRef = useRef(positions);
+  useEffect(() => { positionsRef.current = positions; }, [positions]);
+  const watchlistRef = useRef(watchlist);
+  useEffect(() => { watchlistRef.current = watchlist; }, [watchlist]);
+  // Guard de concurrencia (lib/dataSourceState.js::isCurrentRequest):
+  // contador monotonico, no AbortController -- loadAll() dispara ~15
+  // requests en paralelo, y lo unico que importa es que la request MAS
+  // RECIENTE EN INICIAR sea la unica que puede commitear estado. Si una
+  // mas nueva ya arranco (refresh manual mientras el polling de 60s
+  // seguia esperando, o viceversa), la vieja se descarta ENTERA en
+  // cuanto se detecta -- nunca mezcla resultados de dos ciclos distintos
+  // ni deja que una respuesta vieja sobrescriba estado mas nuevo.
+  const latestRequestIdRef = useRef(0);
+
+  // Sprint P0.2 (Financial Totals Correctness + Stability). Rediseño de
+  // loadAll() alrededor de un GRUPO CRITICO que se commitea como una
+  // sola unidad atomica (items 7/8/9 del sprint): positions +
+  // cash_movements + marketData + futuresEquity son EXACTAMENTE las 4
+  // fuentes que alimentan Total Acciones/Cripto, Patrimonio Base y
+  // Patrimonio Total -- nunca se pinta una combinacion incompleta de
+  // ellas (p.ej. positions nuevas con marketData todavia vacia). Las
+  // demas fuentes (no financieras) arrancan en paralelo desde el
+  // inicio -- ya no esperan a que el grupo critico complete para
+  // EMPEZAR a pedirse -- pero commitean su propio estado de forma
+  // independiente, sin bloquear ni ser bloqueadas por el grupo critico.
   async function loadAll() {
+    const myRequestId = ++latestRequestIdRef.current;
     setLoading(true);
-    setLoadError(null);
     try {
-      const [pos, wl, th, snaps, cm, tx, goalsData, journal, decisionsData, rebalanceData, insightsData, accountsData] = await Promise.all([
-        sb("positions"),
-        sb("watchlist").catch(() => []),
-        sb("thesis").catch(() => []),
-        sb("snapshots").catch(() => []),
-        sb("cash_movements").catch(() => []),
-        sb("transactions").catch(() => []),
-        sb("goals").catch(() => []),
-        sb("journal_entries").catch(() => []),
-        sb("decisions").catch(() => []),
-        sb("rebalance_targets").catch(() => []),
-        sb("ai_insights").catch(() => []),
-        sb("accounts").catch(() => []),
-      ]);
-      setPositions(pos);
-      setWatchlist(wl);
-      setThesis(th);
-      setSnapshots([...snaps].sort((a, b) => (a.date < b.date ? -1 : 1)));
-      setCashMovements([...cm].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setTransactions([...tx].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setGoals(goalsData || []);
-      setJournalEntries([...journal].sort((a, b) => (a.date < b.date ? 1 : -1)));
-      setDecisions(decisionsData || []);
-      setRebalanceTargets(rebalanceData || []);
-      setAiInsights([...(insightsData || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
-      setAccounts(accountsData || []);
+      // Todo arranca en paralelo. market-data es la unica fuente con una
+      // dependencia real (necesita `items` derivados de positions/
+      // watchlist) -- futures-equity y market-pulse YA NO esperan a que
+      // resuelvan las demas lecturas de Supabase, porque no tienen
+      // ninguna dependencia real de esos datos (antes esperaban sin
+      // necesidad, agregando latencia real a cada carga).
+      const positionsP = sb("positions");
+      const watchlistP = sb("watchlist");
+      const thesisP = sb("thesis");
+      const snapshotsP = sb("snapshots");
+      const cashMovementsP = sb("cash_movements");
+      const transactionsP = sb("transactions");
+      const goalsP = sb("goals");
+      const journalP = sb("journal_entries");
+      const decisionsP = sb("decisions");
+      const rebalanceP = sb("rebalance_targets");
+      const insightsP = sb("ai_insights");
+      const accountsP = sb("accounts");
+      const futuresEquityP = fetchFuturesEquity();
+      const marketPulseP = fetchMarketPulse();
 
-      fetchMarketPulse().then(setMarketPulse).catch(() => setMarketPulse(null));
+      const [posR, wlR] = await Promise.allSettled([positionsP, watchlistP]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada por un refresh mas nuevo
 
-      const items = [];
-      const seen = new Set();
-      [...pos.filter((p) => p.type !== "cash"), ...wl].forEach((p) => {
-        const key = `${p.ticker}-${p.type}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        items.push({ ticker: p.ticker, type: p.type, coingeckoId: p.coingecko_id || undefined });
-      });
+      // items para precios de mercado: si positions/watchlist fallaron
+      // en ESTE intento, se usa el ultimo valor conocido (via ref) en
+      // vez de dejar de pedir precios por completo.
+      const positionsForItems = posR.status === "fulfilled" ? posR.value : positionsRef.current;
+      const watchlistForItems = wlR.status === "fulfilled" ? wlR.value : watchlistRef.current;
+      const marketDataP = fetchMarketData(buildMarketDataItems(positionsForItems, watchlistForItems));
 
-      const { data, errors, updatedAt: ts } = await fetchMarketData(items);
-      setMarketData(data);
-      setMarketErrors(errors || []);
-      setUpdatedAt(ts);
+      // ================== GRUPO CRITICO ==================
+      // Se espera a que las 4 fuentes financieras hayan resuelto (exito
+      // o fallo) y se commitean TODAS en el mismo tick sincronico (React
+      // 18 agrupa setState consecutivos sin await entre ellos en un solo
+      // render) -- este es el fix real del flicker "abre -> $X -> $0 ->
+      // $Y" reportado por el usuario: antes, positions se commiteaba
+      // solo, y marketData/futuresEquity llegaban en un commit aparte y
+      // mas tardio, asi que Total Acciones/Patrimonio se pintaban de
+      // forma incompleta (solo cash, sin acciones/futures) en el medio.
+      const criticalFetchStartedAt = Date.now();
+      const [cmR, marketR, futuresR] = await Promise.allSettled([cashMovementsP, marketDataP, futuresEquityP]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return; // superada mientras esperabamos el grupo critico
 
-      // Futures: read-only, nunca bloquea la carga principal si falla.
-      fetchFuturesEquity().then(setFuturesEquity).catch(() => {});
-    } catch (e) {
-      setLoadError(String(e.message || e));
+      if (posR.status === "fulfilled") setPositions(posR.value);
+      if (wlR.status === "fulfilled") setWatchlist(wlR.value);
+      if (cmR.status === "fulfilled") setCashMovements([...cmR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (marketR.status === "fulfilled") {
+        // Root cause real de P0.2: MERGE por ticker, nunca reemplazo
+        // completo del mapa -- ver lib/financialSnapshot.js::mergeMarketData.
+        // Un ticker que fallo SOLO este ciclo (el resto de la respuesta
+        // sigue siendo 200 OK) conserva su ultimo precio conocido en vez
+        // de desaparecer del total.
+        setMarketData((prev) => mergeMarketData(prev, marketR.value.data));
+        setMarketErrors(marketR.value.errors || []);
+        setUpdatedAt(marketR.value.updatedAt);
+        setMarketProviderHealth(marketR.value.provider_health || "OK");
+      }
+      // Futures Equity: NUNCA se llama al setter en el caso "rejected"
+      // -- el ultimo valor valido permanece en pantalla, marcado STALE
+      // via sourceMeta, en vez de convertirse silenciosamente en $0.
+      if (futuresR.status === "fulfilled") setFuturesEquity(futuresR.value);
+
+      const nowCritical = new Date().toISOString();
+      const metaCritical = resolveAllSourceMeta(
+        sourceMetaRef.current,
+        { positions: posR, watchlist: wlR, cash_movements: cmR, marketData: marketR, futuresEquity: futuresR },
+        nowCritical
+      );
+      setSourceMeta((prev) => ({ ...prev, ...metaCritical }));
+
+      // Sprint P0.2, item 7 (evidencia de coherent refresh): modo
+      // diagnostico minimo, apagado por defecto -- solo activo con
+      // ?diag=financial en la URL o localStorage.mc_financial_diag=1.
+      // Nunca corre en uso normal, no reemplaza la instrumentacion
+      // server-side del endpoint de reconciliacion (api/fmp-benchmark-temp.js?reconcile=true).
+      if (typeof window !== "undefined") {
+        try {
+          const diagOn = new URLSearchParams(window.location.search).get("diag") === "financial"
+            || window.localStorage.getItem("mc_financial_diag") === "1";
+          if (diagOn) {
+            console.log("[P0.2 coherent-refresh]", {
+              financial_refresh_id: myRequestId,
+              critical_fetch_started_at: new Date(criticalFetchStartedAt).toISOString(),
+              critical_fetch_completed_at: nowCritical,
+              financial_commit_at: new Date().toISOString(),
+              critical_fetch_duration_ms: Date.now() - criticalFetchStartedAt,
+              positions_status: posR.status, cash_movements_status: cmR.status,
+              market_data_status: marketR.status, futures_equity_status: futuresR.status,
+            });
+          }
+        } catch (e) { /* diagnostico nunca debe romper loadAll() */ }
+      }
+
+      // Unico caso de error bloqueante real: positions nunca tuvo datos
+      // validos Y este intento tambien fallo. Cualquier otro fallo se
+      // resuelve en silencio conservando el ultimo valor bueno (marcado
+      // STALE en sourceMeta, nunca mostrado como si fuera un error fatal).
+      setLoadError(
+        isCriticalInitialFailure(metaCritical.positions)
+          ? String(posR.reason?.message || posR.reason || "No se pudo cargar el portafolio")
+          : null
+      );
+
+      // El grupo critico (lo unico que determina Total Acciones/
+      // Patrimonio) ya esta resuelto y commiteado -- las fuentes no
+      // financieras de abajo pueden seguir en vuelo sin que el usuario
+      // siga viendo "Actualizando...".
+      if (isCurrentRequest(myRequestId, latestRequestIdRef.current)) setLoading(false);
+
+      // ================== NO CRITICAS ==================
+      // Ya estaban en vuelo desde el inicio de la funcion -- no
+      // bloquean ni son bloqueadas por el grupo critico, solo se
+      // commitean tan pronto como esten listas (normalmente ya lo estan
+      // para cuando llegamos aqui, por haber arrancado en paralelo).
+      const [thR, snapsR, txR, goalsR, journalR, decisionsR, rebalanceR, insightsR, accountsR, pulseR] =
+        await Promise.allSettled([
+          thesisP, snapshotsP, transactionsP, goalsP, journalP, decisionsP, rebalanceP, insightsP, accountsP, marketPulseP,
+        ]);
+      if (!isCurrentRequest(myRequestId, latestRequestIdRef.current)) return;
+
+      if (thR.status === "fulfilled") setThesis(thR.value);
+      if (snapsR.status === "fulfilled") setSnapshots([...snapsR.value].sort((a, b) => (a.date < b.date ? -1 : 1)));
+      if (txR.status === "fulfilled") setTransactions([...txR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (goalsR.status === "fulfilled") setGoals(goalsR.value || []);
+      if (journalR.status === "fulfilled") setJournalEntries([...journalR.value].sort((a, b) => (a.date < b.date ? 1 : -1)));
+      if (decisionsR.status === "fulfilled") setDecisions(decisionsR.value || []);
+      if (rebalanceR.status === "fulfilled") setRebalanceTargets(rebalanceR.value || []);
+      if (insightsR.status === "fulfilled") setAiInsights([...(insightsR.value || [])].filter((i) => i.scope === "today").sort((a, b) => (a.generated_at < b.generated_at ? 1 : -1)));
+      if (accountsR.status === "fulfilled") setAccounts(accountsR.value || []);
+      if (pulseR.status === "fulfilled") setMarketPulse(pulseR.value);
+
+      const nowNonCritical = new Date().toISOString();
+      const metaNonCritical = resolveAllSourceMeta(
+        sourceMetaRef.current,
+        {
+          thesis: thR, snapshots: snapsR, transactions: txR, goals: goalsR, journal_entries: journalR,
+          decisions: decisionsR, rebalance_targets: rebalanceR, ai_insights: insightsR, accounts: accountsR, marketPulse: pulseR,
+        },
+        nowNonCritical
+      );
+      setSourceMeta((prev) => ({ ...prev, ...metaNonCritical }));
     } finally {
-      setLoading(false);
+      if (isCurrentRequest(myRequestId, latestRequestIdRef.current)) setLoading(false);
     }
   }
 
@@ -260,19 +686,12 @@ export default function Dashboard() {
     return m;
   }, [thesis]);
 
-  const enriched = useMemo(() => positions.map((p) => {
-    const cost = Number(p.cost_basis);
-    let value = null, md = null;
-    if (p.type === "cash") {
-      value = cost;
-    } else {
-      md = marketData[p.ticker];
-      if (md) value = Number(p.shares) * md.price;
-    }
-    const gain = value != null ? value - cost : null;
-    const pct = value != null && cost ? gain / cost : null;
-    return { ...p, value, gain, pct, market: md || null, thesis: thesisByTicker[p.ticker] || null };
-  }), [positions, marketData, thesisByTicker]);
+  // Sprint P0.2: formula canonica unica (lib/financialSnapshot.js) --
+  // mismo calculo exacto que antes, ahora en un solo lugar testeable.
+  const enriched = useMemo(
+    () => enrichPositions(positions, marketData, thesisByTicker),
+    [positions, marketData, thesisByTicker]
+  );
 
   const watchlistEnriched = useMemo(() => watchlist.map((w) => ({
     ...w, market: marketData[w.ticker] || null,
@@ -280,10 +699,22 @@ export default function Dashboard() {
 
   const withValue = enriched.filter((p) => p.value != null);
   const missing = enriched.filter((p) => p.value == null);
+  // Sprint P0.4 (Price Freshness UI, items 5/7/9): estado global
+  // discreto -- CACHED dentro de TTL nunca cuenta como degradacion (ver
+  // summarizeGlobalFreshness), solo STALE/STALE_RATE_LIMITED/missing.
+  const globalFreshness = useMemo(
+    () => summarizeGlobalFreshness(enriched, marketProviderHealth),
+    [enriched, marketProviderHealth]
+  );
+  // Root cause real de P0.2 (item 3/16 del sprint): una posicion con
+  // `type` no clasificado (ni stock/crypto/cash) nunca puede valuarse --
+  // problema de DATOS, no de red. Se reporta aparte de `missing` para
+  // no confundir "todavia no llega el precio" con "el dato esta mal".
+  const unclassified = unclassifiedPositions(positions);
 
-  const stocksValue = withValue.filter((p) => p.type === "stock").reduce((a, p) => a + p.value, 0);
-  const cryptoValue = withValue.filter((p) => p.type === "crypto").reduce((a, p) => a + p.value, 0);
-  const cashValue = cashMovements.reduce((a, m) => a + (m.type === "deposito" ? Number(m.amount) : -Number(m.amount)), 0);
+  const stocksValue = computeStocksValue(enriched);
+  const cryptoValue = computeCryptoValue(enriched);
+  const cashValue = computeCashValue(cashMovements);
 
   // Patrimonio Base: portafolio tradicional + cash, SIN Futures.
   // Patrimonio Total: Base + Futures Equity (solo el ultimo snapshot
@@ -291,9 +722,9 @@ export default function Dashboard() {
   // sigue siendo el nombre usado en el resto de la app (metas, alocacion,
   // etc.) y ahora representa el TOTAL, ya que es el numero real que
   // corresponde a esas metricas.
-  const patrimonioBase = withValue.reduce((a, p) => a + p.value, 0) + cashValue;
+  const patrimonioBase = computePatrimonioBase(enriched, cashValue);
   const futuresEquityUsd = futuresEquity.total_value_usd || 0;
-  const patrimonio = patrimonioBase + futuresEquityUsd;
+  const patrimonio = computePatrimonio(patrimonioBase, futuresEquityUsd);
 
   // Hash de frescura del Daily Brief: cambia si sube PROMPT_VERSION, si
   // cambia de dia, o si el patrimonio se movio de forma material. No
@@ -303,9 +734,17 @@ export default function Dashboard() {
   const dailyBriefHash = `${PROMPT_VERSION_FRONTEND}::${todayISO}::${Math.round(patrimonio / 10) * 10}`;
   const latestInsight = aiInsights.find((i) => i.scope === "today") || null;
   const insightIsFresh = latestInsight?.based_on_hash === dailyBriefHash;
-  const invested = withValue.reduce((a, p) => a + Number(p.cost_basis), 0) + cashValue;
-  const totalGain = patrimonio - invested;
-  const totalPct = invested ? totalGain / invested : 0;
+  const invested = computeInvested(enriched, cashValue);
+  // Financial Correctness fix (bug real encontrado en produccion): antes
+  // esto era computeTotalGain(patrimonio, invested) -- `patrimonio` es
+  // TOTAL_NET_WORTH (incluye Futures Equity), `invested` nunca incluyo
+  // Futures. Resultado: el 100% de Futures Equity se contaba como
+  // ganancia. Fix de un argumento -- ver lib/financialSnapshot.js para
+  // el contrato completo (TRADITIONAL_PNL/TOTAL_PNL_STATUS/etc). Nombres
+  // explicitos a proposito -- "total" ya no puede volver a colarse aqui
+  // por error de variable.
+  const traditionalPnl = computeTotalGain(patrimonioBase, invested);
+  const traditionalReturnPct = invested ? traditionalPnl / invested : 0;
 
   const snapshotPosted = useRef(false);
   useEffect(() => {
@@ -323,14 +762,53 @@ export default function Dashboard() {
   }, [patrimonio, invested, stocksValue, cryptoValue, cashValue, missing.length]);
 
   const top5 = [...withValue].sort((a, b) => b.value - a.value).slice(0, 5);
-  const top1Pct = patrimonio ? (top5[0]?.value || 0) / patrimonio : 0;
-  const top3Pct = patrimonio ? top5.slice(0, 3).reduce((a, p) => a + p.value, 0) / patrimonio : 0;
 
-  const allocType = [
-    { name: "Acciones", value: stocksValue, color: GOLD },
-    { name: "Cripto", value: cryptoValue, color: "#7C8CF8" },
-    { name: "Efectivo", value: cashValue, color: MUTE },
-  ].filter((a) => a.value > 0);
+  // Sprint P5 (Portfolio Weights / Allocation Truth). Dos metricas
+  // DISTINTAS, nunca mezcladas (lib/financialSnapshot.js tiene el
+  // detalle completo de cada formula/status):
+  // - portfolioWeights: peso dentro del portafolio TRADICIONAL
+  //   (acciones+cripto+efectivo, SIN Futures) -- denominador nuevo, no
+  //   existia antes de este sprint.
+  // - netWorthWeights: peso dentro de TODO el patrimonio (incluye
+  //   Futures Equity) -- esto es lo que el codigo YA hacia antes (mal
+  //   llamado "Allocation"), ahora explicito y con status propio.
+  const portfolioWeights = useMemo(() => computePortfolioWeights(enriched), [enriched]);
+  const netWorthWeights = useMemo(
+    () => computeNetWorthWeights(enriched, patrimonio, portfolioWeights.status, futuresEquity.is_complete),
+    [enriched, patrimonio, portfolioWeights.status, futuresEquity.is_complete]
+  );
+  // Concentracion SIEMPRE sobre el portafolio tradicional (item 5 del
+  // sprint: "No usar Patrimonio Total para alertas de concentración").
+  // top1Pct/top3Pct se mantienen como FRACCION (0-1) por compatibilidad
+  // con SemRow/computeSystemHealth (lib/financialMath.js, sin tocar) --
+  // solo cambia de que universo vienen (antes: patrimonio total; ahora:
+  // portafolio tradicional).
+  const concentration = useMemo(() => computeConcentration(portfolioWeights), [portfolioWeights]);
+  const concentrationPartial = concentration.status !== "COMPLETE";
+  const top1Pct = concentration.top1_pct / 100;
+  const top3Pct = concentration.top3_pct / 100;
+
+  const patrimonioBreakdown = useMemo(
+    () => computePatrimonioBreakdown({ stocksValue, cryptoValue, cashValue, futuresEquityUsd, patrimonio }),
+    [stocksValue, cryptoValue, cashValue, futuresEquityUsd, patrimonio]
+  );
+  // Colores fijos por categoria (mismo criterio visual que antes, ahora
+  // con Futures Equity incluido como su propia rebanada -- item 6:
+  // "el pie debe sumar ~100%").
+  const BREAKDOWN_COLORS = { "Acciones": GOLD, "Cripto": "#7C8CF8", "Efectivo": MUTE, "Futures Equity": "#5FA8D3" };
+  const allocType = patrimonioBreakdown.map((c) => ({ ...c, color: BREAKDOWN_COLORS[c.name] || MUTE }));
+
+  // Lookup rapido de pesos por posicion para RichPositionsTable/AssetDetail.
+  const portfolioWeightById = useMemo(() => {
+    const m = {};
+    portfolioWeights.weights.forEach((w) => { m[w.id] = w.portfolio_weight_pct; });
+    return m;
+  }, [portfolioWeights]);
+  const netWorthWeightById = useMemo(() => {
+    const m = {};
+    netWorthWeights.weights.forEach((w) => { m[w.id] = w.net_worth_weight_pct; });
+    return m;
+  }, [netWorthWeights]);
 
   const concColor = top1Pct > 0.35 ? RED : top1Pct > 0.2 ? AMBER : GREEN;
 
@@ -363,11 +841,13 @@ export default function Dashboard() {
   // Estado de Hoy: motor de reglas, riesgo > oportunidad > default. Moni AI solo narra esto, nunca lo decide.
   const estadoDeHoy = useMemo(() => {
     if (patrimonio === 0) return { emoji: "🟢", label: "Sin datos suficientes", detail: "" };
-    if (top1Pct > 0.35) {
+    // Sprint P5 (item 5/J): sin datos completos de portafolio tradicional
+    // no se dispara una alerta de concentración como si fuera confiable.
+    if (!concentrationPartial && top1Pct > 0.35) {
       const top = top5[0];
       return {
         emoji: "🔴", label: `Revisar concentración en ${top?.ticker || ""}`,
-        detail: `Tu posición #1 pesa ${(top1Pct * 100).toFixed(1)}% de tu patrimonio.`,
+        detail: `Tu posición #1 pesa ${(top1Pct * 100).toFixed(1)}% de tu portafolio.`,
       };
     }
     if (scoredOpportunities.length && scoredOpportunities[0].score >= 80) {
@@ -380,13 +860,17 @@ export default function Dashboard() {
       };
     }
     return { emoji: "🟢", label: "Mantener estrategia", detail: "Ninguna señal relevante hoy." };
-  }, [patrimonio, top1Pct, top5, scoredOpportunities]);
+  }, [patrimonio, top1Pct, top5, scoredOpportunities, concentrationPartial]);
 
   // Estado de la Estrategia: reglas sobre datos ya calculados, sin opinión de IA
   const estadoEstrategia = useMemo(() => {
     if (patrimonio === 0) return [];
     const badges = [];
-    if (top1Pct > 0.35) badges.push({ text: "Concentración elevada", color: RED });
+    // Sprint P5 (item 5/J): CONCENTRATION_DATA_PARTIAL explicito en vez
+    // de una alerta de concentración fabricada sobre un universo
+    // incompleto de posiciones tradicionales.
+    if (concentrationPartial) badges.push({ text: "Concentración: datos parciales", color: AMBER });
+    else if (top1Pct > 0.35) badges.push({ text: "Concentración elevada", color: RED });
     else if (top1Pct > 0.2) badges.push({ text: "Concentración moderada", color: AMBER });
     else badges.push({ text: "Diversificación correcta", color: GREEN });
 
@@ -401,7 +885,7 @@ export default function Dashboard() {
       badges.push({ text: "Estrategia alineada", color: GREEN });
     }
     return badges;
-  }, [patrimonio, top1Pct, cashValue, withValue]);
+  }, [patrimonio, top1Pct, cashValue, withValue, concentrationPartial]);
 
   // Qué cambió desde tu última visita: resta simple contra el snapshot anterior, ya existente en la tabla snapshots
   const cambiosRecientes = useMemo(() => {
@@ -421,6 +905,9 @@ export default function Dashboard() {
 
   return (
     <div style={{ background: NAVY_BG, minHeight: "100vh", color: TXT, fontFamily: "'IBM Plex Sans','Inter',sans-serif" }}>
+      {swUpdateAvailable && (
+        <SwUpdateBanner onUpdate={() => window.__moniApplyServiceWorkerUpdate?.()} />
+      )}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
         .num { font-family: 'IBM Plex Mono', monospace; }
@@ -428,7 +915,12 @@ export default function Dashboard() {
         input, select { font-family: inherit; }
       `}</style>
 
-      <div style={{ borderBottom: `1px solid ${LINE}`, overflow: "hidden", whiteSpace: "nowrap", background: PANEL, padding: "8px 0" }}>
+      {/* Sprint P4.1: overflowX:auto en vez de overflow:hidden -- en mobile
+          esta franja ya no corta contenido de forma invisible, se puede
+          deslizar horizontalmente (unico scroll horizontal intencional
+          de todo el layout, para una lista de un solo renglon que no
+          tiene forma razonable de volverse "cards"). */}
+      <div style={{ borderBottom: `1px solid ${LINE}`, overflowX: "auto", whiteSpace: "nowrap", background: PANEL, padding: "8px 0" }}>
         <div style={{ display: "inline-flex", gap: 28, padding: "0 16px" }}>
           {enriched.length === 0 && <span style={{ color: MUTE, fontSize: 12 }}>Cargando posiciones…</span>}
           {enriched.map((p) => (
@@ -454,12 +946,20 @@ export default function Dashboard() {
               <RefreshCw size={12} /> {loading ? "Actualizando…" : "Actualizar precios"}
             </button>
             <div>{updatedAt ? `Precios: ${new Date(updatedAt).toLocaleTimeString("es-MX")}` : "—"}</div>
+            {/* Sprint P0.4 (item 5): discreto, solo aparece si hay
+                degradacion real -- CACHED dentro de TTL nunca cuenta, ver
+                summarizeGlobalFreshness. */}
+            {globalFreshness.status !== "ALL_GOOD" && (
+              <div style={{ color: AMBER, marginTop: 2 }}>{freshnessStatusText(globalFreshness)}</div>
+            )}
           </div>
         </div>
 
         {loadError && (
           <Banner color={RED} icon={AlertTriangle}>
-            No se pudo cargar el portafolio: {loadError}.
+            {isOnline
+              ? <>No se pudo cargar el portafolio: {loadError}.</>
+              : <>Sin conexión a internet — no se pudo cargar el portafolio. Los datos financieros requieren conexión, nunca se muestran inventados.</>}
           </Banner>
         )}
         {missing.length > 0 && !loadError && (
@@ -467,6 +967,20 @@ export default function Dashboard() {
             Sin precio en vivo por ahora: {missing.map((m) => m.ticker).join(", ")}. No se inventa su valor.
           </Banner>
         )}
+        {unclassified.length > 0 && !loadError && (
+          <Banner color={RED}>
+            {unclassified.length === 1 ? "1 posición" : `${unclassified.length} posiciones`} sin tipo de activo asignado ({unclassified.map((p) => p.ticker).join(", ")}) — no se puede valuar ni se incluye en tus totales hasta corregir su clasificación. Esto no es un problema de red, es un dato pendiente de corregir.
+          </Banner>
+        )}
+        {(() => {
+          const missingTickers = new Set(missing.map((m) => m.ticker));
+          const usingLastKnown = marketErrors.filter((t) => !missingTickers.has(t));
+          return usingLastKnown.length > 0 && !loadError ? (
+            <Banner color={AMBER}>
+              Usando el último precio conocido para: {usingLastKnown.join(", ")} (el proveedor de precios no respondió en este ciclo, tu total no cambia por esto).
+            </Banner>
+          ) : null;
+        })()}
 
         <div style={{ background: `linear-gradient(135deg, ${PANEL} 0%, #151C33 100%)`, border: `1px solid ${LINE}`, borderRadius: 14, padding: "32px 36px", marginBottom: 20 }}>
           <div style={{ fontSize: 12, color: MUTE, letterSpacing: 1.5, marginBottom: 8 }}>PATRIMONIO TOTAL (incluye Futures)</div>
@@ -475,8 +989,8 @@ export default function Dashboard() {
           </div>
           <div style={{ display: "flex", gap: 28, marginTop: 18, flexWrap: "wrap", alignItems: "baseline" }}>
             <Metric label="Capital invertido" value={fmt$2(invested)} />
-            <Metric label="Ganancia / Pérdida (portafolio tradicional)" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} icon={totalGain >= 0 ? TrendingUp : TrendingDown} />
-            <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
+            <Metric label="Ganancia / Pérdida (portafolio tradicional)" value={fmt$2(traditionalPnl)} color={traditionalPnl >= 0 ? GREEN : RED} icon={traditionalPnl >= 0 ? TrendingUp : TrendingDown} />
+            <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(traditionalReturnPct)} color={traditionalPnl >= 0 ? GREEN : RED} />
             <Metric label="Patrimonio Base (sin Futures)" value={fmt$2(patrimonioBase)} />
             {futuresEquityUsd > 0 && <Metric label="Futures Equity" value={fmt$2(futuresEquityUsd)} color={GOLD} />}
           </div>
@@ -490,6 +1004,22 @@ export default function Dashboard() {
               ⚠ Patrimonio parcialmente valuado — algún componente de Futures no pudo valuarse a USD todavía.
             </div>
           )}
+          {/* Sprint P0.4 (items 8/9): mismo patron que el aviso de
+              Futures de arriba, para posiciones tradicionales. MISSING
+              (sin precio en absoluto, ya excluido del total) es mas
+              grave que STALE (con precio, pero es el ultimo conocido) --
+              se muestra como mucho un aviso a la vez, nunca los dos
+              apilados por el mismo numero. La cifra NUNCA cambia por
+              esto (sigue siendo LKG), solo se explica su estado. */}
+          {globalFreshness.missingCount > 0 ? (
+            <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
+              ⚠ Patrimonio parcialmente valuado — {globalFreshness.missingCount} {globalFreshness.missingCount === 1 ? "posición sin precio en vivo no se incluye" : "posiciones sin precio en vivo no se incluyen"} en el total todavía.
+            </div>
+          ) : globalFreshness.staleCount > 0 ? (
+            <div style={{ marginTop: 12, fontSize: 12, color: AMBER }}>
+              Actualizado parcialmente — {globalFreshness.staleCount} {globalFreshness.staleCount === 1 ? "precio usa" : "precios usan"} su última cotización válida en vez de una en vivo ahora mismo.
+            </div>
+          ) : null}
           <GoalBar goal={primaryGoal} patrimonio={patrimonio} goalPct={goalPct} onNavigate={setTab} />
         </div>
 
@@ -506,8 +1036,8 @@ export default function Dashboard() {
 
 
         {!assetDetail && (
-        <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
-          {[["command", "Command Center"], ["moniai", "Moni AI"], ["resumen", "Resumen"], ["performance", "Performance"], ["posiciones", "Top Posiciones"], ["tesis", "Tesis"], ["wealth", "Wealth"], ["goals", "Goals"], ["historial", "Historial"], ["dividendos", "Dividendos"], ["journal", "Investment Journal"], ["discover", "Discover"], ["watchlist", "Watchlist"], ["efectivo", "Efectivo"], ["gestionar", "Gestionar"]].map(([key, label]) => (
+        <div className="mc-desktop-only" style={{ display: "flex", gap: 4, borderBottom: `1px solid ${LINE}`, marginBottom: 24, alignItems: "center", flexWrap: "wrap" }}>
+          {ALL_TABS.map(([key, label]) => (
             <button key={key} onClick={() => setTab(key)} style={{
               background: "none", border: "none", color: tab === key ? GOLD : MUTE, fontWeight: 600,
               fontSize: 13, padding: "10px 16px", cursor: "pointer",
@@ -525,6 +1055,11 @@ export default function Dashboard() {
             transactions={transactions}
             journalEntries={journalEntries}
             patrimonio={patrimonio}
+            portfolioWeightById={portfolioWeightById}
+            netWorthWeightById={netWorthWeightById}
+            portfolioWeightStatus={portfolioWeights.status}
+            netWorthWeightStatus={netWorthWeights.status}
+            thesisByTicker={thesisByTicker}
             onBack={closeAsset}
             onSaved={loadAll}
             onOpenAsset={openAsset}
@@ -553,10 +1088,15 @@ export default function Dashboard() {
         )}
 
         {tab === "resumen" && (
-          <div style={{ display: "grid", gap: 14 }}>
-            <TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} />
+          // Sprint P4.1: jerarquia mobile-first via CSS order (mc-mobile-order-N,
+          // solo activo bajo 767px -- el orden de desktop, mas abajo, no cambia).
+          // Patrimonio Total/Base/Futures Equity y las cuentas de Futures ya
+          // viven ARRIBA de este bloque de tabs (hero + FuturesSection), asi
+          // que ya son lo primero que se ve al abrir, en cualquier viewport.
+          <div className="mc-order-flex" style={{ display: "grid", gap: 14 }}>
+            <div className="mc-mobile-order-1"><TodayStatusCard estado={estadoDeHoy} onNavigate={setTab} /></div>
 
-            <div style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <div className="mc-mobile-order-2" style={{ background: "#1A1710", border: `1px solid ${GOLD}`, borderRadius: 10, padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <div style={{ fontSize: 12 }}>
                 <b style={{ color: GOLD }}>Moni AI</b>{" "}
                 {latestInsight?.content?.estado_general ? latestInsight.content.estado_general : "Tu Daily Brief y consultas en vivo viven en una sola pantalla."}
@@ -564,14 +1104,16 @@ export default function Dashboard() {
               <button onClick={() => setTab("moniai")} style={{ background: "none", border: "none", color: MUTE, fontSize: 11, cursor: "pointer" }}>Abrir Moni AI →</button>
             </div>
 
-            <MarketPulseRow pulse={marketPulse} />
+            <div className="mc-mobile-order-3"><MarketPulseRow pulse={marketPulse} /></div>
 
-            <Panel title="Oportunidades — dentro y fuera de tu cartera">
-              <ScoredOpportunities rows={scoredOpportunities} />
-              <CtaLink label="Ver Top Posiciones" onClick={() => setTab("posiciones")} />
-            </Panel>
+            <div className="mc-mobile-order-5">
+              <Panel title="Oportunidades — dentro y fuera de tu cartera">
+                <ScoredOpportunities rows={scoredOpportunities} />
+                <CtaLink label="Ver Top Posiciones" onClick={() => setTab("posiciones")} />
+              </Panel>
+            </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 14 }}>
+            <div className="mc-mobile-order-6" style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 14 }}>
               <Panel title="Dónde está tu dinero">
                 {allocType.length === 0 ? <Empty /> : (
                   <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
@@ -587,7 +1129,7 @@ export default function Dashboard() {
                         <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
                           <span style={{ width: 10, height: 10, borderRadius: "50%", background: e.color, display: "inline-block" }} />
                           <span style={{ color: MUTE }}>{e.name}</span>
-                          <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{patrimonio ? ((e.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
+                          <span className="num" style={{ marginLeft: "auto", fontWeight: 600 }}>{e.pct != null ? `${e.pct.toFixed(1)}%` : "—"}</span>
                         </div>
                       ))}
                     </div>
@@ -611,34 +1153,38 @@ export default function Dashboard() {
               </Panel>
             </div>
 
-            <Panel title="Qué cambió desde tu última visita">
-              {!cambiosRecientes ? (
-                <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay suficiente historial para comparar — vuelve mañana.</div>
-              ) : (
-                <div style={{ fontSize: 12, color: MUTE, lineHeight: 2 }}>
-                  <div>Desde {cambiosRecientes.baselineDate}:</div>
-                  <div>
-                    Patrimonio <b style={{ color: cambiosRecientes.deltaPatrimonio >= 0 ? GREEN : RED }}>
-                      {cambiosRecientes.deltaPatrimonio >= 0 ? "+" : ""}{fmt$2(cambiosRecientes.deltaPatrimonio)} ({fmtPct(cambiosRecientes.deltaPct)})
-                    </b>
+            <div className="mc-mobile-order-4">
+              <Panel title="Qué cambió desde tu última visita">
+                {!cambiosRecientes ? (
+                  <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay suficiente historial para comparar — vuelve mañana.</div>
+                ) : (
+                  <div style={{ fontSize: 12, color: MUTE, lineHeight: 2 }}>
+                    <div>Desde {cambiosRecientes.baselineDate}:</div>
+                    <div>
+                      Patrimonio <b style={{ color: cambiosRecientes.deltaPatrimonio >= 0 ? GREEN : RED }}>
+                        {cambiosRecientes.deltaPatrimonio >= 0 ? "+" : ""}{fmt$2(cambiosRecientes.deltaPatrimonio)} ({fmtPct(cambiosRecientes.deltaPct)})
+                      </b>
+                    </div>
+                    {cambiosRecientes.movers.map((m) => (
+                      <div key={m.id}>{m.ticker} <b style={{ color: (m.market.changePct || 0) >= 0 ? GREEN : RED }}>{fmtPct1(m.market.changePct)}</b></div>
+                    ))}
                   </div>
-                  {cambiosRecientes.movers.map((m) => (
-                    <div key={m.id}>{m.ticker} <b style={{ color: (m.market.changePct || 0) >= 0 ? GREEN : RED }}>{fmtPct1(m.market.changePct)}</b></div>
-                  ))}
-                </div>
-              )}
-              <CtaLink label="Ver Performance" onClick={() => setTab("performance")} />
-            </Panel>
+                )}
+                <CtaLink label="Ver Performance" onClick={() => setTab("performance")} />
+              </Panel>
+            </div>
 
-            <Panel title="Riesgo">
-              {patrimonio === 0 ? <Empty /> : (
-                <>
-                  <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
-                  <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
-                  <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
-                </>
-              )}
-            </Panel>
+            <div className="mc-mobile-order-7">
+              <Panel title="Riesgo">
+                {patrimonio === 0 ? <Empty /> : (
+                  <>
+                    <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
+                    <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
+                    <SemRow label="Efectivo / Patrimonio" value={patrimonio ? cashValue / patrimonio : 0} color={GOLD} />
+                  </>
+                )}
+              </Panel>
+            </div>
           </div>
         )}
 
@@ -650,7 +1196,12 @@ export default function Dashboard() {
 
         {tab === "posiciones" && (
           <Panel title="Top Posiciones — con contexto de rango">
-            <RichPositionsTable rows={[...withValue].sort((a, b) => b.value - a.value)} patrimonio={patrimonio} onOpenAsset={openAsset} />
+            <RichPositionsTable
+              rows={[...withValue].sort((a, b) => b.value - a.value)} missingRows={missing} patrimonio={patrimonio}
+              portfolioWeightById={portfolioWeightById} netWorthWeightById={netWorthWeightById}
+              portfolioWeightStatus={portfolioWeights.status}
+              onOpenAsset={openAsset}
+            />
           </Panel>
         )}
 
@@ -662,9 +1213,10 @@ export default function Dashboard() {
 
         {tab === "wealth" && (
           <WealthTab
-            patrimonio={patrimonio} invested={invested} totalGain={totalGain} totalPct={totalPct}
+            patrimonio={patrimonio} invested={invested} traditionalPnl={traditionalPnl} traditionalReturnPct={traditionalReturnPct}
             stocksValue={stocksValue} cryptoValue={cryptoValue} cashValue={cashValue}
             withValue={withValue} top5={top5} top1Pct={top1Pct} top3Pct={top3Pct} concColor={concColor}
+            concentrationPartial={concentrationPartial} portfolioWeightById={portfolioWeightById}
             allocType={allocType} snapshots={snapshots} goal={primaryGoal} goalPct={goalPct}
             transactions={transactions} cashMovements={cashMovements}
             onOpenAsset={openAsset}
@@ -739,6 +1291,40 @@ export default function Dashboard() {
           Precios de acciones vía Finnhub, cripto vía CoinGecko. Rango de referencia: 52 semanas (acciones) / histórico ATH-ATL (cripto). Informativo, no es asesoría de inversión.
         </div>
       </div>
+
+      {/* Sprint P4.1: menu "Más" (mobile) -- el resto de ALL_TABS, fuera de los 5 destinos principales del bottom nav. */}
+      {showMoreMenu && (
+        <div className="mc-mobile-only" style={{
+          position: "fixed", inset: 0, background: "rgba(10,14,23,0.92)", zIndex: 50,
+          display: "flex", flexDirection: "column", padding: 20, paddingBottom: "calc(var(--mc-bottom-nav-height) + 20px)", overflowY: "auto",
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: TXT }}>Más</div>
+            <button onClick={() => setShowMoreMenu(false)} style={{ background: "none", border: "none", color: MUTE, fontSize: 20, cursor: "pointer", minHeight: 44, minWidth: 44 }}>✕</button>
+          </div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {ALL_TABS.map(([key, label]) => (
+              <button key={key} onClick={() => { setTab(key); setShowMoreMenu(false); }} className="mc-touch-target" style={{
+                background: tab === key ? "#1A1710" : PANEL, border: `1px solid ${tab === key ? GOLD : LINE}`,
+                color: tab === key ? GOLD : TXT, borderRadius: 10, padding: "12px 16px", fontSize: 14, fontWeight: 600,
+                textAlign: "left", cursor: "pointer",
+              }}>{label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="mc-mobile-only">
+        <InstallCTA deferredPrompt={installPrompt} />
+      </div>
+
+      <MobileBottomNav
+        tab={tab}
+        moreOpen={showMoreMenu}
+        onNavigate={(key) => { setTab(key); setShowMoreMenu(false); }}
+        onOpenSmartImport={() => { setTab("gestionar"); setShowAdd(false); setShowSmartImport(true); setShowMoreMenu(false); }}
+        onToggleMore={() => setShowMoreMenu((s) => !s)}
+      />
     </div>
   );
 }
@@ -795,7 +1381,7 @@ function FuturesSection({ futuresEquity }) {
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: TXT, marginBottom: 14, letterSpacing: 0.3 }}>Binance Futures</div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
         {futuresEquity.accounts.map((acc) => {
           const primaryBalance = acc.balances[0];
           const positions = positionsByAccount[acc.account_id] || [];
@@ -812,7 +1398,10 @@ function FuturesSection({ futuresEquity }) {
                   <div className="num" style={{ fontSize: 18, fontWeight: 700 }}>
                     {primaryBalance ? `${primaryBalance.equity_value} ${primaryBalance.ticker}` : "—"}
                   </div>
-                  <div style={{ fontSize: 12, color: MUTE }}>{acc.valuation_status === "OK" ? fmt$2(acc.value_usd) : "Valuación no disponible"}</div>
+                  <div style={{ fontSize: 12, color: MUTE }}>
+                    {acc.valuation_status === "OK" ? fmt$2(acc.value_usd) : "Valuación no disponible"}
+                    <PriceFreshnessDot market={primaryBalance ? { price_status: primaryBalance.price_status, price_source: primaryBalance.price_source, price_fetched_at: primaryBalance.price_fetched_at, price: primaryBalance.price_usd_per_unit } : null} />
+                  </div>
                 </div>
                 {primaryBalance?.available_balance_value != null && (
                   <div>
@@ -870,7 +1459,24 @@ function Panel({ title, children, span }) {
   );
 }
 
-function SemRow({ label, value, color }) {
+function SemRow({ label, value, color, partial }) {
+  // Sprint P5 (Portfolio Weights): `partial` -- cuando el universo detras
+  // de `value` no esta completo (ver computeConcentration), NUNCA se
+  // muestra un % como si fuera exacto (item 3 del sprint) -- se muestra
+  // texto explicito en vez de un numero fabricado sobre datos parciales.
+  if (partial) {
+    return (
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
+          <span style={{ color: MUTE }}>{label}</span>
+          <span className="num" style={{ fontWeight: 700, color: MUTE }}>Parcial</span>
+        </div>
+        <div style={{ height: 6, background: LINE, borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: "100%", background: `repeating-linear-gradient(45deg, ${LINE}, ${LINE} 4px, transparent 4px, transparent 8px)` }} />
+        </div>
+      </div>
+    );
+  }
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 }}>
@@ -1697,6 +2303,28 @@ function CashMovementForm({ onDone }) {
   );
 }
 
+// Financial Correctness fix (Performance ≠ solo presentación): antes
+// esto comparaba `last.patrimonio - first.patrimonio` -- `patrimonio`
+// incluye Futures Equity desde 2026-09-08, asi que los ultimos 2
+// snapshots reales quedaron contaminados (salto de ~+10,131 en un solo
+// dia, que nunca fue ganancia de mercado real). El fix NO edita ni
+// reescribe ninguna fila de `snapshots` -- reconstructTraditionalMarketValue()
+// deriva el valor tradicional de cada fila desde stocks_value/
+// crypto_value/cash_value, columnas que YA existian sin cambios desde
+// el primer snapshot real. Cero migracion de schema.
+//
+// Gap real, documentado, NO resuelto en este sprint (aprobado
+// explicitamente no implementar todavia): esto sigue siendo un cambio
+// de VALOR simple (NET_WORTH_CHANGE), no un retorno de inversion
+// ajustado por flujos externos (INVESTMENT_RETURN) -- un deposito o
+// retiro de efectivo durante el periodo mueve este numero sin que sea
+// ganancia/perdida real. Moni SI tiene `cash_movements` con fecha real
+// (evidencia real: -5,200 en retiros entre 2026-08-12 y 2026-09-07,
+// dentro del periodo de snapshots actual) -- la metrica de abajo NUNCA
+// se le llama "Rendimiento" a proposito, para no reclamar una precision
+// que no tiene todavia. Ver reporte del sprint para la comparacion
+// Simple/Modified-Dietz/TWR y la recomendacion (Modified Dietz, sin
+// implementar aqui).
 function PerformanceTab({ snapshots }) {
   if (!snapshots || snapshots.length === 0) {
     return <div style={{ color: MUTE, fontSize: 13 }}>Aún no hay historial — vuelve mañana. Cada día que abras el sitio se guarda una "foto" de tu patrimonio.</div>;
@@ -1704,22 +2332,28 @@ function PerformanceTab({ snapshots }) {
 
   const first = snapshots[0];
   const last = snapshots[snapshots.length - 1];
-  const change = last.patrimonio - first.patrimonio;
-  const changePct = first.patrimonio ? change / first.patrimonio : 0;
+  const firstTraditional = reconstructTraditionalMarketValue(first);
+  const lastTraditional = reconstructTraditionalMarketValue(last);
+  const change = lastTraditional - firstTraditional;
+  const changePct = firstTraditional ? change / firstTraditional : 0;
 
   const chartData = snapshots.map((s) => ({
     date: s.date,
-    Patrimonio: Number(s.patrimonio),
+    "Patrimonio Total": Number(s.patrimonio),
+    "Valor Tradicional": reconstructTraditionalMarketValue(s),
     Invertido: Number(s.invested),
   }));
 
   return (
     <div>
       <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 24 }}>
-        <Metric label={`Primer registro (${first.date})`} value={fmt$2(Number(first.patrimonio))} />
-        <Metric label={`Hoy (${last.date})`} value={fmt$2(Number(last.patrimonio))} />
-        <Metric label="Cambio del período" value={fmt$2(change)} color={change >= 0 ? GREEN : RED} icon={change >= 0 ? TrendingUp : TrendingDown} />
-        <Metric label="Rendimiento del período" value={fmtPct(changePct)} color={change >= 0 ? GREEN : RED} />
+        <Metric label={`Primer registro (${first.date})`} value={fmt$2(firstTraditional)} />
+        <Metric label={`Hoy (${last.date})`} value={fmt$2(lastTraditional)} />
+        <Metric label="Cambio de valor del período (portafolio tradicional)" value={fmt$2(change)} color={change >= 0 ? GREEN : RED} icon={change >= 0 ? TrendingUp : TrendingDown} />
+        <Metric label="Patrimonio Total hoy (incluye Futures)" value={fmt$2(Number(last.patrimonio))} />
+      </div>
+      <div style={{ fontSize: 11, color: MUTE, marginBottom: 16 }}>
+        No ajustado por depósitos/retiros de efectivo — es cambio de valor, no rendimiento de inversión. Si depositaste o retiraste dinero en este período, este número lo mezcla.
       </div>
 
       {snapshots.length < 3 ? (
@@ -1734,12 +2368,13 @@ function PerformanceTab({ snapshots }) {
           <XAxis dataKey="date" stroke={MUTE} fontSize={11} />
           <YAxis stroke={MUTE} fontSize={11} tickFormatter={fmt$} width={70} />
           <Tooltip formatter={(v) => fmt$2(v)} contentStyle={{ background: PANEL, border: `1px solid ${LINE}`, borderRadius: 8 }} />
-          <Line type="monotone" dataKey="Patrimonio" stroke={GOLD} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="Patrimonio Total" stroke={GOLD} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="Valor Tradicional" stroke={GREEN} strokeWidth={2} dot={false} />
           <Line type="monotone" dataKey="Invertido" stroke={MUTE} strokeWidth={1.5} strokeDasharray="4 4" dot={false} />
         </LineChart>
       </ResponsiveContainer>
       <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>
-        Se guarda un registro por día (la primera vez que abres el sitio ese día). Línea dorada = patrimonio total, línea punteada = capital invertido.
+        Se guarda un registro por día (la primera vez que abres el sitio ese día). Línea dorada = Patrimonio Total (incluye Futures), línea verde = Valor Tradicional (sin Futures), línea punteada = capital invertido.
       </div>
     </div>
   );
@@ -1770,7 +2405,74 @@ function RangeBar({ price, low, high, label, compact }) {
   );
 }
 
-function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
+// Sprint P0.4 (item 6): LIVE/CACHED = sin ruido (precio normal, nada
+// que decir). STALE/STALE_RATE_LIMITED = punto ambar discreto con
+// tooltip (title nativo, sin componente nuevo). DATA_UNAVAILABLE nunca
+// llega aqui -- esas filas se renderizan aparte, ver MissingPositionRow
+// mas abajo, con marcador explicito (nunca silencioso).
+function PriceFreshnessDot({ market }) {
+  const status = market?.price_status;
+  if (status !== "STALE" && status !== "STALE_RATE_LIMITED") return null;
+  return <span title={priceTooltip(market)} style={{ color: AMBER, marginLeft: 4, cursor: "help" }}>●</span>;
+}
+
+function RichPositionsTable({ rows, missingRows, patrimonio, portfolioWeightById, netWorthWeightById, portfolioWeightStatus, onOpenAsset }) {
+  // Sprint P4.1: MISMOS `rows`/`patrimonio` que la tabla de desktop --
+  // solo cambia como se renderizan (responsive rendering, nunca dos
+  // datasets distintos). Card por posicion: ticker, valor de mercado,
+  // PnL, precio, allocation -- exactamente lo pedido, tap abre el detalle
+  // (mismo onOpenAsset que ya usaba la tabla).
+  //
+  // Sprint P5 (Portfolio Weights / Allocation Truth, item 4): la
+  // columna "Allocation" de antes en realidad era TOTAL_NET_WORTH_WEIGHT_PCT
+  // (peso / Patrimonio Total, incluye Futures) -- ahora "Peso Patrimonio",
+  // explicito. "Peso Portafolio" es NUEVO: peso dentro del portafolio
+  // tradicional (sin Futures), ver computePortfolioWeights.
+  const isMobile = useIsMobile();
+  const partial = portfolioWeightStatus !== "COMPLETE";
+  if (isMobile) {
+    return (
+      <div className="mc-card-list">
+        {rows.map((p) => {
+          const pw = portfolioWeightById[p.id];
+          const nw = netWorthWeightById[p.id];
+          return (
+            <button
+              key={p.id}
+              className="mc-card-row mc-touch-target"
+              style={{ flexDirection: "column", alignItems: "stretch", gap: 6 }}
+              onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div><b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></div>
+                <ConvictionStars value={p.thesis?.conviction} />
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 600 }}>
+                <span>{fmt$2(p.value)}</span>
+                <span style={{ color: p.gain >= 0 ? GREEN : RED }}>{p.gain != null ? fmt$2(p.gain) : "—"}</span>
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
+                <span>Precio: {p.market?.price != null ? fmt$2(p.market.price) : "—"}<PriceFreshnessDot market={p.market} /></span>
+                <span>Peso Portafolio: {pw != null ? `${pw.toFixed(1)}%` : "—"}</span>
+              </div>
+              <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: MUTE }}>
+                <span>Peso Patrimonio: {nw != null ? `${nw.toFixed(1)}%` : "—"}</span>
+              </div>
+            </button>
+          );
+        })}
+        {partial && (
+          <div style={{ fontSize: 11, color: AMBER, padding: "4px 2px" }}>⚠ Peso Portafolio parcial — faltan precios de algunas posiciones.</div>
+        )}
+        {(missingRows || []).map((p) => (
+          <div key={p.id} className="mc-card-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6, opacity: 0.75 }}>
+            <div><b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span></div>
+            <div style={{ fontSize: 12, color: AMBER }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
   return (
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 760 }}>
@@ -1784,33 +2486,56 @@ function RichPositionsTable({ rows, patrimonio, onOpenAsset }) {
             <th style={{ padding: "8px 6px", textAlign: "right" }}>Día</th>
             <th style={{ padding: "8px 6px", textAlign: "right" }}>Cap. Mercado</th>
             <th style={{ padding: "8px 6px" }}>Rango</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Peso Portafolio{partial ? " ⚠" : ""}</th>
+            <th style={{ padding: "8px 6px", textAlign: "right" }}>Peso Patrimonio</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((p, i) => (
-            <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
-              <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
+          {rows.map((p, i) => {
+            const pw = portfolioWeightById[p.id];
+            const nw = netWorthWeightById[p.id];
+            return (
+              <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}` }}>
+                <td style={{ padding: "10px 6px", color: MUTE }}>{i + 1}</td>
+                <td style={{ padding: "10px 6px" }}>
+                  <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                    <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
+                  </button>
+                </td>
+                <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}<PriceFreshnessDot market={p.market} /></td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
+                  {p.gain != null ? fmt$2(p.gain) : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (p.market?.changePct || 0) >= 0 ? GREEN : RED }}>
+                  {p.market?.changePct != null ? fmtPct1(p.market.changePct) : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmtBig(p.market?.marketCap)}</td>
+                <td style={{ padding: "10px 6px" }}>
+                  {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
+                </td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{pw != null ? `${pw.toFixed(1)}%` : "—"}</td>
+                <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{nw != null ? `${nw.toFixed(1)}%` : "—"}</td>
+              </tr>
+            );
+          })}
+          {(missingRows || []).map((p) => (
+            <tr key={p.id} style={{ borderBottom: `1px solid ${LINE}`, opacity: 0.75 }}>
+              <td style={{ padding: "10px 6px", color: MUTE }}>—</td>
               <td style={{ padding: "10px 6px" }}>
                 <button onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
                   <b style={{ color: GOLD }}>{p.ticker}</b> <span style={{ color: MUTE, fontSize: 12 }}>{p.name}</span>
                 </button>
               </td>
               <td style={{ padding: "10px 6px" }}><ConvictionStars value={p.thesis?.conviction} /></td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmt$2(p.value)}</td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: p.gain >= 0 ? GREEN : RED }}>
-                {p.gain != null ? fmt$2(p.gain) : "—"}
-              </td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right", color: (p.market?.changePct || 0) >= 0 ? GREEN : RED }}>
-                {p.market?.changePct != null ? fmtPct1(p.market.changePct) : "—"}
-              </td>
-              <td className="num" style={{ padding: "10px 6px", textAlign: "right" }}>{fmtBig(p.market?.marketCap)}</td>
-              <td style={{ padding: "10px 6px" }}>
-                {p.market ? <RangeBar price={p.market.price} low={p.market.low} high={p.market.high} label={p.market.rangeLabel} compact /> : "—"}
-              </td>
+              <td colSpan={7} style={{ padding: "10px 6px", color: AMBER, fontSize: 12 }}>⚠ Sin precio en vivo por ahora — no se incluye en el total</td>
             </tr>
           ))}
         </tbody>
       </table>
+      {partial && (
+        <div style={{ fontSize: 11, color: AMBER, marginTop: 8 }}>⚠ Peso Portafolio parcial — faltan precios de algunas posiciones tradicionales, la distribución de arriba no representa el 100% de tu portafolio todavía.</div>
+      )}
     </div>
   );
 }
@@ -2306,8 +3031,9 @@ function RebalanceTargetForm({ onDone, onCancel }) {
 }
 
 function WealthTab({
-  patrimonio, invested, totalGain, totalPct, stocksValue, cryptoValue, cashValue,
-  withValue, top5, top1Pct, top3Pct, concColor, allocType, snapshots, goal, goalPct,
+  patrimonio, invested, traditionalPnl, traditionalReturnPct, stocksValue, cryptoValue, cashValue,
+  withValue, top5, top1Pct, top3Pct, concColor, concentrationPartial, portfolioWeightById,
+  allocType, snapshots, goal, goalPct,
   transactions, cashMovements, onOpenAsset,
 }) {
   const bySector = useMemo(() => {
@@ -2357,9 +3083,9 @@ function WealthTab({
     <div style={{ display: "grid", gap: 16 }}>
       <Panel title="1. Patrimonio Total">
         <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
-          <Metric label="Patrimonio actual" value={fmt$2(patrimonio)} />
-          <Metric label="Rendimiento total" value={fmtPct(totalPct)} color={totalGain >= 0 ? GREEN : RED} />
-          <Metric label="Ganancia/Pérdida total" value={fmt$2(totalGain)} color={totalGain >= 0 ? GREEN : RED} />
+          <Metric label="Patrimonio actual (Total Net Worth)" value={fmt$2(patrimonio)} />
+          <Metric label="Rendimiento (portafolio tradicional)" value={fmtPct(traditionalReturnPct)} color={traditionalPnl >= 0 ? GREEN : RED} />
+          <Metric label="Ganancia/Pérdida (portafolio tradicional)" value={fmt$2(traditionalPnl)} color={traditionalPnl >= 0 ? GREEN : RED} />
         </div>
         {snapshots.length < 5 && (
           <div style={{ fontSize: 11, color: MUTE, marginTop: 10 }}>El historial de largo plazo apenas empieza a acumularse — se vuelve más útil con cada semana que pasa.</div>
@@ -2410,19 +3136,28 @@ function WealthTab({
         </div>
       </Panel>
 
-      <Panel title="4. Concentración">
-        <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} />
-        <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} />
+      <Panel title="4. Concentración (portafolio tradicional)">
+        {/* Sprint P5 (item 5): SIEMPRE sobre el portafolio tradicional,
+            nunca sobre Patrimonio Total -- ver computeConcentration en
+            lib/financialSnapshot.js. */}
+        <SemRow label="Peso de la posición #1" value={top1Pct} color={concColor} partial={concentrationPartial} />
+        <SemRow label="Peso combinado Top 3" value={top3Pct} color={top3Pct > 0.55 ? RED : top3Pct > 0.35 ? AMBER : GREEN} partial={concentrationPartial} />
+        {concentrationPartial && (
+          <div style={{ fontSize: 11, color: AMBER, marginBottom: 10 }}>⚠ Datos parciales — no todas las posiciones tienen precio, los pesos individuales de abajo no representan el 100% de tu portafolio.</div>
+        )}
         <div style={{ marginTop: 14 }}>
-          {top5.map((p, i) => (
-            <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
-              display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
-              borderBottom: `1px solid ${LINE}`, padding: "8px 0", cursor: "pointer", color: TXT, fontSize: 12, textAlign: "left",
-            }}>
-              <span>{i + 1}. <b style={{ color: GOLD }}>{p.ticker}</b></span>
-              <span className="num">{fmt$2(p.value)} · {patrimonio ? ((p.value / patrimonio) * 100).toFixed(1) : "0.0"}%</span>
-            </button>
-          ))}
+          {top5.map((p, i) => {
+            const w = portfolioWeightById[p.id];
+            return (
+              <button key={p.id} onClick={() => onOpenAsset({ ticker: p.ticker, type: p.type, name: p.name, coingeckoId: p.coingecko_id })} style={{
+                display: "flex", justifyContent: "space-between", width: "100%", background: "none", border: "none",
+                borderBottom: `1px solid ${LINE}`, padding: "8px 0", cursor: "pointer", color: TXT, fontSize: 12, textAlign: "left",
+              }}>
+                <span>{i + 1}. <b style={{ color: GOLD }}>{p.ticker}</b></span>
+                <span className="num">{fmt$2(p.value)} · {w != null ? `${w.toFixed(1)}%` : "—"}</span>
+              </button>
+            );
+          })}
         </div>
       </Panel>
 
@@ -2450,7 +3185,7 @@ function WealthTab({
           <Metric label="Aportes netos (Efectivo)" value={fmt$2(cashValue)} />
           <Metric label="Costo vigente de posiciones" value={fmt$2(costoVigente)} />
           <Metric label="Valor actual de posiciones" value={fmt$2(valorActual)} />
-          <Metric label="Ganancia/Pérdida (posiciones)" value={fmt$2(gananciaPosiciones)} color={gananciaPosiciones >= 0 ? GREEN : RED} />
+          <Metric label="Ganancia/Pérdida (solo posiciones, sin efectivo)" value={fmt$2(gananciaPosiciones)} color={gananciaPosiciones >= 0 ? GREEN : RED} />
           <Metric label="Dividendos recibidos" value={fmt$2(dividendosTotal)} color={GOLD} />
           <Metric label="Retiros" value={fmt$2(retirosTotal)} />
           <Metric label="Intereses" value="No tengo ese dato registrado todavía." />
@@ -3207,7 +3942,11 @@ function WatchlistAddForm({ result, onDone }) {
   );
 }
 
-function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEntries, patrimonio, onBack, onSaved, onOpenAsset }) {
+function AssetDetailScreen({
+  meta, positions, watchlist, transactions, journalEntries, patrimonio,
+  portfolioWeightById, netWorthWeightById, portfolioWeightStatus, netWorthWeightStatus,
+  thesisByTicker, onBack, onSaved, onOpenAsset,
+}) {
   const [market, setMarket] = useState(null);
   const [loadingMarket, setLoadingMarket] = useState(false);
   const [showThesisEdit, setShowThesisEdit] = useState(false);
@@ -3215,18 +3954,27 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
 
   const position = positions.find((p) => p.ticker === meta.ticker);
   const watchlistItem = watchlist.find((w) => w.ticker === meta.ticker);
-  const thesis = position?.thesis || null;
+  // Sprint P1: tesis por TICKER, no por posesion -- un activo en
+  // watchlist o incluso totalmente externo (Discover/Decisions) puede
+  // tener tesis propia. position?.thesis se mantiene primero porque ya
+  // viene enriquecido (misma fuente, mismo objeto -- sin diferencia real,
+  // solo evita un lookup extra cuando existe posicion).
+  const thesis = position?.thesis || (thesisByTicker && thesisByTicker[meta.ticker]) || null;
 
   useEffect(() => {
     if (position?.market) { setMarket(position.market); return; }
     if (watchlistItem?.market) { setMarket(watchlistItem.market); return; }
+    // Sprint P1 (item G): type:null significa no resuelto -- jamas se
+    // pide market-data con type undefined, eso rompia el contrato del
+    // endpoint. Se queda sin cotizacion, la pantalla igual renderiza.
+    if (meta.type == null) { setMarket(null); return; }
     setLoadingMarket(true);
     fetchMarketData([{ ticker: meta.ticker, type: meta.type, coingeckoId: meta.coingeckoId }])
       .then(({ data }) => setMarket(data[meta.ticker] || null))
       .catch(() => setMarket(null))
       .finally(() => setLoadingMarket(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meta.ticker]);
+  }, [meta.ticker, meta.type]);
 
   const ranking = useMemo(() => {
     const withValue = positions.filter((p) => p.value != null && p.type !== "cash");
@@ -3235,7 +3983,12 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
     return idx >= 0 ? { pos: idx + 1, total: sorted.length } : null;
   }, [positions, meta.ticker]);
 
-  const pctPatrimonio = position?.value != null && patrimonio ? (position.value / patrimonio) * 100 : null;
+  // Sprint P5 (item 9): "solo cuando status COMPLETE" -- si el universo
+  // de posiciones tradicionales (portfolio) o el patrimonio total
+  // (incluye Futures) esta incompleto, se muestra "—"/"Parcial" en vez
+  // de un % que parezca exacto sin serlo.
+  const portfolioWeightPct = position && portfolioWeightStatus === "COMPLETE" ? portfolioWeightById[position.id] : null;
+  const netWorthWeightPct = position && netWorthWeightStatus === "COMPLETE" ? netWorthWeightById[position.id] : null;
 
   const scoreData = useMemo(() => {
     if (!market) return null;
@@ -3244,10 +3997,12 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
 
   const decision = useMemo(() => {
     if (!position || !market) return { emoji: "⚪", label: "Sin posición propia", detail: "Este activo no es parte de tu portafolio todavía." };
-    if (pctPatrimonio != null && pctPatrimonio > 35) return { emoji: "🔴", label: "Revisar concentración", detail: `Pesa ${pctPatrimonio.toFixed(1)}% de tu patrimonio.` };
+    // Concentracion: sobre Peso Portafolio (tradicional), nunca Patrimonio
+    // Total (item 5) -- y solo si el dato es COMPLETE (nunca gated=null).
+    if (portfolioWeightPct != null && portfolioWeightPct > 35) return { emoji: "🔴", label: "Revisar concentración", detail: `Pesa ${portfolioWeightPct.toFixed(1)}% de tu portafolio.` };
     if (scoreData && scoreData.total >= 80) return { emoji: "🟡", label: "Revisar", detail: `Opportunity Score ${scoreData.total}.` };
     return { emoji: "🟢", label: "Mantener", detail: "Sin señales relevantes ahora mismo." };
-  }, [position, market, pctPatrimonio, scoreData]);
+  }, [position, market, portfolioWeightPct, scoreData]);
 
   const timelineEvents = useMemo(() => {
     const txEvents = (transactions || [])
@@ -3336,6 +4091,11 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
             ) : (
               <div style={{ fontSize: 13, color: MUTE }}>No la tienes ni la vigilas todavía.</div>
             )}
+            {meta.type == null && (
+              <div style={{ fontSize: 12, color: AMBER, marginTop: 10 }}>
+                Tipo de activo pendiente de resolver — no se solicitó cotización de mercado para este ticker.
+              </div>
+            )}
             {!watchlistItem && !showWlForm && (
               <button onClick={() => setShowWlForm(true)} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer", marginTop: 12 }}>
                 + Agregar a Watchlist
@@ -3353,7 +4113,8 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
         {position && (
           <Panel title="Portfolio Impact">
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px,1fr))", gap: 14 }}>
-              <Metric label="Peso actual" value={pctPatrimonio != null ? `${pctPatrimonio.toFixed(2)}%` : "—"} />
+              <Metric label="Peso Portafolio" value={portfolioWeightPct != null ? `${portfolioWeightPct.toFixed(2)}%` : "Parcial"} />
+              <Metric label="Peso Patrimonio Total" value={netWorthWeightPct != null ? `${netWorthWeightPct.toFixed(2)}%` : "Parcial"} />
               <Metric label="Ranking" value={ranking ? `#${ranking.pos} de ${ranking.total}` : "—"} />
               <Metric label="Sector" value={position.sector || "Sin definir"} />
               <Metric label="Tema" value={position.tema || "Sin definir"} />
@@ -3362,26 +4123,36 @@ function AssetDetailScreen({ meta, positions, watchlist, transactions, journalEn
           </Panel>
         )}
 
-        {position && (
-          <Panel title="Investment Thesis">
-            {!showThesisEdit ? (
-              <>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
-                  <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
-                  <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
-                  <ThesisField label="Exit Thesis (criterio de salida)" value={thesis?.sell_trigger} />
-                  <ThesisField label="Horizonte" value={thesis?.horizon} />
-                  <ThesisField label="Riesgos" value={thesis?.risks} />
-                </div>
-                <button onClick={() => setShowThesisEdit(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>
-                  {thesis ? "Revisar tesis" : "Definir tesis"}
-                </button>
-              </>
-            ) : (
-              <ThesisEditForm ticker={meta.ticker} current={thesis} onDone={() => { setShowThesisEdit(false); onSaved(); }} />
-            )}
-          </Panel>
-        )}
+        {/* Sprint P1 (items 5/6): tesis es por TICKER, no por posesion --
+            ya no se gatea con `position &&`. Un activo en watchlist o
+            totalmente externo (Discover/Decisions) puede definir su
+            propia tesis; ThesisEditForm/manageThesis ya son ticker-scoped,
+            sin dependencia de asset_id ni de tener una posicion. */}
+        <Panel title="Investment Thesis">
+          {!showThesisEdit ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 12, fontSize: 13, marginBottom: 14 }}>
+                <ThesisField label="¿Por qué la compré?" value={thesis?.why_bought} />
+                <ThesisField label="¿Qué tiene de especial?" value={thesis?.what_special} />
+                <ThesisField label="Exit Thesis (criterio de salida)" value={thesis?.sell_trigger} />
+                <ThesisField label="Horizonte" value={thesis?.horizon} />
+                <ThesisField label="Riesgos" value={thesis?.risks} />
+              </div>
+              <button onClick={() => setShowThesisEdit(true)} style={{ background: "none", border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>
+                {thesis ? "Revisar tesis" : "Definir tesis"}
+              </button>
+              {/* Sprint P1 (item 7): Analysis Freshness, deliberadamente
+                  separado de la frescura de PRECIO (esa vive en `market`/
+                  price_status, nunca se mezcla aqui) -- basado solo en
+                  thesis.updated_at. */}
+              <div style={{ fontSize: 10, color: MUTE, marginTop: 10 }}>
+                Frescura del análisis: {reviewDays != null ? `hace ${reviewDays} día${reviewDays === 1 ? "" : "s"}` : "sin tesis registrada"}
+              </div>
+            </>
+          ) : (
+            <ThesisEditForm ticker={meta.ticker} current={thesis} onDone={() => { setShowThesisEdit(false); onSaved(); }} />
+          )}
+        </Panel>
 
         {scoreData && (
           <Panel title="Opportunity Score">
@@ -3727,6 +4498,11 @@ const SMART_IMPORT_ERROR_MESSAGES = {
   TARGET_TRANSACTION_CHANGED: "La transacción relacionada cambió mientras tanto — vuelve a intentar.",
   DUPLICATE_IDENTITY_AT_CONFIRM: "Esta operación ya está registrada con esos mismos datos.",
   POSITION_NOT_FOUND_AT_CONFIRM: "No encontramos la posición para actualizar.",
+  // Sprint P1.2 (Smart Import Futures Confirm)
+  ACCOUNT_TYPE_MISMATCH: "La cuenta seleccionada no es una cuenta de Futures.",
+  INSUFFICIENT_SNAPSHOT_DATA: "No hay suficiente información en esta captura para confirmarla.",
+  COIN_M_NOTIONAL_NOT_SUPPORTED: "COIN-M no soporta notional todavía — solo tamaño en el activo nativo.",
+  STALE_POSITION_MATCH: "La posición cambió desde que se analizó esta captura — vuelve a intentar.",
 };
 
 function humanWarning(code) {
@@ -3990,6 +4766,11 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
       setImportData({
         import_id: row.id,
         status: row.status,
+        // document_type nunca fue columna de smart_imports -- solo vive
+        // en raw_extraction.document_type (persistido, inmutable). Sin
+        // esto, recargar un import de Futures por id perdia la
+        // distincion y caia en la vista de compra/venta.
+        document_type: row.raw_extraction?.document_type ?? null,
         normalized_extraction: row.normalized_extraction,
         proposed_changes: row.proposed_changes,
         warnings: row.normalized_extraction?.warnings || [],
@@ -4065,7 +4846,29 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
     );
   }
 
-  // ================== REVIEW ==================
+  // ================== REVIEW -- Futures (Sprint P1.2) ==================
+  // Rama completamente separada de la de compra/venta: la forma de
+  // normalized_extraction no tiene nada en comun (normalized.asset/.type
+  // vs normalized.balances / normalized.normalized_facts), intentar
+  // reusar el render de abajo mostraria campos vacios sin explicacion.
+  if (state === "REVIEW" && normalized && importData?.document_type === "FUTURES_ACCOUNT_SNAPSHOT") {
+    return (
+      <FuturesAccountSnapshotReview
+        normalized={normalized} accounts={accounts} pin={pin} importId={importData.import_id}
+        onDone={onDone} onCancel={onCancel}
+      />
+    );
+  }
+  if (state === "REVIEW" && normalized && importData?.document_type === "FUTURES_POSITION_SNAPSHOT") {
+    return (
+      <FuturesPositionSnapshotReview
+        normalized={normalized} accounts={accounts} pin={pin} importId={importData.import_id}
+        onDone={onDone} onCancel={onCancel}
+      />
+    );
+  }
+
+  // ================== REVIEW -- compra/venta ==================
   if (state === "REVIEW" && normalized) {
     const warnings = normalized.warnings || [];
     const overall = normalized.overall_import_confidence;
@@ -4237,10 +5040,10 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
         {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button type="button" onClick={confirm} disabled={!canAttemptConfirm} style={{
+          <button type="button" className="mc-touch-target" onClick={confirm} disabled={!canAttemptConfirm} style={{
             background: canAttemptConfirm ? GOLD : LINE, color: canAttemptConfirm ? "#1A1305" : MUTE,
-            border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13,
-            cursor: canAttemptConfirm ? "pointer" : "not-allowed",
+            border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+            cursor: canAttemptConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
           }}>
             Confirmar importación
           </button>
@@ -4253,6 +5056,257 @@ function SmartImportFlow({ onDone, onCancel, assets, accounts }) {
   }
 
   return null;
+}
+
+// ================== Sprint P1.2: Futures REVIEW/CONFIRM ==================
+// Cambio minimo compatible con la UI actual -- mismo cardStyle/inputStyle
+// que el resto de Smart Import, sin rediseño mobile. Cada componente es
+// autonomo: confirma, muestra su propio SUCCESS/ERROR inline, y solo
+// llama a onDone() cuando el usuario cierra con "Listo".
+const futuresCardStyle = { background: NAVY_BG, border: `1px solid ${LINE}`, borderRadius: 10, padding: 18, marginBottom: 24 };
+const futuresRowStyle = { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${LINE}`, fontSize: 13 };
+
+function FuturesFieldRow({ label, value, color }) {
+  return (
+    <div style={futuresRowStyle}>
+      <span style={{ fontSize: 12, color: MUTE }}>{label}</span>
+      <span style={{ color: color || TXT }}>{value != null && value !== "" ? String(value) : "—"}</span>
+    </div>
+  );
+}
+
+function FuturesConfirmSuccess({ title, lines, onDone }) {
+  return (
+    <div style={{ ...futuresCardStyle, border: `1px solid ${GREEN}` }}>
+      <div style={{ fontSize: 15, fontWeight: 700, color: GREEN, marginBottom: 10 }}>{title}</div>
+      <div style={{ fontSize: 13, color: TXT, display: "grid", gap: 6, marginBottom: 16 }}>
+        {lines.map((l, i) => <div key={i}>{l}</div>)}
+      </div>
+      <button type="button" onClick={onDone} style={{ background: GOLD, color: "#1A1305", border: "none", borderRadius: 6, padding: "10px 16px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+        Listo
+      </button>
+    </div>
+  );
+}
+
+function FuturesAccountSnapshotReview({ normalized, accounts, pin, importId, onDone, onCancel }) {
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null);
+  const [accountEdit, setAccountEdit] = useState(null);
+
+  const accountId = accountEdit ?? normalized.account?.account_id ?? null;
+  const account = accountId != null ? accounts.find((a) => a.id === accountId) : null;
+  const accountUnresolved = accountId == null;
+
+  const balances = normalized.balances || [];
+  const classified = balances.map((b) => ({ ...b, _class: classifyBalanceForPersistence(b) }));
+  const toPersist = classified.filter((b) => b._class === "PERSIST");
+  const toIgnore = classified.filter((b) => b._class === "IGNORE");
+  const toReview = classified.filter((b) => b._class === "REVIEW");
+
+  const blockers = [];
+  if (accountUnresolved) blockers.push("Falta identificar la cuenta.");
+  if (toReview.length > 0) blockers.push(`${toReview.length} balance(s) no tienen equity resuelto — no se puede confirmar hasta corregirlo.`);
+  if (toPersist.length === 0) blockers.push("No hay ningún balance con datos suficientes para guardar.");
+  const canConfirm = blockers.length === 0 && !confirming;
+
+  async function handleConfirm() {
+    setConfirming(true); setErrorInfo(null);
+    try {
+      const userEdits = accountEdit != null ? { "0": { account_id: accountEdit } } : {};
+      const data = await callSmartImport({ pin, action: "confirm", import_id: importId, user_edits: userEdits });
+      setResult(data);
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null, detail: e.data?.detail });
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <FuturesConfirmSuccess
+        title={result.already_confirmed ? "Esta importación ya estaba confirmada" : "Snapshot de cuenta confirmado"}
+        lines={[
+          `Cuenta: ${account?.name || accountId}`,
+          `${toPersist.length} balance(s) guardados`,
+          "El patrimonio se actualizará con este snapshot como el más reciente.",
+        ]}
+        onDone={onDone}
+      />
+    );
+  }
+
+  return (
+    <div style={futuresCardStyle}>
+      <div style={{ fontSize: 14, fontWeight: 700, color: TXT, marginBottom: 14 }}>
+        Revisión — Snapshot de cuenta Futures ({normalized.account?.product_type || "—"})
+      </div>
+
+      <div style={{ display: "grid", gap: 0, marginBottom: 16 }}>
+        <div style={futuresRowStyle}>
+          <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
+          {accountUnresolved ? (
+            <select style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 10px", fontSize: 13 }}
+              value={accountEdit ?? ""} onChange={(e) => setAccountEdit(e.target.value ? Number(e.target.value) : null)}>
+              <option value="">Sin identificar</option>
+              {accounts.filter((a) => a.account_type === "futures").map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          ) : (
+            <span onClick={() => setAccountEdit(accountId)} style={{ cursor: "pointer", color: TXT }} title="Click para cambiar">{account?.name || accountId}</span>
+          )}
+        </div>
+        <FuturesFieldRow label="Observado" value={normalized.observed_at ? new Date(normalized.observed_at).toLocaleString("es-MX") : "Se usará la hora de esta importación"} />
+      </div>
+
+      <div style={{ background: "#161c2e", border: `1px solid ${LINE}`, borderRadius: 8, padding: 14, marginBottom: 12 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: GOLD, marginBottom: 8 }}>Balances a guardar ({toPersist.length})</div>
+        {toPersist.length === 0 && <div style={{ fontSize: 12, color: MUTE }}>Ninguno todavía.</div>}
+        {toPersist.map((b, i) => (
+          <div key={i} style={futuresRowStyle}>
+            <span style={{ color: MUTE }}>{b.asset_symbol}</span>
+            <span>Equity: <b style={{ color: GOLD }}>{b.equity_value}</b> ({b.equity_source_type})</span>
+          </div>
+        ))}
+      </div>
+
+      {toIgnore.length > 0 && (
+        <div style={{ fontSize: 12, color: MUTE, marginBottom: 12 }}>
+          Ignorados (sin saldo relevante): {toIgnore.map((b) => b.asset_symbol).join(", ")}
+        </div>
+      )}
+      {toReview.length > 0 && (
+        <div style={{ fontSize: 12, color: RED, background: "#2A1414", border: `1px solid ${RED}`, borderRadius: 6, padding: "8px 10px", marginBottom: 12 }}>
+          Sin equity resuelto: {toReview.map((b) => b.asset_symbol).join(", ")} — revisa la captura.
+        </div>
+      )}
+      {(normalized.warnings || []).length > 0 && (
+        <div style={{ marginBottom: 12, display: "grid", gap: 4 }}>
+          {(normalized.warnings || []).map((w) => <div key={w} style={{ fontSize: 12, color: AMBER }}>• {w}</div>)}
+        </div>
+      )}
+      {blockers.map((b, i) => <div key={i} style={{ fontSize: 12, color: RED, marginBottom: 6 }}>• {b}</div>)}
+      {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button type="button" className="mc-touch-target" onClick={handleConfirm} disabled={!canConfirm} style={{
+          background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
+          border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+          cursor: canConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
+        }}>
+          {confirming ? "Confirmando…" : "Confirmar"}
+        </button>
+        <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "10px 16px", fontSize: 13, cursor: "pointer" }}>
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FuturesPositionSnapshotReview({ normalized, accounts, pin, importId, onDone, onCancel }) {
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null);
+  const [accountEdit, setAccountEdit] = useState(null);
+
+  const facts = normalized.normalized_facts || {};
+  const accountId = accountEdit ?? normalized.account?.account_id ?? null;
+  const account = accountId != null ? accounts.find((a) => a.id === accountId) : null;
+  const accountUnresolved = accountId == null;
+
+  const decision = normalized.identity_result?.decision;
+  const decisionOk = decision === "NEW_POSITION" || decision === "MATCH_EXISTING_HIGH";
+
+  const blockers = [];
+  if (accountUnresolved) blockers.push("Falta identificar la cuenta.");
+  if (!decisionOk) blockers.push(`No se puede confirmar automáticamente (${decision || "identidad no determinada"}) — revisa manualmente.`);
+  const canConfirm = blockers.length === 0 && !confirming;
+
+  async function handleConfirm() {
+    setConfirming(true); setErrorInfo(null);
+    try {
+      const userEdits = accountEdit != null ? { "0": { account_id: accountEdit } } : {};
+      const data = await callSmartImport({ pin, action: "confirm", import_id: importId, user_edits: userEdits });
+      setResult(data);
+    } catch (e) {
+      setErrorInfo({ error_code: e.data?.error_code || null, detail: e.data?.detail });
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <FuturesConfirmSuccess
+        title={result.already_confirmed ? "Esta importación ya estaba confirmada" : "Snapshot de posición confirmado"}
+        lines={[
+          `${facts.instrument || "—"} · ${facts.side === "long" ? "LONG" : "SHORT"}`,
+          `Cuenta: ${account?.name || accountId}`,
+          result.position_operation === "NEW_POSITION" ? "Posición nueva creada" : "Posición existente actualizada",
+        ]}
+        onDone={onDone}
+      />
+    );
+  }
+
+  return (
+    <div style={futuresCardStyle}>
+      <div style={{ fontSize: 14, fontWeight: 700, color: TXT, marginBottom: 14 }}>
+        Revisión — Snapshot de posición Futures
+      </div>
+
+      <div style={{ display: "grid", gap: 0, marginBottom: 16 }}>
+        <div style={futuresRowStyle}>
+          <span style={{ fontSize: 12, color: MUTE }}>Cuenta</span>
+          {accountUnresolved ? (
+            <select style={{ background: NAVY_BG, border: `1px solid ${GOLD}`, color: GOLD, borderRadius: 6, padding: "6px 10px", fontSize: 13 }}
+              value={accountEdit ?? ""} onChange={(e) => setAccountEdit(e.target.value ? Number(e.target.value) : null)}>
+              <option value="">Sin identificar</option>
+              {accounts.filter((a) => a.account_type === "futures").map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          ) : (
+            <span onClick={() => setAccountEdit(accountId)} style={{ cursor: "pointer", color: TXT }} title="Click para cambiar">{account?.name || accountId}</span>
+          )}
+        </div>
+        <FuturesFieldRow label="Instrumento" value={facts.instrument} />
+        <FuturesFieldRow label="Side" value={facts.side === "long" ? "LONG" : facts.side === "short" ? "SHORT" : "—"} color={facts.side === "long" ? GREEN : facts.side === "short" ? RED : TXT} />
+        <FuturesFieldRow label="Leverage" value={facts.leverage != null ? `${facts.leverage}x` : null} />
+        <FuturesFieldRow label="Margin mode" value={facts.margin_mode} />
+        <FuturesFieldRow label="Tamaño (nativo)" value={facts.position_quantity_value != null ? `${facts.position_quantity_value} ${facts.position_quantity_unit || ""}` : null} />
+        <FuturesFieldRow label="Notional" value={facts.notional_value != null ? `${facts.notional_value} ${facts.price_currency || ""}` : "Pendiente de verificación"} />
+        <FuturesFieldRow label="Entry" value={facts.entry_price} />
+        <FuturesFieldRow label="Mark" value={facts.mark_price} />
+        <FuturesFieldRow label="Liquidation" value={facts.liquidation_price} />
+        <FuturesFieldRow label="PnL no realizado" value={facts.unrealized_pnl_value} color={facts.unrealized_pnl_value >= 0 ? GREEN : RED} />
+        <FuturesFieldRow label="ROI" value={facts.roi_pct != null ? `${facts.roi_pct}%` : null} color={facts.roi_pct >= 0 ? GREEN : RED} />
+        <FuturesFieldRow label="Unit semantics" value={facts.unit_semantics_status} color={facts.unit_semantics_status === "VERIFIED" ? GREEN : AMBER} />
+        <FuturesFieldRow label="Resultado de identidad" value={decision} color={decisionOk ? GREEN : RED} />
+      </div>
+
+      {(normalized.warnings || []).length > 0 && (
+        <div style={{ marginBottom: 12, display: "grid", gap: 4 }}>
+          {(normalized.warnings || []).map((w) => <div key={w} style={{ fontSize: 12, color: AMBER }}>• {w}</div>)}
+        </div>
+      )}
+      {blockers.map((b, i) => <div key={i} style={{ fontSize: 12, color: RED, marginBottom: 6 }}>• {b}</div>)}
+      {errorInfo && <div style={{ color: RED, fontSize: 12, marginBottom: 12 }}>{humanError(errorInfo.error_code)}</div>}
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button type="button" className="mc-touch-target" onClick={handleConfirm} disabled={!canConfirm} style={{
+          background: canConfirm ? GOLD : LINE, color: canConfirm ? "#1A1305" : MUTE,
+          border: "none", borderRadius: 6, padding: "12px 20px", fontWeight: 700, fontSize: 14,
+          cursor: canConfirm ? "pointer" : "not-allowed", flex: "1 1 auto",
+        }}>
+          {confirming ? "Confirmando…" : "Confirmar"}
+        </button>
+        <button type="button" onClick={onCancel} style={{ background: "none", border: `1px solid ${LINE}`, color: MUTE, borderRadius: 6, padding: "10px 16px", fontSize: 13, cursor: "pointer" }}>
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function ConvictionStars({ value }) {

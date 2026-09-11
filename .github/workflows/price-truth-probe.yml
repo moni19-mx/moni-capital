@@ -1,0 +1,78 @@
+name: Price Truth Stability Probe
+
+# Probe de observabilidad pura (15 minutos reales) -- ver
+# scripts/priceTruthProbe.mjs / lib/priceTruthProbeState.js. Nunca
+# corrige nada, nunca cambia formulas/TTL/MAX_STALE_AGE/breaker
+# behavior. Corre en GitHub Actions por el mismo motivo que el
+# Conviction Coverage Orchestrator: egress real, a diferencia del
+# sandbox de Claude Code (*.vercel.app da 403 CONNECT rejected ahi).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_base_url:
+        description: 'Preview URL a probar, SIN trailing slash (ej. https://moni-capital-git-....vercel.app) -- requerido, nunca hay default'
+        required: true
+        type: string
+      mode:
+        description: 'diagnostic (3 iter, ~2 min, NO certifica Price Truth) | certification (16 iter, ~15 min, produce PASS/FAIL)'
+        required: false
+        default: 'diagnostic'
+        type: string
+      iterations:
+        description: 'Numero de corridas -- default segun mode si se deja vacio (diagnostic=3, certification=16)'
+        required: false
+        type: string
+      cert_tickers:
+        description: 'SOLO certification: JSON array [{"ticker":"X","type":"stock|crypto"},...] ya resuelto contra `assets` (positions UNION watchlist + USDT). Vacio = fallback al universo fijo de 9. Ignorado en mode=diagnostic.'
+        required: false
+        type: string
+  # Bootstrap (mismo patron que conviction-coverage.yml): GitHub solo
+  # permite disparar workflow_dispatch via API para un workflow que YA
+  # existe en la default branch -- este archivo todavia vive solo en
+  # esta feature branch. "push" no tiene esa restriccion, asi que este
+  # trigger, acotado por paths a este mismo archivo, permite el primer
+  # run real sin esperar a mergear. El target_base_url de este bloque
+  # es la Preview URL estable de ESTA rama (la misma usada durante todo
+  # el sprint, confirmada via el status de GitHub para este commit) --
+  # nunca un default silencioso para uso manual futuro, solo para este
+  # arranque puntual. Se puede quitar despues de mergear a main.
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/price-truth-probe.yml'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run Price Truth Stability Probe
+        env:
+          TARGET_BASE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.target_base_url || 'https://moni-capital-git-claude-supabase-mon-bcfab4-moni19-mxs-projects.vercel.app' }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'diagnostic' }}
+          ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '' }}
+          CERT_TICKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.cert_tickers || '' }}
+          VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: node scripts/priceTruthProbe.mjs
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-truth-probe-results
+          path: |
+            price-truth-probe.jsonl
+            price-truth-summary.md
+            price-truth-diagnostic.jsonl
+            price-truth-diagnostic-summary.md
+          retention-days: 30
+          if-no-files-found: ignore

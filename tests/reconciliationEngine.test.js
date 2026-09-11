@@ -171,14 +171,28 @@ test("computeAssetOwnership: asset sin entradas -> todo 0", () => {
 });
 
 // ================== getAccountEquity ==================
+// NOTA (auditoria getAccountEquity, post Sprint P0.1): accountContext
+// SIEMPRE es el objeto {accountType, provider, productType} -- nunca un
+// string plano. Un string desestructurado da accountType=undefined, lo
+// que hacia que 2 tests de este bloque fallaran en silencio de forma
+// distinta a lo que en realidad probaban (ver docs/reliability o el
+// reporte de auditoria correspondiente). available_balance_value NUNCA
+// participa en ningun escenario -- esa formula (sumar los 3
+// componentes) fue removida deliberadamente por ser incorrecta contra
+// datos reales de Binance USD-M (ver comentario en
+// lib/reconciliationEngine.js encima de getAccountEquity). No
+// reintroducirla bajo ninguna circunstancia.
 test("getAccountEquity: equity explicita del proveedor -> se usa esa, sin recalcular", () => {
-  const r = getAccountEquity({ asset_id: "USDT", equity_value: 5000, wallet_balance_value: 999 }, "futures");
+  const r = getAccountEquity(
+    { asset_id: "USDT", equity_value: 5000, wallet_balance_value: 999 },
+    { accountType: "FUTURES", provider: "BINANCE", productType: "USD_M" }
+  );
   assert.equal(r.status, "OK");
   assert.equal(r.value, 5000);
 });
 
 test("getAccountEquity: spot sin equity explicita -> usa wallet_balance_value", () => {
-  const r = getAccountEquity({ asset_id: "BTC", wallet_balance_value: 0.5 }, "spot");
+  const r = getAccountEquity({ asset_id: "BTC", wallet_balance_value: 0.5 }, { accountType: "SPOT" });
   assert.equal(r.status, "OK");
   assert.equal(r.value, 0.5);
 });
@@ -188,10 +202,34 @@ test("getAccountEquity: spot sin wallet_balance_value -> DATA_UNAVAILABLE, nunca
   assert.equal(r.status, "DATA_UNAVAILABLE");
 });
 
-test("getAccountEquity: futures con los 3 componentes -> suma", () => {
-  const r = getAccountEquity({ asset_id: "USDT", available_balance_value: 100, margin_balance_value: 50, unrealized_pnl_value: -5 }, "futures");
+test("getAccountEquity: futures USD_M derivado (WALLET_PLUS_UNREALIZED_PNL) -> wallet_balance_value + unrealized_pnl_value, available_balance_value NUNCA participa", () => {
+  const r = getAccountEquity(
+    { asset_id: "USDT", wallet_balance_value: 100, unrealized_pnl_value: -5, margin_balance_value: null, equity_value: null },
+    { accountType: "FUTURES", provider: "BINANCE", productType: "USD_M" }
+  );
   assert.equal(r.status, "OK");
-  assert.equal(r.value, 145);
+  assert.equal(r.value, 95);
+  assert.equal(r.provenance, "DERIVED");
+});
+
+test("getAccountEquity: futures USD_M via REPORTED_EQUIVALENT_FIELD (margin_balance_value) -- el camino real de los snapshots confirmados de Moni Capital (import #61)", () => {
+  const r = getAccountEquity(
+    { asset_id: "USDT", margin_balance_value: 4338.65594577 },
+    { accountType: "FUTURES", provider: "BINANCE", productType: "USD_M" }
+  );
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 4338.65594577);
+  assert.equal(r.provenance, "REPORTED_EQUIVALENT_FIELD");
+});
+
+test("getAccountEquity: futures COIN_M via REPORTED_EQUIVALENT_FIELD (margin_balance_value) -- mismo camino real, denominado en BTC (import #64)", () => {
+  const r = getAccountEquity(
+    { asset_id: "BTC", margin_balance_value: 0.06818617 },
+    { accountType: "FUTURES", provider: "BINANCE", productType: "COIN_M" }
+  );
+  assert.equal(r.status, "OK");
+  assert.equal(r.value, 0.06818617);
+  assert.equal(r.provenance, "REPORTED_EQUIVALENT_FIELD");
 });
 
 test("getAccountEquity: futures con un componente faltante -> DATA_UNAVAILABLE, nunca asume 0", () => {

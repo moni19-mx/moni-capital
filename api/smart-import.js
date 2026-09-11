@@ -24,10 +24,14 @@ import {
   evaluateDateUpdateEligibility, evaluateIdentityFieldConsistency,
 } from "../lib/reconciliationEngine.js";
 import {
-  validateUserEditKeys, applyEditsToNormalized, buildRpcParams,
+  validateUserEditKeys, applyEditsToNormalized, buildRpcParams, FUTURES_USER_EDIT_WHITELIST,
 } from "../lib/smartImportConfirm.js";
 import { normalizeFuturesAccountBalance, normalizeFuturesPositionFacts, resolveAccountContext } from "../lib/futuresImportNormalize.js";
 import { matchDerivativePositionIdentity, routeDerivativeSnapshot } from "../lib/reconciliationEngine.js";
+import {
+  resolveObservedAt, buildAccountSnapshotConfirmPlan, buildAccountSnapshotRpcParams,
+  resolvePositionConfirmDecision, buildPositionSnapshotRpcParams,
+} from "../lib/futuresConfirm.js";
 
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -151,6 +155,19 @@ async function handleConfirm(req, res, body) {
   }
   if (importRow.status !== "REVIEW_REQUIRED") {
     return res.status(409).json({ ok: false, import_id, status: importRow.status, error_code: "INVALID_IMPORT_STATE" });
+  }
+
+  // ================== Sprint P1.2: dispatch por document_type ==================
+  // document_type nunca fue columna de smart_imports -- solo vive en
+  // raw_extraction.document_type (persistido, inmutable por trigger).
+  // Los 2 tipos de snapshot de Futures tienen su propio flujo de confirm,
+  // completamente separado del de compra/venta que sigue abajo sin cambios.
+  const documentType = importRow.raw_extraction?.document_type ?? null;
+  if (documentType === "FUTURES_ACCOUNT_SNAPSHOT") {
+    return handleConfirmFuturesAccountSnapshot(res, importRow, body);
+  }
+  if (documentType === "FUTURES_POSITION_SNAPSHOT") {
+    return handleConfirmFuturesPositionSnapshot(res, importRow, body);
   }
 
   // ================== 4. Validar approved_change_indices ==================
@@ -322,6 +339,199 @@ async function handleConfirm(req, res, body) {
   // Cualquier otro resultado controlado del RPC (IMPORT_NOT_FOUND, INVALID_IMPORT_STATE,
   // POSITION_NOT_FOUND_AT_CONFIRM, TARGET_TRANSACTION_NOT_FOUND, TARGET_TRANSACTION_CHANGED,
   // DUPLICATE_IDENTITY_AT_CONFIRM, MULTIPLE_POSITIONS_FOUND, INVALID_OPERATION)
+  return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: rpcResult.result, detail: rpcResult });
+}
+
+// ==================================================
+// Sprint P1.2 -- confirm de FUTURES_ACCOUNT_SNAPSHOT
+// ==================================================
+// REGLA CENTRAL: nunca confia en normalized_extraction como si fuera
+// definitivo -- account y asset se re-resuelven contra Supabase EN VIVO
+// en este momento, nunca se usan a ciegas los ids guardados en extract.
+// Solo escribe via confirm_smart_import_futures_account_snapshot(...) --
+// jamas un INSERT directo a account_snapshots/account_snapshot_balances
+// desde este archivo. La atomicidad (incluida idempotencia via
+// ALREADY_CONFIRMED) pertenece por completo al RPC, ya probado.
+async function handleConfirmFuturesAccountSnapshot(res, importRow, body) {
+  const { import_id, user_edits } = body;
+  const normalized = importRow.normalized_extraction;
+  if (!normalized || !Array.isArray(normalized.balances)) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "INVALID_IMPORT_STATE" });
+  }
+
+  const edits = (user_edits && user_edits["0"]) || {};
+  const keyCheck = validateUserEditKeys(edits, FUTURES_USER_EDIT_WHITELIST);
+  if (!keyCheck.valid) {
+    return res.status(400).json({ ok: false, import_id, error_code: "INVALID_USER_EDIT", field: keyCheck.field });
+  }
+
+  // ================== 4-5. Resolver account real, exigir account_type=futures ==================
+  const accountId = "account_id" in edits ? edits.account_id : (normalized.account?.account_id ?? null);
+  if (accountId == null) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ACCOUNT" });
+  }
+  const { data: account } = await supabase.from("accounts").select("id, account_type").eq("id", accountId).maybeSingle();
+  if (!account) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ACCOUNT" });
+  }
+  if (String(account.account_type).toLowerCase() !== "futures") {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "ACCOUNT_TYPE_MISMATCH" });
+  }
+
+  // ================== 6-9. Clasificar balances + resolver asset_id real por balance persistible ==================
+  const balances = normalized.balances;
+  const symbolsToResolve = [...new Set(balances.map((b) => b.asset_symbol).filter(Boolean))];
+  const assetIdBySymbol = {};
+  for (const symbol of symbolsToResolve) {
+    const resolved = await resolveAsset(supabase, symbol);
+    assetIdBySymbol[symbol] = resolved.status === "MATCHED_ASSET" ? resolved.asset_id : null;
+  }
+  const plan = buildAccountSnapshotConfirmPlan(balances, assetIdBySymbol);
+
+  if (plan.blocked) {
+    const reason = plan.blockedAsset.length > 0 ? "UNKNOWN_ASSET" : "CONFIRMATION_NOT_ALLOWED";
+    return res.status(409).json({
+      ok: false, import_id, status: "REVIEW_REQUIRED", error_code: reason,
+      detail: {
+        blocked_equity_symbols: plan.blockedEquity.map((b) => b.asset_symbol),
+        blocked_asset_symbols: plan.blockedAsset.map((b) => b.asset_symbol),
+      },
+    });
+  }
+  if (plan.persist.length === 0) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "INSUFFICIENT_SNAPSHOT_DATA" });
+  }
+
+  // ================== 11. observed_at: source timestamp, si no import.created_at ==================
+  const observed = resolveObservedAt(normalized.observed_at, importRow.created_at);
+
+  const approvedChanges = {
+    entity: "account_snapshot", operation: "CREATE", account_id: accountId, observed_at: observed.value,
+    balances: plan.persist, ignored_balances: plan.ignored.map((b) => b.asset_symbol),
+  };
+  const rpcParams = buildAccountSnapshotRpcParams({
+    importId: import_id, accountId, observedAt: observed.value,
+    balancesPayload: plan.persist, approvedChanges, userEdits: user_edits || {},
+  });
+
+  // ================== 12. Llamar EXCLUSIVAMENTE al RPC ==================
+  const { data: rpcResult, error: rpcError } = await supabase.rpc("confirm_smart_import_futures_account_snapshot", rpcParams);
+  if (rpcError) {
+    console.error(JSON.stringify(buildSafeLogEntry({ import_id, status: "ERROR", error_code: "RPC_UNEXPECTED_ERROR" })));
+    return res.status(500).json({ ok: false, import_id, error_code: "RPC_UNEXPECTED_ERROR" });
+  }
+
+  // ================== 13. Devolver resultado ==================
+  if (rpcResult.result === "CONFIRMED") {
+    return res.status(200).json({
+      ok: true, import_id, status: "CONFIRMED",
+      account_snapshot_id: rpcResult.account_snapshot_id, balances_inserted: rpcResult.balances_inserted,
+    });
+  }
+  if (rpcResult.result === "ALREADY_CONFIRMED") {
+    return res.status(200).json({ ok: true, import_id, status: "CONFIRMED", already_confirmed: true, account_snapshot_id: rpcResult.account_snapshot_id });
+  }
+  // Cualquier otro resultado controlado del RPC (IMPORT_NOT_FOUND, CONFIRMED_SNAPSHOT_AMBIGUOUS,
+  // INVALID_IMPORT_STATE, ACCOUNT_NOT_FOUND, ACCOUNT_TYPE_MISMATCH, INVALID_BALANCES_PAYLOAD,
+  // DUPLICATE_ASSET_IN_BATCH) -- nunca se oculta, nunca se marca CONFIRMED falsamente.
+  return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: rpcResult.result, detail: rpcResult });
+}
+
+// ==================================================
+// Sprint P1.2 -- confirm de FUTURES_POSITION_SNAPSHOT
+// ==================================================
+// La identidad se vuelve a correr aqui contra derivative_positions
+// ACTUAL (nunca el identity_result guardado en extract, que puede estar
+// obsoleto) -- solo NEW_POSITION/MATCH_EXISTING_HIGH pueden confirmar;
+// MEDIUM/AMBIGUOUS/INSUFFICIENT_DATA bloquean SIEMPRE, antes del RPC.
+// USD-M/COIN-M: cero derivacion de notional/contract size/BTC
+// equivalent/exposure USD aqui -- eso vive exclusivamente en
+// deriveNotional() durante extract, ya persistido en normalized_facts.
+async function handleConfirmFuturesPositionSnapshot(res, importRow, body) {
+  const { import_id, user_edits } = body;
+  const normalized = importRow.normalized_extraction;
+  const facts = normalized?.normalized_facts;
+  if (!facts) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "INVALID_IMPORT_STATE" });
+  }
+
+  const edits = (user_edits && user_edits["0"]) || {};
+  const keyCheck = validateUserEditKeys(edits, FUTURES_USER_EDIT_WHITELIST);
+  if (!keyCheck.valid) {
+    return res.status(400).json({ ok: false, import_id, error_code: "INVALID_USER_EDIT", field: keyCheck.field });
+  }
+
+  // ================== 4. Resolver account real ==================
+  const accountId = "account_id" in edits ? edits.account_id : (normalized.account?.account_id ?? facts.account_id ?? null);
+  if (accountId == null) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ACCOUNT" });
+  }
+  const { data: account } = await supabase.from("accounts").select("id, account_type").eq("id", accountId).maybeSingle();
+  if (!account) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ACCOUNT" });
+  }
+  if (String(account.account_type).toLowerCase() !== "futures") {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "ACCOUNT_TYPE_MISMATCH" });
+  }
+
+  // ================== 5. Re-resolver underlying asset real ==================
+  if (facts.underlying_asset_id == null) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ASSET" });
+  }
+  const underlying = await resolveAssetById(supabase, facts.underlying_asset_id);
+  if (underlying.status !== "MATCHED_ASSET") {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "UNKNOWN_ASSET" });
+  }
+
+  // ================== 6-7. Volver a correr identidad contra derivative_positions ACTUAL ==================
+  if (!facts.instrument || !facts.contract_type) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "INSUFFICIENT_SNAPSHOT_DATA" });
+  }
+  const { data: openCandidates } = await supabase
+    .from("derivative_positions").select("*").eq("account_id", accountId).eq("status", "OPEN");
+  const identityResult = matchDerivativePositionIdentity({ ...facts, account_id: accountId }, openCandidates || []);
+  const decision = resolvePositionConfirmDecision(identityResult);
+  if (!decision.allowed) {
+    return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: "CONFIRMATION_NOT_ALLOWED", reason: decision.blockReason });
+  }
+
+  const observed = resolveObservedAt(facts.observed_at, importRow.created_at);
+
+  const approvedChanges = {
+    entity: "derivative_position_snapshot", operation: decision.operation, target_id: decision.positionId,
+    account_id: accountId, underlying_asset_id: facts.underlying_asset_id, instrument: facts.instrument,
+    side: facts.side, contract_type: facts.contract_type, fields: facts,
+    confidence: identityResult.reconciliation_confidence,
+  };
+  const rpcParams = buildPositionSnapshotRpcParams({
+    importId: import_id, decision, accountId, underlyingAssetId: facts.underlying_asset_id,
+    normalizedFacts: facts, observedAt: observed.value, approvedChanges, userEdits: user_edits || {},
+  });
+
+  // ================== 8. Llamar EXCLUSIVAMENTE al RPC ==================
+  const { data: rpcResult, error: rpcError } = await supabase.rpc("confirm_smart_import_futures_position_snapshot", rpcParams);
+  if (rpcError) {
+    console.error(JSON.stringify(buildSafeLogEntry({ import_id, status: "ERROR", error_code: "RPC_UNEXPECTED_ERROR" })));
+    return res.status(500).json({ ok: false, import_id, error_code: "RPC_UNEXPECTED_ERROR" });
+  }
+
+  if (rpcResult.result === "CONFIRMED") {
+    return res.status(200).json({
+      ok: true, import_id, status: "CONFIRMED",
+      position_id: rpcResult.position_id, snapshot_id: rpcResult.snapshot_id, position_operation: rpcResult.position_operation,
+    });
+  }
+  if (rpcResult.result === "ALREADY_CONFIRMED") {
+    return res.status(200).json({ ok: true, import_id, status: "CONFIRMED", already_confirmed: true, snapshot_id: rpcResult.snapshot_id });
+  }
+  // Cualquier otro resultado controlado del RPC (IMPORT_NOT_FOUND, CONFIRMED_SNAPSHOT_AMBIGUOUS,
+  // INVALID_IMPORT_STATE, INVALID_OPERATION, ACCOUNT_NOT_FOUND, ACCOUNT_TYPE_MISMATCH,
+  // INVALID_SIDE, INVALID_CONTRACT_TYPE, INVALID_MARGIN_MODE, INVALID_INSTRUMENT[_FORMAT],
+  // INVALID_POSITION_QUANTITY_PAIR, INVALID_NOTIONAL_PAIR, COIN_M_NOTIONAL_NOT_SUPPORTED,
+  // UNSUPPORTED_FUTURES_PRODUCT_V1, INVALID_MARGIN_USED_PAIR, INVALID_UNREALIZED_PNL_PAIR,
+  // MISSING_PRICE_CURRENCY, INSUFFICIENT_SNAPSHOT_DATA, INVALID_UNIT_SEMANTICS_STATUS,
+  // MISSING_OBSERVED_AT, INVALID_UNDERLYING_ASSET, TARGET_POSITION_NOT_FOUND,
+  // STALE_POSITION_MATCH, POSITION_ALREADY_EXISTS_AT_CONFIRM, DUPLICATE_PROVIDER_POSITION_ID_AT_CONFIRM)
   return res.status(409).json({ ok: false, import_id, status: "REVIEW_REQUIRED", error_code: rpcResult.result, detail: rpcResult });
 }
 

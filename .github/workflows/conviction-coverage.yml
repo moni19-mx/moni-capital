@@ -1,0 +1,68 @@
+name: Conviction Coverage Orchestrator
+
+# MVP del Conviction Coverage Orchestrator (Priority 2, sprint de
+# automatizacion). Corre en un runner de GitHub Actions -- egress real,
+# a diferencia del sandbox de Claude Code (confirmado con curl real:
+# *.vercel.app y *.sec.gov devuelven 403 CONNECT rejected por politica
+# de egress del sandbox; api.github.com no). Este workflow es el unico
+# puente automatico: Claude Code lo dispara via workflow_dispatch y lee
+# el resultado de vuelta, sin que el usuario copie/pegue JSON.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Tickers separados por coma, ej. GOOG,NVDA (vacio si se usa resume_run_id)'
+        required: false
+        type: string
+      mode:
+        description: 'FULL_PIPELINE | SEC_ONLY | SCORE_ONLY'
+        required: false
+        default: 'FULL_PIPELINE'
+        type: string
+      resume_run_id:
+        description: 'run_id de conviction_runs a resumir en vez de crear uno nuevo (opcional)'
+        required: false
+        type: string
+  # Bootstrap: GitHub solo permite disparar workflow_dispatch via API para
+  # un workflow que YA existe en la default branch del repo -- este
+  # workflow todavia vive solo en esta feature branch (PR sin mergear
+  # aun). "push" no tiene esa restriccion, asi que este trigger, acotado
+  # por paths a este mismo archivo, es lo que permite el primer run (el
+  # canary GOOG/NVDA) sin esperar a mergear a main. Una vez el PR se
+  # mergea, workflow_dispatch queda disponible normalmente y este bloque
+  # deja de ser necesario (se puede quitar).
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/conviction-coverage.yml'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run Conviction Coverage Orchestrator
+        env:
+          MONI_ADMIN_SECRET: ${{ secrets.MONI_ADMIN_SECRET }}
+          VERCEL_PROTECTION_BYPASS_SECRET: ${{ secrets.VERCEL_PROTECTION_BYPASS_SECRET }}
+          VERCEL_BASE_URL: ${{ vars.VERCEL_BASE_URL }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'FULL_PIPELINE' }}
+          TICKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.tickers || 'GOOG,NVDA' }}
+          RESUME_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.resume_run_id || '' }}
+        run: |
+          ARGS="--mode=$MODE"
+          if [ -n "$RESUME_RUN_ID" ]; then
+            ARGS="$ARGS --resume-run-id=$RESUME_RUN_ID"
+          fi
+          if [ -n "$TICKERS" ]; then
+            ARGS="$ARGS --tickers=$TICKERS"
+          fi
+          node scripts/orchestrate-conviction.js $ARGS

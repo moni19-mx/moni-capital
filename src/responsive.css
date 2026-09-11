@@ -1,0 +1,125 @@
+/* src/responsive.css
+   Sprint P4.1 (Responsive Mobile Foundation). Base CSS minima, agregada
+   junto a los estilos inline existentes -- NO reemplaza el sistema de
+   estilos actual, solo resuelve lo que un estilo inline no puede:
+   media queries, ocultar/mostrar por viewport, y reordenar sin duplicar
+   el DOM ("responsive rendering, no dos datasets distintos").
+
+   Un solo breakpoint: 767px. Por debajo = mobile, por arriba = desktop/
+   tablet ancho. Coincide con los viewports de validacion de este sprint
+   (375/390/430 vs 768/1440).
+*/
+
+:root {
+  --mc-bottom-nav-height: 60px;
+  /* Mismos valores que las constantes de color en src/App.jsx (GOLD,
+     PANEL, LINE, MUTE, NAVY_BG) -- una sola paleta, nunca duplicada con
+     valores distintos entre JS y CSS. */
+  --mc-gold: #C9A34E;
+  --mc-panel: #11172A;
+  --mc-line: #232B45;
+  --mc-mute: #8A93B0;
+  --mc-navy-bg: #0A0E17;
+}
+
+/* ================== Utilidades de visibilidad ================== */
+.mc-mobile-only { display: none; }
+.mc-desktop-only { display: initial; }
+
+@media (max-width: 767px) {
+  .mc-mobile-only { display: initial; }
+  .mc-desktop-only { display: none !important; }
+
+  /* Espacio para que el bottom nav fijo nunca tape contenido real.
+     Sprint P4.2: + safe-area-inset-bottom para el home indicator de
+     iPhone (notch/Dynamic Island) en modo standalone/PWA -- sin esto,
+     el ultimo item real de la pagina queda parcialmente tapado por la
+     barra de gestos del sistema. env() con fallback 0px es un no-op en
+     navegadores/dispositivos sin safe-area (Android, desktop, iPhone
+     mas viejos). */
+  body { padding-bottom: calc(var(--mc-bottom-nav-height) + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* ================== Bottom navigation (mobile) ================== */
+/* display:none/flex vive ENTERO aqui (no delega en .mc-mobile-only) a
+   proposito -- dos reglas de igual especificidad sobre el mismo
+   elemento, una base y otra dentro de @media, se resuelven por orden de
+   aparicion en el archivo, no por cual "suena" mas especifica. Tenerlo
+   autocontenido en una sola regla + su propio @media evita point en el
+   que un cambio de orden en el archivo vuelva a romper la visibilidad. */
+.mc-bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--mc-bottom-nav-height);
+  display: none;
+  z-index: 40;
+  border-top: 1px solid var(--mc-line);
+  background: var(--mc-panel);
+  /* Sprint P4.2: el nav en si tambien necesita el padding, no solo el
+     body -- los botones deben quedar arriba del home indicator, no
+     debajo de el (fondo del nav se extiende hasta bottom:0 igual, solo
+     el contenido interactivo se corre hacia arriba). */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  box-sizing: content-box;
+}
+@media (max-width: 767px) {
+  .mc-bottom-nav { display: flex; }
+}
+
+.mc-bottom-nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--mc-mute);
+  /* Touch target real -- toda la altura del nav (60px) y ancho flexible,
+     nunca menor a lo recomendado (~44px). */
+  min-height: 44px;
+}
+
+.mc-bottom-nav-item.active { color: var(--mc-gold); }
+
+/* ================== Reordenar sin duplicar DOM (hero mobile-first) ================== */
+@media (max-width: 767px) {
+  .mc-mobile-order-1 { order: 1; }
+  .mc-mobile-order-2 { order: 2; }
+  .mc-mobile-order-3 { order: 3; }
+  .mc-mobile-order-4 { order: 4; }
+  .mc-mobile-order-5 { order: 5; }
+  .mc-mobile-order-6 { order: 6; }
+  .mc-mobile-order-7 { order: 7; }
+}
+.mc-order-flex { display: flex; flex-direction: column; }
+
+/* ================== Card list (alternativa mobile a <table>) ================== */
+.mc-card-list { display: flex; flex-direction: column; gap: 8px; }
+.mc-card-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px; border-radius: 10px; background: var(--mc-navy-bg);
+  border: 1px solid var(--mc-line); text-align: left; cursor: pointer;
+  min-height: 44px; width: 100%;
+}
+
+/* ================== Touch targets ================== */
+.mc-touch-target { min-height: 44px; }
+
+/* ================== Standalone (PWA instalada) ================== */
+/* Sprint P4.2. apple-mobile-web-app-status-bar-style=black-translucent
+   (index.html) hace que el status bar de iOS se dibuje ENCIMA del
+   contenido en vez de empujarlo -- sin esto, el header queda debajo del
+   reloj/bateria en standalone. Solo aplica en standalone: en Safari
+   normal (pestaña de navegador) el status bar ya no es parte del
+   viewport de la pagina, agregar este padding ahi correria el header
+   sin necesidad. */
+@media (display-mode: standalone) {
+  body { padding-top: env(safe-area-inset-top, 0px); }
+}
