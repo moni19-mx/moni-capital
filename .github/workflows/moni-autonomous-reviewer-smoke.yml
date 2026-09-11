@@ -22,6 +22,11 @@ on:
         description: 'Modelo de OpenAI a usar para el smoke test (nunca hardcodeado en el codigo)'
         required: true
         type: string
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/moni-autonomous-reviewer-smoke.yml'
 
 permissions:
   contents: read
