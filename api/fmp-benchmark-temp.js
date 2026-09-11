@@ -828,6 +828,98 @@ async function runHistoricalPriceProbe(req, res) {
   return res.status(200).json({ ok: true, mode: "HISTORICAL_PRICE_PROBE", tickers: tickerList, summary, results });
 }
 
+// ================== Historical Multiple Data Review, NEXT TASK 1 ==================
+// Modo diagnostico separado (?pin=X&mode=corporate_action_probe),
+// read-only, temporal -- verifica si el plan actual de FMP soporta un
+// endpoint ESTRUCTURADO de splits (y, como bono directamente util para
+// el test de dividendos de NEXT TASK 3, uno de dividends) -- NUNCA
+// infiere factores de split desde el salto de EPS, solo lo usa como
+// corroboracion aparte si hiciera falta. Reutiliza
+// normalizeFmpHistoricalResponse (ya generico: array / {historical:[]}
+// / {data:[]} / unsupported) -- cero logica de parsing duplicada.
+const CORPORATE_ACTION_SPLIT_TICKERS = ["NVDA", "AMZN", "GOOGL", "MSFT", "ORCL", "QCOM"];
+const CORPORATE_ACTION_DIVIDEND_TICKERS = ["MSFT", "ORCL", "QCOM"];
+
+async function probeFmpListEndpoint(FMP_KEY, endpointPath, ticker) {
+  const url = `${FMP_BASE}${endpointPath}?symbol=${ticker}&apikey=${FMP_KEY}`;
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    return { ticker, endpoint: endpointPath, classification: "PROVIDER_ERROR", detail: `network_error: ${String(e.message || e)}` };
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    return { ticker, endpoint: endpointPath, classification: "AUTH_ERROR", http_status: resp.status };
+  }
+  if (resp.status === 402) {
+    return { ticker, endpoint: endpointPath, classification: "PLAN_BLOCKED", http_status: resp.status };
+  }
+  if (!resp.ok) {
+    const bodyText = await resp.text();
+    if (looksLikePlanBlockedMessage(bodyText)) {
+      return { ticker, endpoint: endpointPath, classification: "PLAN_BLOCKED", http_status: resp.status, body_snippet: bodyText.slice(0, 300) };
+    }
+    return { ticker, endpoint: endpointPath, classification: "PROVIDER_ERROR", http_status: resp.status, body_snippet: bodyText.slice(0, 300) };
+  }
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ticker, endpoint: endpointPath, classification: "PROVIDER_ERROR", detail: `json_parse_error: ${String(e.message || e)}` };
+  }
+  const { shape, records } = normalizeFmpHistoricalResponse(data);
+  if (records.length === 0) {
+    return { ticker, endpoint: endpointPath, classification: "NO_DATA", http_status: resp.status, detected_response_shape: shape };
+  }
+  return {
+    ticker, endpoint: endpointPath, classification: "AVAILABLE", http_status: resp.status,
+    detected_response_shape: shape, record_count: records.length,
+    fields_present_in_sample: Object.keys(records[0]),
+    sample_records: records.slice(0, 5),
+  };
+}
+
+function checkKnownSplitReproduced(splitResult, expectedDate, expectedRatioText) {
+  if (splitResult.classification !== "AVAILABLE") return { reproduced: false, reason: splitResult.classification };
+  const match = splitResult.sample_records.find((r) => r.date === expectedDate);
+  if (!match) return { reproduced: false, reason: "expected_date_not_found_in_sample", expected_date: expectedDate, expected_ratio: expectedRatioText };
+  return { reproduced: true, matched_record: match, expected_ratio: expectedRatioText };
+}
+
+async function runCorporateActionProbe(req, res) {
+  const FMP_KEY = process.env.FMP_API_KEY;
+  if (!FMP_KEY) {
+    return res.status(500).json({ error: "missing_fmp_key_in_vercel_env" });
+  }
+
+  const splitResults = [];
+  for (const ticker of CORPORATE_ACTION_SPLIT_TICKERS) {
+    const r = await probeFmpListEndpoint(FMP_KEY, "/splits", ticker);
+    splitResults.push(r);
+    await sleep(REQUEST_DELAY_MS);
+  }
+
+  const knownEventChecks = {
+    NVDA: checkKnownSplitReproduced(splitResults.find((r) => r.ticker === "NVDA"), "2024-06-07", "10:1"),
+    AMZN: checkKnownSplitReproduced(splitResults.find((r) => r.ticker === "AMZN"), "2022-06-06", "20:1"),
+    GOOGL: checkKnownSplitReproduced(splitResults.find((r) => r.ticker === "GOOGL"), "2022-07-18", "20:1"),
+  };
+
+  const dividendResults = [];
+  for (const ticker of CORPORATE_ACTION_DIVIDEND_TICKERS) {
+    const r = await probeFmpListEndpoint(FMP_KEY, "/dividends", ticker);
+    dividendResults.push(r);
+    await sleep(REQUEST_DELAY_MS);
+  }
+
+  return res.status(200).json({
+    ok: true,
+    mode: "CORPORATE_ACTION_PROBE",
+    splits: { endpoint: "/splits", tickers_tested: CORPORATE_ACTION_SPLIT_TICKERS, results: splitResults, known_event_reproduction_check: knownEventChecks },
+    dividends: { endpoint: "/dividends", tickers_tested: CORPORATE_ACTION_DIVIDEND_TICKERS, results: dividendResults },
+  });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
@@ -839,6 +931,10 @@ export default async function handler(req, res) {
 
   if (mode === "historical_probe") {
     return runHistoricalPriceProbe(req, res);
+  }
+
+  if (mode === "corporate_action_probe") {
+    return runCorporateActionProbe(req, res);
   }
 
   if (reconcile === "true") {
