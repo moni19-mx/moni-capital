@@ -16,6 +16,12 @@
 // Nunca devuelve ni loguea la API key en la respuesta ni en errores.
 
 import { createClient } from "@supabase/supabase-js";
+// Historical Multiple Data Review: normalizacion PURA y testeable de la
+// forma real de respuesta de FMP historical-price-eod/full (ver
+// lib/fmpHistoricalNormalizer.js -- bugfix real, el probe asumia
+// siempre `{ historical: [...] }` y clasificaba NO_DATA para
+// respuestas que son un array de nivel superior).
+import { normalizeFmpHistoricalResponse } from "../lib/fmpHistoricalNormalizer.js";
 // Micro-sprint P0.2 (Financial Totals Correctness + Stability), cierre
 // final. Reutiliza la formula canonica unica -- CERO reimplementacion.
 import {
@@ -687,6 +693,17 @@ const FMP_HISTORICAL_ELIGIBLE_TICKERS = [
   "NVDA", "ORCL", "QCOM", "VRT",
 ];
 
+// Fechas de split REALES conocidas (evidencia externa, no derivadas del
+// salto de EPS -- usadas solo para localizar la ventana de registros a
+// inspeccionar; la clasificacion RAW/SPLIT_ADJUSTED se decide con los
+// precios reales alrededor de esa fecha, nunca asumida).
+const KNOWN_SPLIT_DATES = {
+  NVDA: "2024-06-07",   // 10-for-1
+  AMZN: "2022-06-06",   // 20-for-1
+  GOOG: "2022-07-18",   // 20-for-1
+  GOOGL: "2022-07-18",  // 20-for-1
+};
+
 async function probeHistoricalPriceTicker(FMP_KEY, ticker) {
   const url = `${FMP_BASE}/historical-price-eod/full?symbol=${ticker}&apikey=${FMP_KEY}`;
   let resp;
@@ -717,9 +734,22 @@ async function probeHistoricalPriceTicker(FMP_KEY, ticker) {
     return { ticker, classification: "PROVIDER_ERROR", detail: `json_parse_error: ${String(e.message || e)}` };
   }
 
-  const records = data?.historical;
-  if (!Array.isArray(records) || records.length === 0) {
-    return { ticker, classification: "NO_DATA", http_status: resp.status, top_level_keys: data && typeof data === "object" ? Object.keys(data) : [] };
+  // BUGFIX (Historical Multiple Data Review): la forma real de la
+  // respuesta de FMP para /historical-price-eod/full puede ser un
+  // ARRAY de nivel superior directamente (confirmado en vivo para
+  // NVDA/AMZN) -- asumir siempre `{ historical: [...] }` clasificaba
+  // erroneamente NO_DATA para un ticker con ~1255 registros reales.
+  // normalizeFmpHistoricalResponse nunca adivina una forma no
+  // reconocida en silencio -- ver lib/fmpHistoricalNormalizer.js.
+  const { shape: detectedResponseShape, records } = normalizeFmpHistoricalResponse(data);
+  if (records.length === 0) {
+    return {
+      ticker,
+      classification: "NO_DATA",
+      http_status: resp.status,
+      detected_response_shape: detectedResponseShape,
+      top_level_keys: data && typeof data === "object" ? Object.keys(data).slice(0, 20) : [],
+    };
   }
 
   // Se ordena explicitamente por fecha -- nunca se asume el orden que
@@ -729,10 +759,14 @@ async function probeHistoricalPriceTicker(FMP_KEY, ticker) {
   const earliest = sorted[sorted.length - 1];
   const fieldsPresent = Object.keys(latest);
 
+  const knownSplitDate = KNOWN_SPLIT_DATES[ticker] || null;
+  const splitWindowEvidence = knownSplitDate ? findRecordsAroundDate(records, knownSplitDate, 3) : null;
+
   return {
     ticker,
     classification: "AVAILABLE",
     http_status: resp.status,
+    detected_response_shape: detectedResponseShape,
     provider_symbol: ticker,
     record_count: records.length,
     earliest_date: earliest.date,
@@ -745,10 +779,24 @@ async function probeHistoricalPriceTicker(FMP_KEY, ticker) {
     volume_field_value: latest.volume ?? null,
     split_related_fields: Object.fromEntries(fieldsPresent.filter((k) => /split/i.test(k)).map((k) => [k, latest[k]])),
     dividend_related_fields: Object.fromEntries(fieldsPresent.filter((k) => /div/i.test(k)).map((k) => [k, latest[k]])),
-    exchange_field_value: latest.exchange ?? data.exchange ?? null,
-    currency_field_value: latest.currency ?? data.currency ?? null,
-    top_level_keys: Object.keys(data),
+    exchange_field_value: latest.exchange ?? (Array.isArray(data) ? null : data.exchange) ?? null,
+    currency_field_value: latest.currency ?? (Array.isArray(data) ? null : data.currency) ?? null,
+    known_split_date: knownSplitDate,
+    split_window_evidence: splitWindowEvidence,
   };
+}
+
+// Sprint P2A style split-evidence helper: busca, dentro de los records
+// ya normalizados y ordenados por fecha, la ventana alrededor de una
+// fecha de split conocida -- evidencia real, nunca inferida del nombre
+// de un campo. Devuelve hasta N registros antes y despues de esa fecha.
+function findRecordsAroundDate(records, targetDate, windowSize = 3) {
+  const sorted = [...records].sort((a, b) => (a.date < b.date ? -1 : 1)); // ascendente
+  const idx = sorted.findIndex((r) => r.date >= targetDate);
+  if (idx === -1) return { found: false, before: [], after: [] };
+  const before = sorted.slice(Math.max(0, idx - windowSize), idx);
+  const after = sorted.slice(idx, idx + windowSize);
+  return { found: true, before, after };
 }
 
 async function runHistoricalPriceProbe(req, res) {
