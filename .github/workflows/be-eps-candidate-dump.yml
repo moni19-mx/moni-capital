@@ -1,0 +1,31 @@
+name: BE EPS Candidate Dump
+
+# Diagnostico puntual, SOLO LECTURA, temporal -- ver
+# scripts/beEpsCandidateDump.mjs. Objetivo: entender con evidencia por
+# que BE sigue resolviendo a EarningsPerShareBasicAndDiluted (2020, LOW)
+# despues del fix de seleccion de unidad, en vez de EarningsPerShareDiluted
+# (donde companyfacts muestra un punto 2025 real). SEC EDGAR es publico
+# (sin API key) -- este workflow no requiere NINGUN secret. NUNCA escribe
+# en Supabase.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/supabase-moni-capital-bggymh
+    paths:
+      - '.github/workflows/be-eps-candidate-dump.yml'
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run BE EPS Candidate Dump
+        run: node scripts/beEpsCandidateDump.mjs
