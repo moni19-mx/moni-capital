@@ -49,6 +49,15 @@ async function main() {
     console.log(`[be-candidate-dump] tag=${tag} units_keys=${JSON.stringify(Object.keys(units))}`);
     const chosenUnit = selectCompatibleUnit(units, allowedUnits);
     console.log(`[be-candidate-dump] tag=${tag} selectCompatibleUnit_result=${JSON.stringify(chosenUnit)}`);
+    // Diagnostico adicional: si selectCompatibleUnit devolvio null pese a
+    // que la unidad esperada SI aparece como key, caracterizar la forma
+    // real del valor (nunca asumir "es un array" sin comprobarlo).
+    for (const unitKey of allowedUnits) {
+      if (Object.prototype.hasOwnProperty.call(units, unitKey)) {
+        const rawValue = units[unitKey];
+        console.log(`[be-candidate-dump] tag=${tag} unit_key=${unitKey} typeof_raw_value=${typeof rawValue} is_array=${Array.isArray(rawValue)} value_snapshot=${JSON.stringify(rawValue).slice(0, 500)}`);
+      }
+    }
 
     if (chosenUnit) {
       const rawEntries = units[chosenUnit] || [];
