@@ -1,0 +1,37 @@
+{
+  "task_id": "autonomous-loop-documentation-canary",
+  "title": "Autonomous Loop Documentation Canary",
+  "objective": "Prove the full autonomous loop end to end (Phase D) on a harmless, non-financial task before it is ever pointed at real product code. Make a small, bounded improvement to autonomous/README.md's 'How a task branch is created' section, adding a concrete worked example of a task_id and its derived branch name.",
+  "scope": {
+    "allowed_files": [
+      "autonomous/README.md"
+    ],
+    "forbidden_files": []
+  },
+  "acceptance_criteria": [
+    {
+      "id": "worked_example_added",
+      "description": "autonomous/README.md's branch-naming section includes at least one concrete worked example showing a real task_id string and the exact branch name deriveTaskBranchName() produces for it.",
+      "auto_checkable": false
+    },
+    {
+      "id": "tests_pass",
+      "description": "The full test suite passes with zero failures.",
+      "auto_checkable": true
+    },
+    {
+      "id": "build_succeeds",
+      "description": "npm run build exits 0.",
+      "auto_checkable": true
+    }
+  ],
+  "required_tests": [
+    "npm test"
+  ],
+  "required_live_evidence": [],
+  "risk_level": "LOW",
+  "human_approval_required_for": [
+    "any change outside autonomous/README.md",
+    "any AUTONOMOUS_INFRA_CHANGE-classified file"
+  ]
+}

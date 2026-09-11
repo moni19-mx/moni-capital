@@ -1,0 +1,74 @@
+{
+  "type": "object",
+  "required": ["verdict", "summary", "blocking_findings", "required_changes", "tests_to_add_or_rerun", "human_action", "next_iteration_scope"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "type": "string", "enum": ["PASS", "HOLD", "BLOCKED_HUMAN"] },
+    "summary": { "type": "string" },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "finding", "evidence", "required_action"],
+        "additionalProperties": false,
+        "properties": {
+          "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+          "finding": { "type": "string" },
+          "evidence": { "type": "string" },
+          "required_action": { "type": "string" }
+        }
+      }
+    },
+    "required_changes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests_to_add_or_rerun": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "human_action": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["reason", "description"],
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": "string",
+              "enum": [
+                "SECRET_REQUIRED",
+                "PROVIDER_ACCOUNT_CHANGE",
+                "BILLING_OR_PLAN_CHANGE",
+                "EXTERNAL_DASHBOARD_ACTION",
+                "PRODUCT_POLICY_DECISION",
+                "DESTRUCTIVE_DB_OPERATION",
+                "RLS_OR_SECURITY_POLICY_CHANGE",
+                "SERVICE_ROLE_PERMISSION_CHANGE",
+                "PRODUCTION_MIGRATION_APPROVAL",
+                "FINANCIAL_TRUTH_FORMULA_CHANGE",
+                "NET_WORTH_SEMANTIC_CHANGE",
+                "DERIVATIVE_EQUITY_SEMANTIC_CHANGE",
+                "EXTERNAL_PURCHASE_OR_BILLING",
+                "API_SECRET_CREATION_OR_ROTATION",
+                "PRODUCTION_MERGE_APPROVAL",
+                "CANONICAL_PROVIDER_IDENTITY_CHANGE",
+                "SILENT_DATA_CORRECTION",
+                "AUTONOMOUS_INFRA_CHANGE",
+                "MAX_AUTONOMOUS_ITERATIONS_REACHED",
+                "AMBIGUOUS_MATERIALLY_DIFFERENT_OUTCOMES",
+                "OTHER"
+              ]
+            },
+            "description": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "next_iteration_scope": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
