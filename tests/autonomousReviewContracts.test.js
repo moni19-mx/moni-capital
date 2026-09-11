@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 import {
   validateTaskSpec, validateReviewPacket, validateReviewResponse,
   isProtectedPath, classifyFileChanges, packetSupportsPass,
-  reviewerVerdictIsInternallyConsistent, shouldStopIteration,
+  reviewerVerdictIsInternallyConsistent, reviewerResponseIsSelfConsistent,
+  shouldStopIteration,
   deriveTaskBranchName, reviewerModelFromEnv, isForcePushArgs,
   DEFAULT_PROTECTED_PATTERNS, DEFAULT_MAX_ITERATIONS,
 } from "../lib/autonomousReviewContracts.js";
@@ -265,4 +266,54 @@ test("LL - isForcePushArgs: un push normal nunca se marca como force", () => {
 test("MM - DEFAULT_PROTECTED_PATTERNS incluye exactamente los 6 patrones especificados", () => {
   assert.equal(DEFAULT_PROTECTED_PATTERNS.length, 6);
   assert.ok(DEFAULT_PROTECTED_PATTERNS.includes("lib/autonomousReviewContracts.js"));
+});
+
+// ================== Fase B: reviewerResponseIsSelfConsistent ==================
+// Casos explicitos exigidos en la revision de Fase B -- un
+// REVIEW_RESPONSE schema-valido puede seguir siendo incoherente
+// consigo mismo.
+
+test("NN - reviewerResponseIsSelfConsistent: PASS limpio (sin findings, sin required_changes, human_action null) -> consistente", () => {
+  const result = reviewerResponseIsSelfConsistent(VALID_RESPONSE_PASS);
+  assert.equal(result.consistent, true);
+});
+
+test("OO - reviewerResponseIsSelfConsistent: PASS con blocking_findings no vacio -> INCONSISTENTE", () => {
+  const bad = { ...VALID_RESPONSE_PASS, blocking_findings: [{ severity: "LOW", finding: "x", evidence: "y", required_action: "z" }] };
+  const result = reviewerResponseIsSelfConsistent(bad);
+  assert.equal(result.consistent, false);
+  assert.equal(result.reason, "verdict_PASS_but_blocking_findings_not_empty");
+});
+
+test("PP - reviewerResponseIsSelfConsistent: PASS con required_changes no vacio -> INCONSISTENTE", () => {
+  const bad = { ...VALID_RESPONSE_PASS, required_changes: ["do one more thing"] };
+  const result = reviewerResponseIsSelfConsistent(bad);
+  assert.equal(result.consistent, false);
+  assert.equal(result.reason, "verdict_PASS_but_required_changes_not_empty");
+});
+
+test("QQ - reviewerResponseIsSelfConsistent: PASS con human_action no nulo -> INCONSISTENTE", () => {
+  const bad = { ...VALID_RESPONSE_PASS, human_action: { reason: "OTHER", description: "x" } };
+  const result = reviewerResponseIsSelfConsistent(bad);
+  assert.equal(result.consistent, false);
+  assert.equal(result.reason, "verdict_PASS_but_human_action_not_null");
+});
+
+test("RR - reviewerResponseIsSelfConsistent: BLOCKED_HUMAN con human_action=null -> INCONSISTENTE, nunca accionable", () => {
+  const bad = { ...VALID_RESPONSE_PASS, verdict: "BLOCKED_HUMAN", human_action: null };
+  const result = reviewerResponseIsSelfConsistent(bad);
+  assert.equal(result.consistent, false);
+  assert.equal(result.reason, "verdict_BLOCKED_HUMAN_but_human_action_is_null");
+});
+
+test("SS - reviewerResponseIsSelfConsistent: BLOCKED_HUMAN con human_action real -> consistente", () => {
+  const good = { ...VALID_RESPONSE_PASS, verdict: "BLOCKED_HUMAN", human_action: { reason: "SECRET_REQUIRED", description: "x" } };
+  const result = reviewerResponseIsSelfConsistent(good);
+  assert.equal(result.consistent, true);
+});
+
+test("TT - reviewerResponseIsSelfConsistent: HOLD con findings reales -> consistente (sin restriccion adicional para HOLD)", () => {
+  const hold = { ...VALID_RESPONSE_PASS, verdict: "HOLD", blocking_findings: [{ severity: "HIGH", finding: "x", evidence: "y", required_action: "z" }] };
+  const result = reviewerResponseIsSelfConsistent(hold);
+  assert.equal(result.consistent, true);
 });
