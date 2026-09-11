@@ -665,13 +665,132 @@ async function runWarmupLive(req, res) {
   });
 }
 
+// ================== Historical Multiple Data Review, PRIORITY 2 ==================
+// Modo diagnostico separado (?pin=X&mode=historical_probe), read-only,
+// temporal -- NO relacionado con el proposito original de este archivo
+// (benchmark FMP con escritura a fmp_benchmark_results). Reutiliza
+// FMP_BASE/looksLikePlanBlockedMessage/sleep ya existentes en este mismo
+// archivo -- cero reimplementacion. Usa el credential FMP_API_KEY que ya
+// esta confirmado funcionando en Vercel (nunca se agrego como secret de
+// GitHub Actions a proposito -- decision explicita del usuario de
+// reusar el path Vercel en vez de duplicar el secret). NUNCA escribe en
+// Supabase, NUNCA expone la API key, NUNCA toca el ruteo de precios de
+// produccion (lib/prices.js / lib/marketDataOrchestrator.js / etc. no
+// se importan ni se tocan aqui).
+//
+// Universo: los 11 tickers EPS-eligible con historia STRONG/MINIMUM
+// confirmados por el audit de canonicalizacion de este mismo sprint
+// (scripts/secAnnualCanonicalizationAudit.mjs) -- BE/NBIS (sin historia
+// usable) y ALAB/GEV (WEAK, historia insuficiente) quedan fuera.
+const FMP_HISTORICAL_ELIGIBLE_TICKERS = [
+  "AMD", "AMZN", "ANET", "GOOG", "GOOGL", "META", "MSFT",
+  "NVDA", "ORCL", "QCOM", "VRT",
+];
+
+async function probeHistoricalPriceTicker(FMP_KEY, ticker) {
+  const url = `${FMP_BASE}/historical-price-eod/full?symbol=${ticker}&apikey=${FMP_KEY}`;
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    return { ticker, classification: "PROVIDER_ERROR", detail: `network_error: ${String(e.message || e)}` };
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    return { ticker, classification: "AUTH_ERROR", http_status: resp.status };
+  }
+  if (resp.status === 402) {
+    return { ticker, classification: "PLAN_BLOCKED", http_status: resp.status };
+  }
+  if (!resp.ok) {
+    const bodyText = await resp.text();
+    if (looksLikePlanBlockedMessage(bodyText)) {
+      return { ticker, classification: "PLAN_BLOCKED", http_status: resp.status, body_snippet: bodyText.slice(0, 300) };
+    }
+    return { ticker, classification: "PROVIDER_ERROR", http_status: resp.status, body_snippet: bodyText.slice(0, 300) };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ticker, classification: "PROVIDER_ERROR", detail: `json_parse_error: ${String(e.message || e)}` };
+  }
+
+  const records = data?.historical;
+  if (!Array.isArray(records) || records.length === 0) {
+    return { ticker, classification: "NO_DATA", http_status: resp.status, top_level_keys: data && typeof data === "object" ? Object.keys(data) : [] };
+  }
+
+  // Se ordena explicitamente por fecha -- nunca se asume el orden que
+  // FMP devuelve sin verificarlo.
+  const sorted = [...records].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const latest = sorted[0];
+  const earliest = sorted[sorted.length - 1];
+  const fieldsPresent = Object.keys(latest);
+
+  return {
+    ticker,
+    classification: "AVAILABLE",
+    http_status: resp.status,
+    provider_symbol: ticker,
+    record_count: records.length,
+    earliest_date: earliest.date,
+    latest_date: latest.date,
+    fields_present_in_sample: fieldsPresent,
+    sample_record_latest: latest,
+    sample_record_earliest: earliest,
+    close_field_value: latest.close ?? null,
+    adjclose_like_field_value: latest.adjClose ?? latest.adjustedClose ?? latest.adjustedClosePrice ?? null,
+    volume_field_value: latest.volume ?? null,
+    split_related_fields: Object.fromEntries(fieldsPresent.filter((k) => /split/i.test(k)).map((k) => [k, latest[k]])),
+    dividend_related_fields: Object.fromEntries(fieldsPresent.filter((k) => /div/i.test(k)).map((k) => [k, latest[k]])),
+    exchange_field_value: latest.exchange ?? data.exchange ?? null,
+    currency_field_value: latest.currency ?? data.currency ?? null,
+    top_level_keys: Object.keys(data),
+  };
+}
+
+async function runHistoricalPriceProbe(req, res) {
+  const FMP_KEY = process.env.FMP_API_KEY;
+  if (!FMP_KEY) {
+    return res.status(500).json({ error: "missing_fmp_key_in_vercel_env" });
+  }
+  const { tickers: tickersOverride } = req.query || {};
+  const tickerList = tickersOverride
+    ? tickersOverride.split(",").map((t) => t.trim().toUpperCase()).filter(Boolean)
+    : FMP_HISTORICAL_ELIGIBLE_TICKERS;
+
+  const results = [];
+  for (const ticker of tickerList) {
+    const r = await probeHistoricalPriceTicker(FMP_KEY, ticker);
+    results.push(r);
+    await sleep(REQUEST_DELAY_MS);
+  }
+
+  const summary = {
+    total_tested: results.length,
+    available: results.filter((r) => r.classification === "AVAILABLE").map((r) => r.ticker),
+    plan_blocked: results.filter((r) => r.classification === "PLAN_BLOCKED").map((r) => r.ticker),
+    auth_error: results.filter((r) => r.classification === "AUTH_ERROR").map((r) => r.ticker),
+    no_data: results.filter((r) => r.classification === "NO_DATA").map((r) => r.ticker),
+    provider_error: results.filter((r) => r.classification === "PROVIDER_ERROR").map((r) => r.ticker),
+  };
+
+  return res.status(200).json({ ok: true, mode: "HISTORICAL_PRICE_PROBE", tickers: tickerList, summary, results });
+}
+
 export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
-  const { pin, tickers, cryptoTickers, reconcile, warmup } = req.query || {};
+  const { pin, tickers, cryptoTickers, reconcile, warmup, mode } = req.query || {};
 
   if (!pin || pin !== process.env.MONI_PIN) {
     return res.status(401).json({ error: "invalid_pin" });
+  }
+
+  if (mode === "historical_probe") {
+    return runHistoricalPriceProbe(req, res);
   }
 
   if (reconcile === "true") {
